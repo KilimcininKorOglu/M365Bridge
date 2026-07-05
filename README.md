@@ -131,8 +131,11 @@ The wizard will guide you through:
 3. Saving the JSON output to `data/setup.json`
 4. Encrypting and storing the refresh token
 5. Saving environment variables to `data/.env` file
+6. (Optional) Capturing SSO cookies for automatic token renewal after 24-hour expiry
 
 The wizard reads a JSON file (default: `data/setup.json`) containing `oid`, `tenant`, and `refresh_token` fields. It encrypts the refresh token with AES-256-GCM, stores the encryption key in `data/tokens/encryption.key`, and writes environment variables to `data/.env`.
+
+> **Note on token expiry:** Microsoft SPA refresh tokens expire after 24 hours (AADSTS700084). Without SSO cookies, you must re-run the setup wizard daily. To enable automatic renewal, capture SSO cookies during setup (see Step 2 below). SSO cookies last weeks/months and allow the server to silently re-authenticate when the refresh token expires.
 
 ### Manual Setup
 
@@ -228,6 +231,36 @@ return 'Interceptors installed and ' + cleared + ' access tokens cleared. MSAL s
 ```
 
 The wizard will encrypt the refresh token with AES-256-GCM and save environment variables to `data/.env`.
+
+### Capturing SSO Cookies (Optional, Recommended)
+
+SSO cookies enable automatic token renewal after the 24-hour refresh token expiry. Without them, you must re-run the setup wizard every 24 hours.
+
+1. In your browser DevTools, go to **Application** > **Cookies** > `https://login.microsoftonline.com`
+2. Find and copy the values of these cookies:
+   - `ESTSAUTH`
+   - `ESTSAUTHPERSISTENT`
+3. Add them to `data/setup.json` under the `sso_cookies` array:
+
+```json
+{
+  "oid": "your-oid",
+  "tenant": "your-tenant",
+  "refresh_token": "your-refresh-token",
+  "sso_cookies": [
+    {"name": "ESTSAUTH", "value": "cookie-value-here"},
+    {"name": "ESTSAUTHPERSISTENT", "value": "cookie-value-here"}
+  ]
+}
+```
+
+4. Run the setup wizard again to save the SSO cookies:
+
+```bash
+./bin/m365-bridge setup-wizard
+```
+
+The wizard will encrypt the SSO cookies with AES-256-GCM and store them in `data/tokens/sso_cookies.json`. When the refresh token expires, the server automatically uses the SSO cookies to silently re-authenticate via `oauth2/v2.0/authorize?prompt=none` and obtain a fresh access and refresh token.
 
 ### Environment Variables
 
@@ -343,7 +376,7 @@ When you start the server for the first time:
 4. On success, you will see: `Starting API server on port 8000`
 5. The first request may take slightly longer as it opens a WebSocket connection to `substrate.office.com`
 
-If the refresh token is missing or expired, the server will fail to start with a token refresh error. Re-run `./bin/m365-bridge setup-wizard` to extract a fresh token.
+If the refresh token is missing or expired, the server will attempt SSO cookie re-authentication if `data/tokens/sso_cookies.json` exists. If SSO cookies are also missing or expired, the server will fail to start with a token refresh error. Re-run `./bin/m365-bridge setup-wizard` to extract fresh tokens and cookies.
 
 ### Session Isolation
 
@@ -457,6 +490,7 @@ All model selection is via the `tone` field sent to the M365 backend. The `Overr
 cmd/cli/main.go          # Single entry point, subcommand router
 pkg/
   auth/auth.go           # TokenManager, token refresh, AES-encrypted refresh token storage
+  auth/sso.go            # SSO cookie-based re-authentication (fallback for 24h token expiry)
   client/client.go       # M365Client, WebSocket (SignalR) communication
   crypto/crypto.go       # AES-256-GCM encryption for refresh tokens
   models/models.go       # Version, ModelRegistry, Config, LoadConfig, LookupModel
@@ -476,13 +510,16 @@ data/                    # Runtime data (gitignored): tokens/, setup.json, cache
 | `github.com/google/uuid`        | UUID generation for SIDs and request IDs                              |
 | `github.com/gorilla/websocket`  | WebSocket client for SignalR                                          |
 | `github.com/pkoukk/tiktoken-go` | BPE token counting (cl100k_base) for usage and max_tokens enforcement |
+| `golang.org/x/net`             | publicsuffix list for SSO cookie jar                                |
 
 ## Security
 
 - Refresh tokens encrypted with AES-256-GCM before storage
+- SSO cookies encrypted with AES-256-GCM before storage (`data/tokens/sso_cookies.json`)
 - Encryption key stored in `data/tokens/encryption.key`
 - Access tokens cached in `data/tokens/token_cache.json` (disk-persisted, ~1h expiry with 60s buffer)
 - Background token refresher proactively refreshes access token every 30 minutes in `serve` mode
+- SSO cookie auto-renewal silently re-authenticates when refresh token expires (24h SPA limit)
 - No credentials stored in code or repository
 - `data/` directory is gitignored (contains tokens, cache, setup.json)
 - API key authentication protects all `/v1/*` endpoints when configured

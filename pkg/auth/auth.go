@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/crypto"
@@ -107,7 +108,12 @@ func (tm *TokenManager) Refresh() (string, error) {
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("%w: status %d: %s", ErrRefreshFailed, resp.StatusCode, string(body))
+		errMsg := string(body)
+		// If refresh token expired (AADSTS700084), try SSO cookie re-auth as fallback
+		if strings.Contains(errMsg, "AADSTS700084") && hasSSOCookies() {
+			return tm.reauthWithSSO()
+		}
+		return "", fmt.Errorf("%w: status %d: %s", ErrRefreshFailed, resp.StatusCode, errMsg)
 	}
 
 	var result struct {

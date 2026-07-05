@@ -44,7 +44,7 @@ func Run(filePath string) error {
 
 	// Step 1: Read configuration from file
 	fmt.Printf("Reading JSON from file: %s\n\n", filePath)
-	tenant, oid, refreshToken, err := getConfigFromFile(filePath)
+	tenant, oid, refreshToken, ssoCookies, err := getConfigFromFile(filePath)
 	if err != nil {
 		return fmt.Errorf("%w\n\nSave the browser console JSON output to %s and try again", err, filePath)
 	}
@@ -54,7 +54,16 @@ func Run(filePath string) error {
 		return err
 	}
 
-	// Step 3: Save environment configuration
+	// Step 3: Save SSO cookies if provided
+	if len(ssoCookies) > 0 {
+		if err := auth.SaveSSOCookies(ssoCookies); err != nil {
+			fmt.Printf("  Warning: failed to save SSO cookies: %v\n", err)
+		} else {
+			fmt.Println("  SSO cookies encrypted and saved")
+		}
+	}
+
+	// Step 4: Save environment configuration
 	if err := saveEnv(tenant, oid); err != nil {
 		return err
 	}
@@ -172,43 +181,72 @@ return 'Interceptors installed and ' + cleared + ' access tokens cleared. MSAL s
 	fmt.Println()
 	fmt.Println("  Save the JSON output to data/setup.json (or pass --file <path>)")
 	fmt.Println()
+
+	// SSO cookie instructions for auto-renewal
+	fmt.Println(strings.Repeat("=", 60))
+	fmt.Println("  Step 2 (Optional): Capture SSO cookies for auto-renewal")
+	fmt.Println(strings.Repeat("=", 60))
+	fmt.Println()
+	fmt.Println("  SSO cookies allow the server to auto-renew tokens after the")
+	fmt.Println("  24-hour refresh token expiry, without running setup-wizard again.")
+	fmt.Println("  SSO cookies last weeks/months.")
+	fmt.Println()
+	fmt.Println("  In DevTools:")
+	fmt.Println("    1. Go to Application -> Cookies -> https://login.microsoftonline.com")
+	fmt.Println("    2. Find these cookies and copy their values:")
+	fmt.Println("       - ESTSAUTH")
+	fmt.Println("       - ESTSAUTHPERSISTENT")
+	fmt.Println("       -SignInStateCookie (if present)")
+	fmt.Println("    3. Add them to data/setup.json under \"sso_cookies\" array:")
+	fmt.Println()
+	fmt.Println("  Example setup.json with SSO cookies:")
+	fmt.Println("  {")
+	fmt.Println("    \"oid\": \"...\", \"tenant\": \"...\", \"refresh_token\": \"...\",")
+	fmt.Println("    \"sso_cookies\": [")
+	fmt.Println("      {\"name\": \"ESTSAUTH\", \"value\": \"...\"},")
+	fmt.Println("      {\"name\": \"ESTSAUTHPERSISTENT\", \"value\": \"...\"}")
+	fmt.Println("    ]")
+	fmt.Println("  }")
+	fmt.Println()
 }
 
 // getConfigFromFile reads setup JSON from a file.
-func getConfigFromFile(path string) (string, string, string, error) {
+// Returns tenant, oid, refresh token, SSO cookies, and error.
+func getConfigFromFile(path string) (string, string, string, []auth.SSOCookie, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return "", "", "", fmt.Errorf("failed to read file %s: %w", path, err)
+		return "", "", "", nil, fmt.Errorf("failed to read file %s: %w", path, err)
 	}
 
 	raw := strings.TrimSpace(string(data))
 	if raw == "" {
-		return "", "", "", fmt.Errorf("file %s is empty", path)
+		return "", "", "", nil, fmt.Errorf("file %s is empty", path)
 	}
 
 	// Parse JSON directly
 	var parsed struct {
-		OID          string `json:"oid"`
-		Tenant       string `json:"tenant"`
-		RefreshToken string `json:"refresh_token"`
+		OID          string           `json:"oid"`
+		Tenant       string           `json:"tenant"`
+		RefreshToken string           `json:"refresh_token"`
+		SSOCookies   []auth.SSOCookie `json:"sso_cookies"`
 	}
 	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
 		// Try extracting JSON from surrounding text
 		jsonPattern := regexp.MustCompile(`\{.*\}`)
 		if match := jsonPattern.FindString(raw); match != "" {
 			if err2 := json.Unmarshal([]byte(match), &parsed); err2 != nil {
-				return "", "", "", fmt.Errorf("failed to parse JSON from file: %w", err)
+				return "", "", "", nil, fmt.Errorf("failed to parse JSON from file: %w", err)
 			}
 		} else {
-			return "", "", "", fmt.Errorf("failed to parse JSON from file: %w", err)
+			return "", "", "", nil, fmt.Errorf("failed to parse JSON from file: %w", err)
 		}
 	}
 
 	if parsed.Tenant == "" || parsed.OID == "" {
-		return "", "", "", fmt.Errorf("missing tenant or oid in JSON")
+		return "", "", "", nil, fmt.Errorf("missing tenant or oid in JSON")
 	}
 	if parsed.RefreshToken == "" || parsed.RefreshToken == "NOT_FOUND" {
-		return "", "", "", fmt.Errorf("missing or invalid refresh_token in JSON")
+		return "", "", "", nil, fmt.Errorf("missing or invalid refresh_token in JSON")
 	}
 
 	// If refresh_token is a JSON object, try extracting secret/value/data fields
@@ -227,8 +265,11 @@ func getConfigFromFile(path string) (string, string, string, error) {
 	fmt.Printf("  OID: %s\n", parsed.OID)
 	fmt.Printf("  Tenant: %s\n", parsed.Tenant)
 	fmt.Printf("  Refresh token: %d chars\n", len(refreshToken))
+	if len(parsed.SSOCookies) > 0 {
+		fmt.Printf("  SSO cookies: %d captured\n", len(parsed.SSOCookies))
+	}
 
-	return parsed.Tenant, parsed.OID, refreshToken, nil
+	return parsed.Tenant, parsed.OID, refreshToken, parsed.SSOCookies, nil
 }
 
 // verifyToken validates the refresh token by exchanging it for an access token.
