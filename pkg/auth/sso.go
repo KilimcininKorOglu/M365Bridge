@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/cookiejar"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -20,7 +19,6 @@ import (
 	"time"
 
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/crypto"
-	"golang.org/x/net/publicsuffix"
 )
 
 const (
@@ -29,7 +27,7 @@ const (
 	// authorizeURLTemplate is the OAuth2 authorize endpoint for silent re-auth.
 	authorizeURLTemplate = "https://login.microsoftonline.com/%s/oauth2/v2.0/authorize"
 	// defaultRedirectURI is the redirect URI registered for the M365 Copilot SPA app.
-	defaultRedirectURI = "https://m365.cloud.microsoft/landingv2"
+	defaultRedirectURI = "https://m365.cloud.microsoft/spalanding"
 )
 
 // SSOCookie represents a single SSO cookie from login.microsoftonline.com.
@@ -124,32 +122,14 @@ func (tm *TokenManager) reauthWithSSO() (string, error) {
 		return "", fmt.Errorf("%w: no SSO cookies available: %v", ErrRefreshFailed, err)
 	}
 
-	// Build cookie jar with SSO cookies for login.microsoftonline.com
-	jar, err := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
-	if err != nil {
-		return "", fmt.Errorf("%w: failed to create cookie jar: %v", ErrRefreshFailed, err)
-	}
-
-	loginURL, _ := url.Parse("https://login.microsoftonline.com")
-	var httpCookies []*http.Cookie
+	// Build Cookie header string from SSO cookies
+	var cookieParts []string
 	for _, c := range store.Cookies {
-		domain := c.Domain
-		if domain == "" {
-			domain = "login.microsoftonline.com"
-		}
-		httpCookies = append(httpCookies, &http.Cookie{
-			Name:     c.Name,
-			Value:    c.Value,
-			Path:     c.Path,
-			Domain:   domain,
-			Secure:   c.Secure,
-			HttpOnly: c.HttpOnly,
-		})
+		cookieParts = append(cookieParts, c.Name+"="+c.Value)
 	}
-	jar.SetCookies(loginURL, httpCookies)
+	cookieHeader := strings.Join(cookieParts, "; ")
 
 	client := &http.Client{
-		Jar: jar,
 		// Don't follow redirects automatically; we need to capture the auth code
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
@@ -163,27 +143,30 @@ func (tm *TokenManager) reauthWithSSO() (string, error) {
 		return "", fmt.Errorf("%w: %v", ErrRefreshFailed, err)
 	}
 
-	// Build authorize URL with prompt=none for silent auth
+	// Build authorize URL for silent auth using SSO cookies
+	// sso_reload=True tells the server to use SSO cookies and skip the BssoInterrupt page.
+	// prompt=none breaks SSO cookie recognition, so we omit it.
 	authorizeURL := fmt.Sprintf(authorizeURLTemplate, tm.tenant)
 	params := url.Values{
 		"client_id":             {tm.clientID},
 		"response_type":         {"code"},
 		"redirect_uri":          {defaultRedirectURI},
-		"scope":                 {tm.scope},
-		"prompt":                {"none"},
+		"scope":                 {tm.scope + " offline_access"},
+		"response_mode":         {"fragment"},
 		"code_challenge":        {challenge},
 		"code_challenge_method": {"S256"},
 		"state":                 {"m365bridge-sso"},
+		"sso_reload":            {"True"},
 	}
 
 	authReq, err := http.NewRequest("GET", authorizeURL+"?"+params.Encode(), nil)
 	if err != nil {
 		return "", fmt.Errorf("%w: failed to create authorize request: %v", ErrRefreshFailed, err)
 	}
-	authReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-	authReq.Header.Set("Origin", "https://m365.cloud.microsoft")
+	authReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
 	authReq.Header.Set("Referer", "https://m365.cloud.microsoft/")
 	authReq.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	authReq.Header.Set("Cookie", cookieHeader)
 
 	authResp, err := client.Do(authReq)
 	if err != nil {
@@ -191,65 +174,135 @@ func (tm *TokenManager) reauthWithSSO() (string, error) {
 	}
 	defer authResp.Body.Close()
 
-	// Check for redirect with auth code
-	location := authResp.Header.Get("Location")
-	if location == "" {
-		body, _ := io.ReadAll(authResp.Body)
-		return "", fmt.Errorf("%w: no redirect from authorize (status %d): %s", ErrRefreshFailed, authResp.StatusCode, string(body))
-	}
+	// Follow redirects manually until we get the auth code or reach redirect_uri
+	currentResp := authResp
+	for {
+		location := currentResp.Header.Get("Location")
+		if location == "" {
+			body, _ := io.ReadAll(currentResp.Body)
+			bodyStr := string(body)
+			// Check for meta refresh redirect in HTML
+			if metaURL := extractMetaRefreshURL(bodyStr); metaURL != "" {
+				location = metaURL
+			} else {
+				if len(bodyStr) > 2000 {
+					bodyStr = bodyStr[:2000]
+				}
+				return "", fmt.Errorf("%w: no redirect from authorize (status %d): %s", ErrRefreshFailed, currentResp.StatusCode, bodyStr)
+			}
+		}
 
-	// Parse auth code from redirect URL
-	locURL, err := url.Parse(location)
-	if err != nil {
-		return "", fmt.Errorf("%w: failed to parse redirect URL: %v", ErrRefreshFailed, err)
-	}
+		// Check if this is the redirect_uri with auth code
+		if strings.Contains(location, "m365.cloud.microsoft") {
+			// Parse auth code from redirect URL
+			locURL, err := url.Parse(location)
+			if err != nil {
+				return "", fmt.Errorf("%w: failed to parse redirect URL: %v", ErrRefreshFailed, err)
+			}
 
-	authCode := locURL.Query().Get("code")
-	if authCode == "" {
-		// Check for error in fragment (response_mode=fragment is default for SPA)
-		fragment := locURL.Fragment
-		if fragment != "" {
-			fragParams, _ := url.ParseQuery(fragment)
-			authCode = fragParams.Get("code")
+			authCode := locURL.Query().Get("code")
 			if authCode == "" {
-				errCode := fragParams.Get("error")
-				errDesc := fragParams.Get("error_description")
-				return "", fmt.Errorf("%w: authorize returned error: %s: %s", ErrRefreshFailed, errCode, errDesc)
+				// Check for code in fragment (response_mode=fragment)
+				fragment := locURL.Fragment
+				if fragment != "" {
+					fragParams, _ := url.ParseQuery(fragment)
+					authCode = fragParams.Get("code")
+					if authCode == "" {
+						errCode := fragParams.Get("error")
+						errDesc := fragParams.Get("error_description")
+						return "", fmt.Errorf("%w: authorize returned error: %s: %s", ErrRefreshFailed, errCode, errDesc)
+					}
+				}
+			}
+			if authCode != "" {
+				// Exchange auth code for tokens
+				return tm.exchangeAuthCode(authCode, verifier, cookieHeader)
 			}
 		}
-		if authCode == "" {
-			errCode := locURL.Query().Get("error")
-			errDesc := locURL.Query().Get("error_description")
-			if errCode != "" {
-				return "", fmt.Errorf("%w: authorize returned error: %s: %s", ErrRefreshFailed, errCode, errDesc)
-			}
-			return "", fmt.Errorf("%w: no auth code in redirect URL: %s", ErrRefreshFailed, location)
+
+		// Follow the redirect
+		redirectReq, err := http.NewRequest("GET", location, nil)
+		if err != nil {
+			return "", fmt.Errorf("%w: failed to create redirect request: %v", ErrRefreshFailed, err)
 		}
+		redirectReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
+		redirectReq.Header.Set("Referer", "https://m365.cloud.microsoft/")
+		redirectReq.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+		redirectReq.Header.Set("Cookie", cookieHeader)
+
+		currentResp.Body.Close()
+		currentResp, err = client.Do(redirectReq)
+		if err != nil {
+			return "", fmt.Errorf("%w: redirect request failed: %v", ErrRefreshFailed, err)
+		}
+		defer currentResp.Body.Close()
+	}
+}
+
+// extractMetaRefreshURL parses an HTML body and extracts the URL from a
+// <meta http-equiv="refresh" content="0; url=..."> tag. Returns empty string if not found.
+func extractMetaRefreshURL(html string) string {
+	// Find meta refresh tag
+	idx := strings.Index(strings.ToLower(html), "http-equiv=\"refresh\"")
+	if idx == -1 {
+		idx = strings.Index(strings.ToLower(html), "http-equiv='refresh'")
+	}
+	if idx == -1 {
+		return ""
 	}
 
-	// Exchange auth code for tokens
+	// Find the content attribute after this position
+	rest := html[idx:]
+	contentIdx := strings.Index(strings.ToLower(rest), "content=\"")
+	if contentIdx == -1 {
+		contentIdx = strings.Index(strings.ToLower(rest), "content='")
+	}
+	if contentIdx == -1 {
+		return ""
+	}
+
+	// Extract the content value
+	rest = rest[contentIdx+9:]
+	endIdx := strings.Index(rest, "\"")
+	if endIdx == -1 {
+		endIdx = strings.Index(rest, "'")
+	}
+	if endIdx == -1 {
+		return ""
+	}
+
+	content := rest[:endIdx]
+	// Parse "0; url=..." format
+	urlIdx := strings.Index(strings.ToLower(content), "url=")
+	if urlIdx == -1 {
+		return ""
+	}
+
+	return strings.TrimSpace(content[urlIdx+4:])
+}
+
+// exchangeAuthCode exchanges an authorization code for access and refresh tokens.
+func (tm *TokenManager) exchangeAuthCode(authCode, verifier, cookieHeader string) (string, error) {
 	tokenData := url.Values{
 		"client_id":     {tm.clientID},
 		"grant_type":    {"authorization_code"},
 		"code":          {authCode},
 		"redirect_uri":  {defaultRedirectURI},
 		"code_verifier": {verifier},
-		"scope":         {tm.scope},
+		"scope":         {tm.scope + " offline_access"},
 	}
 
 	tokenReq, err := http.NewRequest("POST", tm.tokenURL, strings.NewReader(tokenData.Encode()))
 	if err != nil {
 		return "", fmt.Errorf("%w: failed to create token request: %v", ErrRefreshFailed, err)
 	}
-	tokenReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	tokenReq.Header.Set("Content-Type", "application/x-www-form-urlencoded;charset=utf-8")
 	tokenReq.Header.Set("Origin", "https://m365.cloud.microsoft")
 	tokenReq.Header.Set("Referer", "https://m365.cloud.microsoft/")
 	tokenReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
 	tokenReq.Header.Set("Accept", "application/json")
-	tokenReq.Header.Set("Sec-Fetch-Site", "cross-site")
-	tokenReq.Header.Set("Sec-Fetch-Mode", "cors")
-	tokenReq.Header.Set("Sec-Fetch-Dest", "empty")
 
+	client := &http.Client{Timeout: 15 * time.Second}
 	tokenResp, err := client.Do(tokenReq)
 	if err != nil {
 		return "", fmt.Errorf("%w: token exchange failed: %v", ErrRefreshFailed, err)
