@@ -568,6 +568,34 @@ func (api *APIServer) handleCompletions(w http.ResponseWriter, r *http.Request) 
 	}
 }
 
+func normalizeAnthropicSystem(raw json.RawMessage) (string, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return "", nil
+	}
+
+	var systemText string
+	if err := json.Unmarshal(raw, &systemText); err == nil {
+		return systemText, nil
+	}
+
+	var blocks []struct {
+		Type string
+		Text string
+	}
+	if err := json.Unmarshal(raw, &blocks); err != nil {
+		return "", err
+	}
+
+	parts := make([]string, 0, len(blocks))
+	for _, block := range blocks {
+		if block.Text != "" {
+			parts = append(parts, block.Text)
+		}
+	}
+
+	return strings.Join(parts, "\n\n"), nil
+}
+
 // handleAnthropicMessages handles Anthropic messages API requests.
 func (api *APIServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodOptions {
@@ -589,7 +617,7 @@ func (api *APIServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Req
 	var req struct {
 		Model       string                 `json:"model"`
 		Messages    []payload.Message      `json:"messages"`
-		System      string                 `json:"system"`
+		System      json.RawMessage        `json:"system"`
 		MaxTokens   int                    `json:"max_tokens"`
 		Stream      bool                   `json:"stream"`
 		Temperature float64                `json:"temperature"`
@@ -609,10 +637,18 @@ func (api *APIServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Req
 	cfg := models.LookupModel(modelKey)
 	logging.Infof("handleAnthropicMessages: model=%s stream=%v tools=%d sid=%s", modelKey, req.Stream, len(req.Tools), modelSessionID)
 
-	// Build chat messages with system prompt prepended
+	// Build chat messages with system prompt prepended. Claude Code can send
+	// Anthropic system as either a string or an array of text content blocks.
+	systemPrompt, err := normalizeAnthropicSystem(req.System)
+	if err != nil {
+		logging.Errorf("handleAnthropicMessages: invalid system field: %v", err)
+		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Invalid system field: %v", err))
+		return
+	}
+
 	chatMessages := []payload.Message{}
-	if req.System != "" {
-		chatMessages = append(chatMessages, payload.Message{Role: "system", Content: req.System})
+	if systemPrompt != "" {
+		chatMessages = append(chatMessages, payload.Message{Role: "system", Content: systemPrompt})
 	}
 	chatMessages = append(chatMessages, req.Messages...)
 
@@ -770,8 +806,8 @@ func (api *APIServer) streamAnthropicComplete(w http.ResponseWriter, messages []
 	for chunk := range ch {
 		if chunk.Error != nil {
 			errData := map[string]interface{}{
-				"type":    "error",
-				"error":   map[string]interface{}{"type": "server_error", "message": chunk.Error.Error()},
+				"type":  "error",
+				"error": map[string]interface{}{"type": "server_error", "message": chunk.Error.Error()},
 			}
 			errJSON, _ := json.Marshal(errData)
 			fmt.Fprintf(w, "event: error\ndata: %s\n\n", errJSON)
@@ -950,7 +986,6 @@ func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []pa
 			}
 		}
 	}
-
 
 	// If tool calling buffered text, send it now as a single chunk
 	if toolCallingEnabled && fullText != "" && len(simToolCalls) == 0 {
@@ -2016,8 +2051,8 @@ func toolNamesFromDefs(tools []toolcalling.ToolDef) []string {
 	}
 	names := make([]string, 0, len(tools))
 	for _, t := range tools {
-		if t.Function.Name != "" {
-			names = append(names, t.Function.Name)
+		if name := toolcalling.ToolName(&t); name != "" {
+			names = append(names, name)
 		}
 	}
 	return names
@@ -2359,12 +2394,12 @@ func buildResponsesObject(responseID, model, text, thinking string, toolCalls []
 	}
 
 	resp := map[string]interface{}{
-		"id":         responseID,
-		"object":     "response",
-		"created_at": time.Now().Unix(),
-		"status":     status,
-		"model":      model,
-		"output":     output,
+		"id":          responseID,
+		"object":      "response",
+		"created_at":  time.Now().Unix(),
+		"status":      status,
+		"model":       model,
+		"output":      output,
 		"output_text": text,
 		"usage": map[string]interface{}{
 			"input_tokens":     promptTok,
@@ -2567,20 +2602,20 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 					sendEvent("response.output_item.added", map[string]interface{}{
 						"output_index": outputIdx,
 						"item": map[string]interface{}{
-							"id":     msgID,
-							"type":   "message",
-							"status": "in_progress",
-							"role":   "assistant",
+							"id":      msgID,
+							"type":    "message",
+							"status":  "in_progress",
+							"role":    "assistant",
 							"content": []interface{}{},
 						},
 					})
 					sendEvent("response.content_part.added", map[string]interface{}{
-						"item_id":      msgID,
-						"output_index": outputIdx,
+						"item_id":       msgID,
+						"output_index":  outputIdx,
 						"content_index": 0,
 						"part": map[string]interface{}{
-							"type": "output_text",
-							"text": "",
+							"type":        "output_text",
+							"text":        "",
 							"annotations": []interface{}{},
 						},
 					})
@@ -2738,20 +2773,20 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 			sendEvent("response.output_item.added", map[string]interface{}{
 				"output_index": outputIdx,
 				"item": map[string]interface{}{
-					"id":     msgID,
-					"type":   "message",
-					"status": "in_progress",
-					"role":   "assistant",
+					"id":      msgID,
+					"type":    "message",
+					"status":  "in_progress",
+					"role":    "assistant",
 					"content": []interface{}{},
 				},
 			})
 			sendEvent("response.content_part.added", map[string]interface{}{
-				"item_id":      msgID,
-				"output_index": outputIdx,
+				"item_id":       msgID,
+				"output_index":  outputIdx,
 				"content_index": 0,
 				"part": map[string]interface{}{
-					"type": "output_text",
-					"text": "",
+					"type":        "output_text",
+					"text":        "",
 					"annotations": []interface{}{},
 				},
 			})
@@ -2768,12 +2803,12 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 				"text":          fullText,
 			})
 			sendEvent("response.content_part.done", map[string]interface{}{
-				"item_id":      msgID,
-				"output_index": outputIdx,
+				"item_id":       msgID,
+				"output_index":  outputIdx,
 				"content_index": 0,
 				"part": map[string]interface{}{
-					"type": "output_text",
-					"text": fullText,
+					"type":        "output_text",
+					"text":        fullText,
 					"annotations": []interface{}{},
 				},
 			})
@@ -2811,12 +2846,12 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 				"text":          fullText,
 			})
 			sendEvent("response.content_part.done", map[string]interface{}{
-				"item_id":      msgID,
-				"output_index": outputIdx,
+				"item_id":       msgID,
+				"output_index":  outputIdx,
 				"content_index": 0,
 				"part": map[string]interface{}{
-					"type": "output_text",
-					"text": fullText,
+					"type":        "output_text",
+					"text":        fullText,
 					"annotations": []interface{}{},
 				},
 			})

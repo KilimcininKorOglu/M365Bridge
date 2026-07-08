@@ -14,12 +14,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
-	"github.com/gorilla/websocket"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/auth"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/logging"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/models"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/payload"
+	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
 )
 
 const (
@@ -44,9 +44,9 @@ var (
 
 // ToolCall represents a detected tool call from the response.
 type ToolCall struct {
-	ID       string                 `json:"id"`
-	Type     string                 `json:"type"`
-	Function ToolCallFunction       `json:"function"`
+	ID       string           `json:"id"`
+	Type     string           `json:"type"`
+	Function ToolCallFunction `json:"function"`
 }
 
 // ToolCallFunction represents the function part of a tool call.
@@ -59,10 +59,10 @@ type ToolCallFunction struct {
 // All state is per-request (carried via channel chunks), so the client
 // is safe for concurrent use without any mutex.
 type M365Client struct {
-	tokenManager      *auth.TokenManager
-	handshakeTimeout  time.Duration
-	recvTimeout       time.Duration
-	recvFinalTimeout  time.Duration
+	tokenManager     *auth.TokenManager
+	handshakeTimeout time.Duration
+	recvTimeout      time.Duration
+	recvFinalTimeout time.Duration
 }
 
 // NewM365Client creates a new M365 client instance.
@@ -82,10 +82,10 @@ func (c *M365Client) Close() error {
 
 // UploadResult represents the response from the M365 UploadFile endpoint.
 type UploadResult struct {
-	DocID      string `json:"docId"`
-	FileName   string `json:"fileName"`
-	FileType   string `json:"fileType"`
-	IsSuccess  bool
+	DocID     string `json:"docId"`
+	FileName  string `json:"fileName"`
+	FileType  string `json:"fileType"`
+	IsSuccess bool
 }
 
 // UploadFile uploads an image to M365 Copilot via the UploadFile HTTP endpoint.
@@ -251,9 +251,9 @@ type StreamChunk struct {
 	Thinking       string
 	IsFinal        bool
 	Error          error
-	ConversationID string    // set on final chunk
+	ConversationID string     // set on final chunk
 	ToolCalls      []ToolCall // set on final chunk
-	FinishReason   string    // set on final chunk
+	FinishReason   string     // set on final chunk
 }
 
 // ChatStreamGen generates a stream of response chunks for a single text prompt.
@@ -361,7 +361,6 @@ func (c *M365Client) ChatConversationStreamGen(messages []payload.Message, tone,
 				if err := json.Unmarshal([]byte(part), &data); err != nil {
 					continue
 				}
-
 
 				// DEBUG: log every WebSocket message type and target (ConvStream)
 				if mt, ok := data["type"].(float64); ok {
@@ -534,10 +533,19 @@ func (c *M365Client) sendRecv(conn *websocket.Conn, payload string) (string, err
 							if argMap, ok := arg.(map[string]interface{}); ok {
 								if msgs, ok := argMap["messages"].([]interface{}); ok && len(msgs) > 0 {
 									if lastMsg, ok := msgs[len(msgs)-1].(map[string]interface{}); ok {
-										if text, ok := lastMsg["text"].(string); ok {
-											fullText = text
+										if lastMsgType, _ := lastMsg["messageType"].(string); lastMsgType != "Progress" {
+											if text, ok := lastMsg["text"].(string); ok && text != "" && text != fullText {
+												if strings.HasPrefix(text, fullText) {
+													fullText += text[len(fullText):]
+												} else {
+													fullText = text
+												}
+											}
 										}
 									}
+								}
+								if writeAtCursor, ok := argMap["writeAtCursor"].(string); ok && writeAtCursor != "" {
+									fullText += writeAtCursor
 								}
 							}
 						}
@@ -651,8 +659,6 @@ func cleanText(text string) string {
 
 	return strings.TrimSpace(cleaned)
 }
-
-
 
 // extractImageGenerationMarkdown extracts image URLs from a Progress message
 // with contentOrigin "ImageGeneration" and returns them as markdown image links.
