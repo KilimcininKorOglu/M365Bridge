@@ -67,7 +67,7 @@ var ModelRegistry = map[string]ModelConfig{
 		OpenAIID: "claude-sonnet-4.6",
 	},
 	"claude-opus": {
-		Tone:     "Claude_Sonnet",
+		Tone:     "Claude_Opus",
 		Override: "",
 		OpenAIID: "claude-opus-4.6",
 	},
