@@ -1180,6 +1180,71 @@ func TestResponsesStreamBufferedSimulationRetriesBeforePublishing(t *testing.T) 
 	}
 }
 
+func TestResponsesStreamSimulationPublishesTextBeforeFinal(t *testing.T) {
+	upstream := make(chan client.StreamChunk, 2)
+	ch := responsesStreamWithEmptyRetry(
+		context.Background(),
+		"",
+		nil,
+		true,
+		nil,
+		func(_ context.Context, _ string) <-chan client.StreamChunk {
+			return upstream
+		},
+	)
+
+	upstream <- client.StreamChunk{
+		Text: `{"choices":[{"message":{"content":"çalışıyor"}}`,
+	}
+
+	select {
+	case chunk := <-ch:
+		if chunk.Text == "" {
+			t.Fatalf("first streamed chunk had no text: %#v", chunk)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("simulated Responses text remained buffered until final")
+	}
+
+	upstream <- client.StreamChunk{IsFinal: true}
+	close(upstream)
+	for range ch {
+	}
+}
+
+func TestLimitResponsesStreamDeltaHonorsMaxTokens(t *testing.T) {
+	emitted, published, truncated := limitResponsesStreamDelta(
+		"",
+		"hello world",
+		1,
+	)
+	if emitted == "" || published != emitted || !truncated {
+		t.Fatalf(
+			"first limited delta = (%q, %q, %t)",
+			emitted,
+			published,
+			truncated,
+		)
+	}
+	if countTokens(published) > 1 {
+		t.Fatalf("published content exceeds token limit: %q", published)
+	}
+
+	emitted, next, truncated := limitResponsesStreamDelta(
+		published,
+		" ignored",
+		1,
+	)
+	if emitted != "" || next != published || !truncated {
+		t.Fatalf(
+			"post-limit delta = (%q, %q, %t)",
+			emitted,
+			next,
+			truncated,
+		)
+	}
+}
+
 func TestResponsesStreamWithoutFinalReturnsUpstreamError(t *testing.T) {
 	attempts := 0
 

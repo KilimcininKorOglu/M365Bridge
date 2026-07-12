@@ -3053,7 +3053,7 @@ func responsesStreamWithEmptyRetry(
 	ctx context.Context,
 	initialConversationID string,
 	retryDelays []time.Duration,
-	bufferUntilFinal bool,
+	simulatedTransport bool,
 	onRetry func(),
 	call responsesStreamCall,
 ) <-chan client.StreamChunk {
@@ -3074,7 +3074,6 @@ func responsesStreamWithEmptyRetry(
 			stream := call(ctx, conversationID)
 			sawVisibleChunk := false
 			sawFinal := false
-			bufferedChunks := []client.StreamChunk{}
 
 			for chunk := range stream {
 				if chunk.Error != nil {
@@ -3084,22 +3083,16 @@ func responsesStreamWithEmptyRetry(
 				if chunk.IsFinal {
 					sawFinal = true
 					if sawVisibleChunk || attempt >= len(retryDelays) {
-						for _, buffered := range bufferedChunks {
-							if !emit(buffered) {
-								return
-							}
-						}
 						emit(chunk)
 						return
 					}
 					break
 				}
-				if bufferUntilFinal {
-					bufferedChunks = append(bufferedChunks, chunk)
-					if strings.TrimSpace(chunk.Text) != "" {
-						sawVisibleChunk = true
-					}
-					continue
+				if simulatedTransport {
+					// Simulated prompts can put the transport envelope in the
+					// upstream thinking channel. The Responses handler only
+					// needs raw text for its safe content extractor.
+					chunk.Thinking = ""
 				}
 				if chunk.Text == "" && chunk.Thinking == "" {
 					continue
@@ -3296,6 +3289,26 @@ func truncateToTokens(text string, maxTokens int) (string, bool) {
 		return text, false
 	}
 	return strings.Join(words[:maxTokens], " "), true
+}
+
+func limitResponsesStreamDelta(
+	published string,
+	delta string,
+	maxTokens int,
+) (string, string, bool) {
+	if delta == "" {
+		return "", published, false
+	}
+	if maxTokens <= 0 ||
+		countTokens(published+delta) <= maxTokens {
+		return delta, published + delta, false
+	}
+	remaining := maxTokens - countTokens(published)
+	if remaining <= 0 {
+		return "", published, true
+	}
+	limited, _ := truncateToTokens(delta, remaining)
+	return limited, published + limited, true
 }
 
 // ===================================================================
@@ -4051,6 +4064,56 @@ func (api *APIServer) streamResponses(
 	messageOutputIndex := 0
 	msgID := fmt.Sprintf("msg_%s", responseID)
 	reasoningID := fmt.Sprintf("rs_%s", responseID)
+	simulatedPublishedText := ""
+	emitSimulatedDelta := func(delta string) {
+		delta, published, limited := limitResponsesStreamDelta(
+			simulatedPublishedText,
+			delta,
+			maxTokens,
+		)
+		simulatedPublishedText = published
+		if limited {
+			truncated = true
+		}
+		if delta == "" {
+			return
+		}
+		if !messageItemEmitted {
+			outputIdx := 0
+			if reasoningItemEmitted {
+				outputIdx = 1
+			}
+			messageOutputIndex = outputIdx
+			sendEvent("response.output_item.added", map[string]any{
+				"output_index": outputIdx,
+				"item": map[string]any{
+					"id":      msgID,
+					"type":    "message",
+					"status":  "in_progress",
+					"role":    "assistant",
+					"phase":   "commentary",
+					"content": []any{},
+				},
+			})
+			sendEvent("response.content_part.added", map[string]any{
+				"item_id":       msgID,
+				"output_index":  outputIdx,
+				"content_index": 0,
+				"part": map[string]any{
+					"type":        "output_text",
+					"text":        "",
+					"annotations": []any{},
+				},
+			})
+			messageItemEmitted = true
+		}
+		sendEvent("response.output_text.delta", map[string]any{
+			"item_id":       msgID,
+			"output_index":  messageOutputIndex,
+			"content_index": 0,
+			"delta":         delta,
+		})
+	}
 
 	var finalConvID string
 	for chunk := range ch {
@@ -4109,9 +4172,10 @@ func (api *APIServer) streamResponses(
 		// Handle text content
 		if chunk.Text != "" {
 			if toolCallingEnabled {
-				// Buffer text for tool call parsing at the end
+				// Keep the raw transport for final tool-call parsing, while
+				// publishing only decoded assistant content.
 				fullText += chunk.Text
-				contentExtractor.Feed(chunk.Text)
+				emitSimulatedDelta(contentExtractor.Feed(chunk.Text))
 			} else {
 				if !messageItemEmitted {
 					// Emit message output item
@@ -4238,8 +4302,9 @@ func (api *APIServer) streamResponses(
 	finishReason := "stop"
 
 	if toolCallingEnabled {
+		initialParseText := contentExtractor.ParseText()
 		simulated, parseErr := parseResponsesSimulationWithRetry(
-			fullText,
+			initialParseText,
 			toolPolicy,
 			func() (string, error) {
 				if sid != "" {
@@ -4257,8 +4322,10 @@ func (api *APIServer) streamResponses(
 				}
 				fullText = retryResult.text
 				finalConvID = retryResult.conversationID
-				contentExtractor = toolcalling.ContentStreamExtractor{}
-				contentExtractor.Feed(retryResult.text)
+				if !messageItemEmitted {
+					contentExtractor = toolcalling.ContentStreamExtractor{}
+					contentExtractor.Feed(retryResult.text)
+				}
 				return retryResult.text, nil
 			},
 			func() (string, error) {
@@ -4277,8 +4344,10 @@ func (api *APIServer) streamResponses(
 				}
 				fullText = retryResult.text
 				finalConvID = retryResult.conversationID
-				contentExtractor = toolcalling.ContentStreamExtractor{}
-				contentExtractor.Feed(retryResult.text)
+				if !messageItemEmitted {
+					contentExtractor = toolcalling.ContentStreamExtractor{}
+					contentExtractor.Feed(retryResult.text)
+				}
 				return retryResult.text, nil
 			},
 		)
@@ -4302,13 +4371,19 @@ func (api *APIServer) streamResponses(
 		committedContent := contentExtractor.Commit(
 			toolPolicy.allowedToolNames,
 		)
+		emitSimulatedDelta(committedContent)
 		if len(simulated.toolCalls) == 0 &&
 			(committedContent != "" || simulated.content == "") {
-			simulated.content = committedContent
+			simulated.content = simulatedPublishedText
+		} else if messageItemEmitted {
+			simulated.content = simulatedPublishedText
 		}
 		fullText = simulated.content
 		toolCalls = simulated.toolCalls
 		finishReason = simulated.finishReason
+		if truncated {
+			finishReason = "length"
+		}
 		if responsesResultEmpty(fullText, toolCalls) {
 			if sid != "" {
 				api.ctxCache.Delete("session:" + sid)
