@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [1.3.6] - 2026-07-12
+
+### Changed
+- Move the project to Go 1.26 and adopt standard-library iterators (`slices.Backward`, `strings.SplitSeq`)
+- Bump the Docker base images to `golang:1.26-alpine` and `alpine:3.24` and update the `gorilla/websocket` dependency
+- Update pinned GitHub Actions to their latest releases via Dependabot
+
 ## [1.3.5] - 2026-07-12
 
 ### Added
