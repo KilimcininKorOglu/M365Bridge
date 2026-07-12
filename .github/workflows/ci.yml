@@ -49,6 +49,25 @@ jobs:
           if [ "$GOOS" = "windows" ]; then EXT=".exe"; fi
           go build -o "bin/m365-bridge-${{ matrix.goos }}-${{ matrix.goarch }}${EXT}" ./cmd/cli
 
+  modernize:
+    name: Modernize
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: true
+
+      # The modernize analyzer ships in gopls and requires a newer Go toolchain
+      # than the module targets. GOTOOLCHAIN=auto lets `go run` fetch it while
+      # the project itself stays on Go 1.22.
+      - name: Run gopls modernize analyzer
+        env:
+          GOTOOLCHAIN: auto
+        run: go run golang.org/x/tools/gopls/internal/analysis/modernize/cmd/modernize@v0.23.0 ./...
+
   docker:
     name: Docker Build
     runs-on: ubuntu-latest
