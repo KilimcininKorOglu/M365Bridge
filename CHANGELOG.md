@@ -6,6 +6,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [1.5.0] - 2026-09-04
+
+### Added
+- Serve an image the model generates inside an ordinary chat answer. The link M365 returns can only be fetched with a designer token in `Authorization` plus a `fileToken` header, so no client could ever load it; every chat responder now rewrites it to `/v1/images/{ref}` and this gateway downloads the bytes itself. The reference is minted here and resolved from an in-memory store, never taken from the caller, so the route opens no SSRF surface
+- Report that a picture is being generated while the turn waits for it. M365 announces the work about a minute before the address arrives, and the turn previously looked stalled. The state travels as `StreamChunk.Notice` and goes out as an SSE comment, so it enters no field contract, reaches no transcript, and an OpenAI or Anthropic client ignores it exactly as it ignores the keepalive
+- Show that waiting state in the browser interface, in the reader's own language, and clear it by itself when the answer starts
+- Read and write the account's Copilot personalization flags through `GET /v1/personalization` and `PATCH /v1/personalization`. M365 keeps a memory on the account rather than on a conversation, and it was measured reaching a brand-new conversation: content stored in an earlier session shaped a turn nobody asked to personalize. A write is verified by reading the flags back, because the endpoint answers 200 without moving the flag
+- Offer that memory as a switch at the bottom of the interface sidebar. It is the operator's real M365 setting and reaches their web and mobile clients too, so nothing here changes it on its own, and a tenant that forbids personalization is reported rather than silently ignored
+
+### Changed
+- Ask the backend to merge pure deltas with the `feature.EnableMergingPureDeltas` variant. One long answer arrived as about 840 `writeAtCursor` deltas without it and about 130 with it, carrying the same bytes. Every other flag in the `variants` string was measured against the live backend and found inert
+- Raise every Go declaration to 1.26.6, so `GOTOOLCHAIN=auto` cannot resolve an older toolchain and the workflows track the module floor through `go-version-file: go.mod` instead of a literal that drifts from it
+- Count the snapshots `snapshotDelta` refuses and report the total on the turn's completion line. The refusals are correct and scale with the citations in the answer, but they were silent, so a turn that lost answer text looked exactly like a turn that lost nothing
+- Annotate the directory open in `syncDir` as the proven-safe call it is, with the reason in the code, so the security gate reports zero rather than one permanent finding
+- Pin that the middleware hands a streaming handler a working `http.Flusher`. Every SSE route asserts it and answers 500 when the assertion fails, so a middleware that wrapped the writer in a type without `Flush` would take all seven streaming routes down at once
+- Document the Copilot memory switch in both READMEs
+
+### Fixed
+- Sync the directory after the atomic rename. Syncing a file commits its contents and not the name that points at them, so a power cut just after a successful write could lose it entirely rather than leave it torn
+- Keep a generated image out of the snapshot baseline. The image markdown this package injects is never restated by a backend snapshot, so counting it into the baseline made the answer's first snapshot diverge and the opening words of the reply were dropped
+- Verify a refresh token in the setup wizard by redeeming it, and stage it before the permanent file is written. Verifying through `Get` proved nothing, because `Get` returns a cached access token without reading the refresh token, so a placeholder passed whenever the previous run's cache was still warm
+- Take the tenant and oid written to `data/.env` from the redeemed access token's claims rather than from the setup file. The oid takes no part in the token exchange, so nothing else in the wizard can tell a wrong one from a right one, and a wrong one surfaced much later as a failed chat request
+
 ## [1.4.9] - 2026-08-24
 
 ### Changed

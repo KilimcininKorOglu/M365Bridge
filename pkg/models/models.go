@@ -14,7 +14,7 @@ import (
 
 // Version is the application version, shared across all binaries.
 // Overridable at build time via ldflags: -X github.com/KilimcininKorOglu/M365Bridge/pkg/models.Version=x.y.z
-var Version = "1.4.9"
+var Version = "1.5.0"
 
 const (
 	// DefaultClientID is the default Microsoft 365 Copilot client ID.
