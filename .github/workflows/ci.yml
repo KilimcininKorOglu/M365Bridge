@@ -94,10 +94,14 @@ jobs:
           cache: true
 
       # Pin the toolchain so the modernize analyzer runs against a fixed Go
-      # version regardless of the setup-go patch release.
+      # version regardless of the setup-go patch release. `local` is the fixed
+      # version setup-go just installed from go-version-file, which is the
+      # go.mod floor. A literal here is a second declaration of that floor and
+      # drifts below it the moment go.mod is raised, which fails the job with
+      # "go.mod requires go >= X (running go Y)".
       - name: Run gopls modernize analyzer
         env:
-          GOTOOLCHAIN: go1.26.5
+          GOTOOLCHAIN: local
         run: go run golang.org/x/tools/gopls/internal/analysis/modernize/cmd/modernize@v0.23.0 ./...
 
   docker:
