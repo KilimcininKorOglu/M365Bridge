@@ -14,6 +14,9 @@ __pycache__/*
 
 # Docker
 docker-data/
+# Local compose overrides. Compose reads this automatically, so a committed one
+# would change every machine and the release path with it.
+docker-compose.override.yml
 webui_analysis.md
 encryption.key
 .gocache/
