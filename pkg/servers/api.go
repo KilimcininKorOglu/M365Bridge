@@ -2575,9 +2575,7 @@ func (api *APIServer) respondBufferedChat(w http.ResponseWriter, result toolLoop
 func (api *APIServer) nonStreamChatCompletions(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, sid, convID string, maxTokens int, hasTools bool, tools []toolcalling.ToolDef, toolChoice string, stopSequences []string, noParallel bool) {
 	respText, thinking, toolCalls, finishReason, finalConvID, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
 	if err != nil {
-		if sid != "" {
-			api.ctxCache.Delete(sessionKeyPrefix + sid)
-		}
+		api.forgetSession(sid)
 		api.sendUpstreamError(w, "chat", err)
 		return
 	}
@@ -2592,87 +2590,20 @@ func (api *APIServer) nonStreamChatCompletions(w http.ResponseWriter, messages [
 
 	// Parse simulated tool calls from response text if tool calling is enabled
 	if hasTools {
-		contracts := toolcalling.ContractsFor(tools).WithChoice(toolChoice).WithoutParallel(noParallel)
-		sim := toolcalling.ParseSimulatedResponse(respText, toolNamesFromDefs(tools), contracts)
-		sim = api.repairSimulatedToolCalls(toolLoopOpenAI, messages, cfg, tools, contracts, respText, sim)
-		sim = dropSettledToolCalls(buildToolLedger(messages), toolChoice, sim)
-		if sim.HasPayload {
-			if len(sim.ToolCalls) > 0 {
-				finishReason = "tool_calls"
-				for _, pc := range sim.ToolCalls {
-					toolCalls = append(toolCalls, client.ToolCall{
-						ID:       pc.ID,
-						Type:     "function",
-						Function: client.ToolCallFunction{Name: pc.Name, Namespace: pc.Namespace, Arguments: string(pc.Arguments)},
-					})
-				}
-				respText = ""
-			} else {
-				respText = sim.Content
-				finishReason = "stop"
-			}
-		} else {
-			// M365 did not return a simulated JSON payload (e.g. it ran
-			// its own server-side tools and returned plain text). Since
-			// we discarded backend-injected toolCalls above, reset the
-			// finish reason so we don't report tool_use with no blocks.
-			finishReason = "stop"
-			respText = toolcalling.WithholdTransportEnvelope(respText)
-		}
+		respText, toolCalls, finishReason = api.applySimulatedToolCalls(
+			toolLoopOpenAI, messages, cfg, tools, toolChoice, noParallel, respText, toolCalls,
+		)
 	}
 
 	if blockedByContentPolicy(respText, toolCalls) {
-		if sid != "" {
-			api.ctxCache.Delete(sessionKeyPrefix + sid)
-		}
+		api.forgetSession(sid)
 		api.sendContentBlockedError(w, respText)
 		return
 	}
 	respText = withoutUnverifiedCompletionClaim(respText, hasTools, buildToolLedger(messages), toolCalls)
+	respText, finishReason = cutChatAnswer(respText, finishReason, stopSequences, maxTokens)
 
-	// A stop sequence ends the answer where the caller said it ends. OpenAI
-	// reports that as the ordinary "stop", the same as an answer that ended on
-	// its own, so only the text changes.
-	if cut, matched := cutAtStopSequence(respText, stopSequences); matched != "" {
-		respText = cut
-		finishReason = "stop"
-	}
-
-	// Enforce max_tokens on response text
-	if maxTokens > 0 {
-		if truncated, ok := truncateToTokens(respText, maxTokens); ok {
-			respText = truncated
-			finishReason = "length"
-		}
-	}
-
-	msg := map[string]any{
-		"role":    "assistant",
-		"content": respText,
-	}
-
-	if thinking != "" {
-		msg["reasoning_content"] = thinking
-	}
-
-	if len(toolCalls) > 0 {
-		openaiToolCalls := make([]map[string]any, len(toolCalls))
-		for i, tc := range toolCalls {
-			openaiToolCalls[i] = map[string]any{
-				"index": i,
-				"id":    tc.ID,
-				"type":  "function",
-				"function": map[string]string{
-					"name":      tc.Function.Name,
-					"arguments": tc.Function.Arguments,
-				},
-			}
-		}
-		msg["tool_calls"] = openaiToolCalls
-		if respText == "" {
-			msg["content"] = nil
-		}
-	}
+	msg := openAIAssistantMessage(respText, thinking, toolCalls)
 
 	promptTok := countPromptTokens(messages, tools, toolChoice)
 	completionTok := countTokens(respText) + outputProtocolTokens
@@ -2701,6 +2632,96 @@ func (api *APIServer) nonStreamChatCompletions(w http.ResponseWriter, messages [
 	api.storeSessionMapping(sid, finalConvID)
 	api.recordAssistantTurn(sid, cfg.OpenAIID, respText, thinking)
 	api.sendJSON(w, http.StatusOK, response)
+}
+
+// forgetSession drops a session's conversation binding, so the next turn does
+// not continue a conversation this one could not use.
+func (api *APIServer) forgetSession(sid string) {
+	if sid != "" {
+		api.ctxCache.Delete(sessionKeyPrefix + sid)
+	}
+}
+
+// applySimulatedToolCalls parses the simulated tool calls out of the answer in
+// the provider's own shape, and reports the text, the calls and the finish
+// reason that follow from it.
+func (api *APIServer) applySimulatedToolCalls(provider toolLoopProvider, messages []payload.Message, cfg models.ModelConfig, tools []toolcalling.ToolDef, toolChoice string, noParallel bool, respText string, toolCalls []client.ToolCall) (string, []client.ToolCall, string) {
+	contracts := toolcalling.ContractsFor(tools).WithChoice(toolChoice).WithoutParallel(noParallel)
+	sim := parseLoopSimulation(provider, respText, tools, contracts)
+	sim = api.repairSimulatedToolCalls(provider, messages, cfg, tools, contracts, respText, sim)
+	sim = dropSettledToolCalls(buildToolLedger(messages), toolChoice, sim)
+
+	if !sim.HasPayload {
+		// M365 did not return a simulated JSON payload (e.g. it ran its own
+		// server-side tools and returned plain text). Since the backend-injected
+		// tool calls were discarded above, reset the finish reason so we do not
+		// report tool_use with no blocks.
+		return toolcalling.WithholdTransportEnvelope(respText), toolCalls, "stop"
+	}
+	if len(sim.ToolCalls) == 0 {
+		return sim.Content, toolCalls, "stop"
+	}
+	for _, pc := range sim.ToolCalls {
+		toolCalls = append(toolCalls, client.ToolCall{
+			ID:       pc.ID,
+			Type:     "function",
+			Function: client.ToolCallFunction{Name: pc.Name, Namespace: pc.Namespace, Arguments: string(pc.Arguments)},
+		})
+	}
+	return "", toolCalls, "tool_calls"
+}
+
+// cutChatAnswer applies the caller's stop sequence and max_tokens.
+//
+// A stop sequence ends the answer where the caller said it ends. OpenAI reports
+// that as the ordinary "stop", the same as an answer that ended on its own, so
+// only the text changes. max_tokens wins when it is reached first.
+func cutChatAnswer(respText, finishReason string, stopSequences []string, maxTokens int) (string, string) {
+	if cut, matched := cutAtStopSequence(respText, stopSequences); matched != "" {
+		respText = cut
+		finishReason = "stop"
+	}
+	if maxTokens > 0 {
+		if truncated, ok := truncateToTokens(respText, maxTokens); ok {
+			respText = truncated
+			finishReason = "length"
+		}
+	}
+	return respText, finishReason
+}
+
+// openAIAssistantMessage builds the assistant message of a chat completion. A
+// turn that produced only tool calls carries a null content, which is what the
+// OpenAI schema declares.
+func openAIAssistantMessage(respText, thinking string, toolCalls []client.ToolCall) map[string]any {
+	msg := map[string]any{
+		"role":    "assistant",
+		"content": respText,
+	}
+	if thinking != "" {
+		msg["reasoning_content"] = thinking
+	}
+	if len(toolCalls) == 0 {
+		return msg
+	}
+
+	openaiToolCalls := make([]map[string]any, len(toolCalls))
+	for i, tc := range toolCalls {
+		openaiToolCalls[i] = map[string]any{
+			"index": i,
+			"id":    tc.ID,
+			"type":  "function",
+			"function": map[string]string{
+				"name":      tc.Function.Name,
+				"arguments": tc.Function.Arguments,
+			},
+		}
+	}
+	msg["tool_calls"] = openaiToolCalls
+	if respText == "" {
+		msg["content"] = nil
+	}
+	return msg
 }
 
 // streamAnthropicMessages streams messages in Anthropic SSE format.
@@ -3065,18 +3086,9 @@ func (api *APIServer) respondBufferedAnthropic(w http.ResponseWriter, result too
 	if len(result.toolCalls) > 0 {
 		stopReason = "tool_use"
 	}
-	// The answer ends where the caller said it ends, and Anthropic names the
-	// sequence that ended it alongside the reason.
-	cut, matchedStop := cutAtStopSequence(result.text, stopSequences)
-	if matchedStop != "" {
-		result.text, stopReason = cut, "stop_sequence"
-	}
-	if maxTokens > 0 {
-		if truncated, ok := truncateToTokens(result.text, maxTokens); ok {
-			result.text, stopReason = truncated, "max_tokens"
-			matchedStop = ""
-		}
-	}
+	var matchedStop string
+	result.text, stopReason, matchedStop = cutAnthropicAnswer(result.text, stopReason, stopSequences, maxTokens)
+
 	content := []map[string]any{}
 	if result.text != "" {
 		content = append(content, map[string]any{"type": "text", "text": result.text})
@@ -3088,48 +3100,111 @@ func (api *APIServer) respondBufferedAnthropic(w http.ResponseWriter, result too
 		}
 		content = append(content, map[string]any{"type": "tool_use", "id": call.ID, "name": call.Function.Name, "input": input})
 	}
+
 	usage := anthropicUsage(messages, tools, toolChoice, result.text, result.thinking)
 	response := map[string]any{"id": fmt.Sprintf("msg_%s", uuid.New().String()), "type": "message", "role": "assistant", "content": content, "model": model, "stop_reason": stopReason, "stop_sequence": nullableString(matchedStop), "usage": usage}
 	if !stream {
 		api.sendJSON(w, http.StatusOK, response)
 		return
 	}
+	api.replayAnthropicSSE(w, response, content, model, usage, stopReason, matchedStop, countTokens(result.text))
+}
+
+// cutAnthropicAnswer applies the caller's stop sequence and max_tokens.
+//
+// The answer ends where the caller said it ends, and Anthropic names the
+// sequence that ended it alongside the reason. max_tokens wins when it is
+// reached first, and clears the match.
+func cutAnthropicAnswer(respText, stopReason string, stopSequences []string, maxTokens int) (string, string, string) {
+	cut, matchedStop := cutAtStopSequence(respText, stopSequences)
+	if matchedStop != "" {
+		respText, stopReason = cut, "stop_sequence"
+	}
+	if maxTokens > 0 {
+		if truncated, ok := truncateToTokens(respText, maxTokens); ok {
+			respText, stopReason = truncated, "max_tokens"
+			matchedStop = ""
+		}
+	}
+	return respText, stopReason, matchedStop
+}
+
+// anthropicToolUseInput decodes a call's arguments for a tool_use block.
+//
+// Arguments that do not parse become an empty object rather than a missing
+// field, because a tool_use block without input is not a shape the Anthropic
+// clients accept.
+func anthropicToolUseInput(arguments string) any {
+	var input any
+	if err := json.Unmarshal([]byte(arguments), &input); err != nil || input == nil {
+		return map[string]any{}
+	}
+	return input
+}
+
+// anthropicContentBlocks renders one answer as Anthropic content blocks, in the
+// order the protocol expects: reasoning, then text, then the tool calls.
+func anthropicContentBlocks(thinking, respText string, toolCalls []client.ToolCall) []map[string]any {
+	content := []map[string]any{}
+	if thinking != "" {
+		content = append(content, map[string]any{"type": "thinking", "thinking": thinking, "signature": ""})
+	}
+	if respText != "" {
+		content = append(content, map[string]any{"type": "text", "text": respText})
+	}
+	for _, tc := range toolCalls {
+		content = append(content, map[string]any{
+			"type":  "tool_use",
+			"id":    tc.ID,
+			"name":  tc.Function.Name,
+			"input": anthropicToolUseInput(tc.Function.Arguments),
+		})
+	}
+	return content
+}
+
+// replayAnthropicSSE writes an already complete answer as the Anthropic event
+// stream, which is what a streaming request whose turn was buffered receives.
+func (api *APIServer) replayAnthropicSSE(w http.ResponseWriter, response map[string]any, content []map[string]any, model string, usage map[string]any, stopReason, matchedStop string, outputTokens int) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	api.sendAnthropicSSE(w, "message_start", map[string]any{"type": "message_start", "message": map[string]any{"id": response["id"], "type": "message", "role": "assistant", "content": []any{}, "model": model, "stop_reason": nil, "stop_sequence": nil, "usage": map[string]any{"input_tokens": usage["input_tokens"], "output_tokens": 0, "usage_source": usageSource()}}})
 	for i, block := range content {
-		switch block["type"] {
-		case "tool_use":
-			// tool_use input must stream as an input_json_delta fragment, not
-			// inline in content_block_start; SDK clients accumulate partial_json
-			// and otherwise see an empty input and loop forever.
-			start := map[string]any{"type": "tool_use", "id": block["id"], "name": block["name"], "input": map[string]any{}}
-			api.sendAnthropicSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": i, "content_block": start})
-			partial, err := json.Marshal(block["input"])
-			if err != nil || len(partial) == 0 {
-				partial = []byte("{}")
-			}
-			api.sendAnthropicSSE(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": i, "delta": map[string]any{"type": "input_json_delta", "partial_json": string(partial)}})
-		case "text":
-			api.sendAnthropicSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": i, "content_block": map[string]any{"type": "text", "text": ""}})
-			if txt, _ := block["text"].(string); txt != "" {
-				api.sendAnthropicSSE(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": i, "delta": map[string]any{"type": "text_delta", "text": txt}})
-			}
-		default:
-			api.sendAnthropicSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": i, "content_block": block})
-		}
+		api.replayAnthropicBlock(w, i, block)
 		api.sendAnthropicSSE(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": i})
 	}
-	api.sendAnthropicSSE(w, "message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": stopReason, "stop_sequence": nullableString(matchedStop)}, "usage": map[string]any{"output_tokens": countTokens(result.text)}})
+	api.sendAnthropicSSE(w, "message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": stopReason, "stop_sequence": nullableString(matchedStop)}, "usage": map[string]any{"output_tokens": outputTokens}})
 	api.sendAnthropicSSE(w, "message_stop", map[string]any{"type": "message_stop"})
+}
+
+// replayAnthropicBlock writes the start and the content of one block.
+func (api *APIServer) replayAnthropicBlock(w http.ResponseWriter, index int, block map[string]any) {
+	switch block["type"] {
+	case "tool_use":
+		// tool_use input must stream as an input_json_delta fragment, not
+		// inline in content_block_start; SDK clients accumulate partial_json
+		// and otherwise see an empty input and loop forever.
+		start := map[string]any{"type": "tool_use", "id": block["id"], "name": block["name"], "input": map[string]any{}}
+		api.sendAnthropicSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": index, "content_block": start})
+		partial, err := json.Marshal(block["input"])
+		if err != nil || len(partial) == 0 {
+			partial = []byte("{}")
+		}
+		api.sendAnthropicSSE(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": index, "delta": map[string]any{"type": "input_json_delta", "partial_json": string(partial)}})
+	case "text":
+		api.sendAnthropicSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": index, "content_block": map[string]any{"type": "text", "text": ""}})
+		if txt, _ := block["text"].(string); txt != "" {
+			api.sendAnthropicSSE(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": index, "delta": map[string]any{"type": "text_delta", "text": txt}})
+		}
+	default:
+		api.sendAnthropicSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": index, "content_block": block})
+	}
 }
 
 // nonStreamAnthropicMessages handles non-streaming Anthropic messages response.
 func (api *APIServer) nonStreamAnthropicMessages(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, anthropicModel string, maxTokens int, sid, convID string, hasTools bool, tools []toolcalling.ToolDef, toolChoice string, stopSequences []string, noParallel bool) {
 	respText, thinking, toolCalls, finishReason, finalConvID, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
 	if err != nil {
-		if sid != "" {
-			api.ctxCache.Delete(sessionKeyPrefix + sid)
-		}
+		api.forgetSession(sid)
 		api.sendUpstreamError(w, "chat", err)
 		return
 	}
@@ -3144,33 +3219,9 @@ func (api *APIServer) nonStreamAnthropicMessages(w http.ResponseWriter, messages
 
 	// Parse simulated tool calls from response text if tool calling is enabled
 	if hasTools {
-		contracts := toolcalling.ContractsFor(tools).WithChoice(toolChoice).WithoutParallel(noParallel)
-		sim := toolcalling.ParseSimulatedResponseAnthropic(respText, toolNamesFromDefs(tools), contracts)
-		sim = api.repairSimulatedToolCalls(toolLoopAnthropic, messages, cfg, tools, contracts, respText, sim)
-		sim = dropSettledToolCalls(buildToolLedger(messages), toolChoice, sim)
-		if sim.HasPayload {
-			if len(sim.ToolCalls) > 0 {
-				finishReason = "tool_calls"
-				for _, pc := range sim.ToolCalls {
-					toolCalls = append(toolCalls, client.ToolCall{
-						ID:       pc.ID,
-						Type:     "function",
-						Function: client.ToolCallFunction{Name: pc.Name, Namespace: pc.Namespace, Arguments: string(pc.Arguments)},
-					})
-				}
-				respText = ""
-			} else {
-				respText = sim.Content
-				finishReason = "stop"
-			}
-		} else {
-			// M365 did not return a simulated JSON payload (e.g. it ran
-			// its own server-side tools and returned plain text). Since
-			// we discarded backend-injected toolCalls above, reset the
-			// finish reason so we don't report tool_use with no blocks.
-			finishReason = "stop"
-			respText = toolcalling.WithholdTransportEnvelope(respText)
-		}
+		respText, toolCalls, finishReason = api.applySimulatedToolCalls(
+			toolLoopAnthropic, messages, cfg, tools, toolChoice, noParallel, respText, toolCalls,
+		)
 	}
 
 	stopReason := "end_turn"
@@ -3179,56 +3230,15 @@ func (api *APIServer) nonStreamAnthropicMessages(w http.ResponseWriter, messages
 	}
 
 	if blockedByContentPolicy(respText, toolCalls) {
-		if sid != "" {
-			api.ctxCache.Delete(sessionKeyPrefix + sid)
-		}
+		api.forgetSession(sid)
 		api.sendContentBlockedError(w, respText)
 		return
 	}
 	respText = withoutUnverifiedCompletionClaim(respText, hasTools, buildToolLedger(messages), toolCalls)
 
-	// The answer ends where the caller said it ends, and Anthropic names the
-	// sequence that ended it alongside the reason.
-	cut, matchedStop := cutAtStopSequence(respText, stopSequences)
-	if matchedStop != "" {
-		respText = cut
-		stopReason = "stop_sequence"
-	}
-
-	// Enforce max_tokens on response text
-	if maxTokens > 0 {
-		if truncated, ok := truncateToTokens(respText, maxTokens); ok {
-			respText = truncated
-			stopReason = "max_tokens"
-			matchedStop = ""
-		}
-	}
-
-	content := []map[string]any{}
-	if thinking != "" {
-		content = append(content, map[string]any{"type": "thinking", "thinking": thinking, "signature": ""})
-	}
-	if respText != "" {
-		content = append(content, map[string]any{"type": "text", "text": respText})
-	}
-
-	if len(toolCalls) > 0 {
-		for _, tc := range toolCalls {
-			var input any
-			// Arguments that do not parse become an empty object rather than a
-			// missing field, because a tool_use block without input is not a
-			// shape the Anthropic clients accept.
-			if err := json.Unmarshal([]byte(tc.Function.Arguments), &input); err != nil || input == nil {
-				input = map[string]any{}
-			}
-			content = append(content, map[string]any{
-				"type":  "tool_use",
-				"id":    tc.ID,
-				"name":  tc.Function.Name,
-				"input": input,
-			})
-		}
-	}
+	var matchedStop string
+	respText, stopReason, matchedStop = cutAnthropicAnswer(respText, stopReason, stopSequences, maxTokens)
+	content := anthropicContentBlocks(thinking, respText, toolCalls)
 
 	response := map[string]any{
 		"id":            fmt.Sprintf("msg_%s", uuid.New().String()),
