@@ -812,8 +812,7 @@ func (c *M365Client) sendRecv(conn *websocket.Conn, payload string) (string, err
 		return "", err
 	}
 
-	fullText := ""
-
+	var state sendRecvState
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(c.recvTimeout))
 		msgType, message, err := conn.ReadMessage()
@@ -827,58 +826,134 @@ func (c *M365Client) sendRecv(conn *websocket.Conn, payload string) (string, err
 			continue
 		}
 
-		text := string(message)
-		parts := strings.SplitSeq(text, signalRDelimiter)
-
-		for part := range parts {
-			part = strings.TrimSpace(part)
-			if part == "" {
-				continue
+		for part := range strings.SplitSeq(string(message), signalRDelimiter) {
+			step, err := state.frame(part)
+			if err != nil {
+				return "", err
 			}
-
-			var data map[string]any
-			if err := json.Unmarshal([]byte(part), &data); err != nil {
-				continue
-			}
-
-			if msgType, ok := data["type"].(float64); ok && int(msgType) == 1 {
-				if target, ok := data["target"].(string); ok && target == "update" {
-					if args, ok := data["arguments"].([]any); ok {
-						for _, arg := range args {
-							if argMap, ok := arg.(map[string]any); ok {
-								if msgs, ok := argMap["messages"].([]any); ok && len(msgs) > 0 {
-									if lastMsg, ok := msgs[len(msgs)-1].(map[string]any); ok && carriesAnswerText(lastMsg) {
-										if text, ok := lastMsg["text"].(string); ok {
-											// This path replaces rather than
-											// accumulates, so the whole text is
-											// stripped each time.
-											fullText = stripCitations(text)
-										}
-									}
-								}
-							}
-						}
-					}
-				}
-			} else if msgType, ok := data["type"].(float64); ok && int(msgType) == 2 {
-				// The backend reports whether the turn produced anything. A
-				// failed turn sends no answer message, so without this the
-				// caller receives empty text and no error.
-				if item, ok := data["item"].(map[string]any); ok {
-					if failure := parseTurnResult(item); failure != nil && fullText == "" {
-						logging.Errorf("sendRecv: %v", failure)
-						return "", failure
-					}
-				}
-			} else if msgType, ok := data["type"].(float64); ok && int(msgType) == 3 {
-				if fullText == "" {
-					logging.Errorf("sendRecv: %v", ErrEmptyTurn)
-					return "", ErrEmptyTurn
-				}
-				return fullText, nil
+			if step == frameDone {
+				return state.fullText, nil
 			}
 		}
 	}
+}
+
+// frameStep says what one SignalR frame means to a non-streaming turn.
+type frameStep int
+
+const (
+	// frameContinue keeps reading.
+	frameContinue frameStep = iota
+	// frameDone means the turn ended and the text is complete.
+	frameDone
+)
+
+// sendRecvState holds the answer of a non-streaming turn.
+type sendRecvState struct {
+	fullText string
+}
+
+// frame reads one SignalR frame.
+func (s *sendRecvState) frame(part string) (frameStep, error) {
+	data, ok := decodeSignalRFrame(part)
+	if !ok {
+		return frameContinue, nil
+	}
+	switch signalRFrameType(data) {
+	case 1:
+		s.applyUpdate(data)
+	case 2:
+		return frameContinue, s.turnResult(data)
+	case 3:
+		return frameDone, s.completion()
+	}
+	return frameContinue, nil
+}
+
+// applyUpdate adopts the answer snapshot an update frame carried.
+func (s *sendRecvState) applyUpdate(data map[string]any) {
+	if target, ok := data["target"].(string); !ok || target != "update" {
+		return
+	}
+	args, ok := data["arguments"].([]any)
+	if !ok {
+		return
+	}
+	for _, arg := range args {
+		argMap, ok := arg.(map[string]any)
+		if !ok {
+			continue
+		}
+		if text, ok := lastAnswerText(argMap); ok {
+			// This path replaces rather than accumulates, so the whole text is
+			// stripped each time.
+			s.fullText = stripCitations(text)
+		}
+	}
+}
+
+// turnResult reads the backend's verdict. A failed turn sends no answer
+// message, so without this the caller receives empty text and no error.
+func (s *sendRecvState) turnResult(data map[string]any) error {
+	item, ok := data["item"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	failure := parseTurnResult(item)
+	if failure == nil || s.fullText != "" {
+		return nil
+	}
+	logging.Errorf("sendRecv: %v", failure)
+	return failure
+}
+
+// completion answers the end-of-turn frame. A turn that produced no text is an
+// error rather than an empty answer.
+func (s *sendRecvState) completion() error {
+	if s.fullText == "" {
+		logging.Errorf("sendRecv: %v", ErrEmptyTurn)
+		return ErrEmptyTurn
+	}
+	return nil
+}
+
+// lastAnswerText reads the last message of an update argument when it carries
+// answer text. carriesAnswerText is what keeps the backend's own tool traffic
+// out of the answer.
+func lastAnswerText(argMap map[string]any) (string, bool) {
+	msgs, ok := argMap["messages"].([]any)
+	if !ok || len(msgs) == 0 {
+		return "", false
+	}
+	lastMsg, ok := msgs[len(msgs)-1].(map[string]any)
+	if !ok || !carriesAnswerText(lastMsg) {
+		return "", false
+	}
+	text, ok := lastMsg["text"].(string)
+	return text, ok
+}
+
+// decodeSignalRFrame decodes one delimiter-separated frame. Anything that is
+// not a JSON object is not a frame this client reads.
+func decodeSignalRFrame(part string) (map[string]any, bool) {
+	part = strings.TrimSpace(part)
+	if part == "" {
+		return nil, false
+	}
+	var data map[string]any
+	if err := json.Unmarshal([]byte(part), &data); err != nil {
+		return nil, false
+	}
+	return data, true
+}
+
+// signalRFrameType reads a frame's type, or 0 when it declares none.
+func signalRFrameType(data map[string]any) int {
+	frameType, ok := data["type"].(float64)
+	if !ok {
+		return 0
+	}
+	return int(frameType)
 }
 
 // answerAccumulator tracks what a turn has already put on the wire.
