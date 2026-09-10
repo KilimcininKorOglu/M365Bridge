@@ -1095,32 +1095,44 @@ func (api *APIServer) handleConversation(w http.ResponseWriter, r *http.Request)
 	conversationClient := client.NewConversationClient(api.tokenManager)
 	switch r.Method {
 	case http.MethodPatch:
-		var req struct {
-			Name string `json:"name"`
-		}
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
-			api.sendError(w, http.StatusBadRequest, "Invalid request body")
-			return
-		}
-		if strings.TrimSpace(req.Name) == "" {
-			api.sendError(w, http.StatusBadRequest, "name is required")
-			return
-		}
-		if err := conversationClient.RenameConversation(r.Context(), conversationID, strings.TrimSpace(req.Name)); err != nil {
-			api.sendConversationError(w, err)
-			return
-		}
-		api.sendJSON(w, http.StatusOK, map[string]any{"id": conversationID, "name": strings.TrimSpace(req.Name)})
+		api.renameConversation(w, r, conversationClient, conversationID)
 	case http.MethodDelete:
-		if err := conversationClient.DeleteConversation(r.Context(), conversationID); err != nil {
-			api.sendConversationError(w, err)
-			return
-		}
-		api.dropSessionsFor(conversationID)
-		w.WriteHeader(http.StatusNoContent)
+		api.deleteConversation(w, r, conversationClient, conversationID)
 	default:
 		api.sendError(w, http.StatusMethodNotAllowed, "Method not allowed")
 	}
+}
+
+// renameConversation gives an M365 web conversation a new name.
+func (api *APIServer) renameConversation(w http.ResponseWriter, r *http.Request, conversationClient *client.ConversationClient, conversationID string) {
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		api.sendError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		api.sendError(w, http.StatusBadRequest, "name is required")
+		return
+	}
+	if err := conversationClient.RenameConversation(r.Context(), conversationID, name); err != nil {
+		api.sendConversationError(w, err)
+		return
+	}
+	api.sendJSON(w, http.StatusOK, map[string]any{"id": conversationID, "name": name})
+}
+
+// deleteConversation removes the conversation upstream and drops every session
+// bound to it, because more than one session can point at one conversation.
+func (api *APIServer) deleteConversation(w http.ResponseWriter, r *http.Request, conversationClient *client.ConversationClient, conversationID string) {
+	if err := conversationClient.DeleteConversation(r.Context(), conversationID); err != nil {
+		api.sendConversationError(w, err)
+		return
+	}
+	api.dropSessionsFor(conversationID)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // readConversationHistory imports the turns of a conversation this gateway
@@ -4197,8 +4209,18 @@ func applyReasoningEffort(modelKey string, cfg models.ModelConfig, deliberate bo
 // context window legitimately sends results whose calls are no longer present.
 // Only a missing id is rejected in that case.
 func validateToolResultMessages(messages []payload.Message) error {
-	// A repeated id makes the loop ambiguous: neither the client nor this
-	// server can tell which call a later result answers.
+	known, err := declaredToolCallIDs(messages)
+	if err != nil {
+		return err
+	}
+	return validateToolResults(messages, known)
+}
+
+// declaredToolCallIDs collects the call ids this request declares.
+//
+// A repeated id makes the loop ambiguous: neither the client nor this server
+// can tell which call a later result answers.
+func declaredToolCallIDs(messages []payload.Message) (map[string]bool, error) {
 	known := make(map[string]bool)
 	for i := range messages {
 		for _, call := range messages[i].ToolCalls {
@@ -4206,29 +4228,42 @@ func validateToolResultMessages(messages []payload.Message) error {
 				continue
 			}
 			if known[call.ID] {
-				return fmt.Errorf("tool call id %q is declared more than once in this request", call.ID)
+				return nil, fmt.Errorf("tool call id %q is declared more than once in this request", call.ID)
 			}
 			known[call.ID] = true
 		}
 	}
+	return known, nil
+}
 
+// validateToolResults checks that every result answers exactly one declared
+// call.
+func validateToolResults(messages []payload.Message, known map[string]bool) error {
 	answered := make(map[string]bool)
 	for i := range messages {
 		if messages[i].Role == "tool" && messages[i].ToolCallID == "" {
 			return errors.New(`a message with role "tool" is missing tool_call_id`)
 		}
-		for _, result := range messages[i].ToolResults {
-			if result.ID == "" {
-				return errors.New("a tool result is missing the id of the tool call it answers")
-			}
-			if len(known) > 0 && !known[result.ID] {
-				return fmt.Errorf("tool result %q does not answer any tool call in this request", result.ID)
-			}
-			if answered[result.ID] {
-				return fmt.Errorf("tool call %q is answered more than once in this request", result.ID)
-			}
-			answered[result.ID] = true
+		if err := validateMessageToolResults(messages[i], known, answered); err != nil {
+			return err
 		}
+	}
+	return nil
+}
+
+// validateMessageToolResults checks the results one message carries.
+func validateMessageToolResults(message payload.Message, known, answered map[string]bool) error {
+	for _, result := range message.ToolResults {
+		if result.ID == "" {
+			return errors.New("a tool result is missing the id of the tool call it answers")
+		}
+		if len(known) > 0 && !known[result.ID] {
+			return fmt.Errorf("tool result %q does not answer any tool call in this request", result.ID)
+		}
+		if answered[result.ID] {
+			return fmt.Errorf("tool call %q is answered more than once in this request", result.ID)
+		}
+		answered[result.ID] = true
 	}
 	return nil
 }
