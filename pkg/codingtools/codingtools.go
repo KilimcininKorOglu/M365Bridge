@@ -507,30 +507,36 @@ func (m *Manager) applyPatch(ctx context.Context, a map[string]any) (string, boo
 	return result.Output, result.Truncated, nil
 }
 
-func (m *Manager) command(ctx context.Context, tool string, command any, stdin []byte) Result {
-	result := Result{Tool: tool}
-	timed, cancel := context.WithTimeout(ctx, m.config.Timeout)
-	defer cancel()
-	var cmd *exec.Cmd
+// buildCommand turns a command literal into a process. A string is a command
+// line the caller wrote and runs through the shell; a []string is an argument
+// vector this package built and is executed directly.
+func buildCommand(ctx context.Context, command any) (*exec.Cmd, error) {
 	switch value := command.(type) {
 	case string:
 		if strings.TrimSpace(value) == "" {
-			result.Error = "command is required"
-			return result
+			return nil, errors.New("command is required")
 		}
-		cmd = shellCommand(timed, value)
+		return shellCommand(ctx, value), nil
 	case []string:
 		if len(value) == 0 {
-			result.Error = "command is required"
-			return result
+			return nil, errors.New("command is required")
 		}
 		// Running a command is what this package is for, and it is off unless
 		// M365_ENABLE_CODE_TOOLS turns it on. Every []string form here is built
 		// from literals in Execute, never from caller text.
 		// #nosec G204
-		cmd = exec.CommandContext(timed, value[0], value[1:]...)
-	default:
-		result.Error = "invalid command"
+		return exec.CommandContext(ctx, value[0], value[1:]...), nil
+	}
+	return nil, errors.New("invalid command")
+}
+
+func (m *Manager) command(ctx context.Context, tool string, command any, stdin []byte) Result {
+	result := Result{Tool: tool}
+	timed, cancel := context.WithTimeout(ctx, m.config.Timeout)
+	defer cancel()
+	cmd, buildErr := buildCommand(timed, command)
+	if buildErr != nil {
+		result.Error = buildErr.Error()
 		return result
 	}
 	cmd.Dir = m.workspace
