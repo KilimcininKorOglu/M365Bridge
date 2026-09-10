@@ -4831,24 +4831,7 @@ func parseResponsesSimulation(text string, policy responsesToolPolicy) (response
 		finishReason: "stop",
 	}
 	simulated := toolcalling.ParseSimulatedResponseResponses(text, policy.allowedToolNames, toolcalling.ContractsFor(policy.tools).WithoutParallel(policy.noParallel))
-	// A grammar tool's body arrives unfenced, either as the lone bridge
-	// envelope or as bare source. It may be the whole reply, or it may end up
-	// as the extracted content of an otherwise valid envelope; either way it
-	// would reach the client as escaped source in an assistant message instead
-	// of a call. The candidate is whatever text is about to be forwarded.
-	if len(simulated.ToolCalls) == 0 {
-		candidate := text
-		if simulated.HasPayload {
-			candidate = simulated.Content
-		}
-		if call, ok := toolcalling.GrammarBodyCall(candidate, policy.tools, policy.allows); ok {
-			logging.Infof("parseResponsesSimulation: claimed an unfenced grammar body as a %q call", call.Name)
-			simulated.HasPayload = true
-			simulated.FinishReason = "tool_calls"
-			simulated.Content = ""
-			simulated.ToolCalls = []toolcalling.ToolCall{call}
-		}
-	}
+	simulated = claimGrammarBodyCall(text, simulated, policy)
 	if !policy.required {
 		simulated = dropSettledToolCalls(policy.ledger, "", simulated)
 	}
@@ -4856,38 +4839,81 @@ func parseResponsesSimulation(text string, policy responsesToolPolicy) (response
 		result.content = simulated.Content
 		if len(simulated.ToolCalls) > 0 {
 			result.finishReason = "tool_calls"
-			for _, parsed := range simulated.ToolCalls {
-				namespace, ok := resolveResponsesToolNamespace(
-					parsed.Name,
-					parsed.Namespace,
-					policy.tools,
-				)
-				if !ok {
-					continue
-				}
-				result.toolCalls = append(result.toolCalls, client.ToolCall{
-					ID:   parsed.ID,
-					Type: "function",
-					Function: client.ToolCallFunction{
-						Name:      parsed.Name,
-						Namespace: namespace,
-						Arguments: string(parsed.Arguments),
-					},
-				})
-			}
+			result.toolCalls = responsesToolCallsFrom(simulated.ToolCalls, policy)
 		}
 	}
 	if len(result.toolCalls) > 0 && strings.TrimSpace(result.content) == "" {
 		result.content = "I'm using the relevant tool now and will continue with its result."
 	}
 
-	if policy.required && len(result.toolCalls) == 0 {
-		if policy.requiredName != "" {
-			return responsesSimulationResult{}, fmt.Errorf("%w: required tool %q was not emitted", errSimulatedToolCallRequired, policy.requiredName)
-		}
-		return responsesSimulationResult{}, fmt.Errorf("%w: no valid client tool call was emitted", errSimulatedToolCallRequired)
+	if err := policy.requireEmittedCall(result.toolCalls); err != nil {
+		return responsesSimulationResult{}, err
 	}
 	return result, nil
+}
+
+// claimGrammarBodyCall claims an unfenced grammar tool body as a call.
+//
+// A grammar tool's body arrives unfenced, either as the lone bridge envelope or
+// as bare source. It may be the whole reply, or it may end up as the extracted
+// content of an otherwise valid envelope; either way it would reach the client
+// as escaped source in an assistant message instead of a call. The candidate is
+// whatever text is about to be forwarded.
+func claimGrammarBodyCall(text string, simulated toolcalling.SimulatedResult, policy responsesToolPolicy) toolcalling.SimulatedResult {
+	if len(simulated.ToolCalls) > 0 {
+		return simulated
+	}
+	candidate := text
+	if simulated.HasPayload {
+		candidate = simulated.Content
+	}
+	call, ok := toolcalling.GrammarBodyCall(candidate, policy.tools, policy.allows)
+	if !ok {
+		return simulated
+	}
+	logging.Infof("parseResponsesSimulation: claimed an unfenced grammar body as a %q call", call.Name)
+	simulated.HasPayload = true
+	simulated.FinishReason = "tool_calls"
+	simulated.Content = ""
+	simulated.ToolCalls = []toolcalling.ToolCall{call}
+	return simulated
+}
+
+// responsesToolCallsFrom resolves each parsed call's namespace and drops the
+// ones that name no declared tool.
+func responsesToolCallsFrom(parsedCalls []toolcalling.ToolCall, policy responsesToolPolicy) []client.ToolCall {
+	var calls []client.ToolCall
+	for _, parsed := range parsedCalls {
+		namespace, ok := resolveResponsesToolNamespace(
+			parsed.Name,
+			parsed.Namespace,
+			policy.tools,
+		)
+		if !ok {
+			continue
+		}
+		calls = append(calls, client.ToolCall{
+			ID:   parsed.ID,
+			Type: "function",
+			Function: client.ToolCallFunction{
+				Name:      parsed.Name,
+				Namespace: namespace,
+				Arguments: string(parsed.Arguments),
+			},
+		})
+	}
+	return calls
+}
+
+// requireEmittedCall enforces a tool_choice that demanded a call.
+func (p responsesToolPolicy) requireEmittedCall(toolCalls []client.ToolCall) error {
+	if !p.required || len(toolCalls) > 0 {
+		return nil
+	}
+	if p.requiredName != "" {
+		return fmt.Errorf("%w: required tool %q was not emitted", errSimulatedToolCallRequired, p.requiredName)
+	}
+	return fmt.Errorf("%w: no valid client tool call was emitted", errSimulatedToolCallRequired)
 }
 
 func parseResponsesSimulationWithRetry(
@@ -4898,24 +4924,44 @@ func parseResponsesSimulationWithRetry(
 ) (responsesSimulationResult, error) {
 	result, err := parseResponsesSimulation(text, policy)
 	if err == nil {
-		if emptyRetry == nil ||
-			!responsesResultEmpty(result.content, result.toolCalls) {
-			return result, nil
-		}
-		retryText, retryErr := emptyRetry()
-		if retryErr != nil {
-			return responsesSimulationResult{}, fmt.Errorf(
-				"empty simulated response retry failed: %w",
-				retryErr,
-			)
-		}
-		return parseResponsesSimulation(retryText, policy)
+		return retryEmptyResponsesSimulation(result, policy, emptyRetry)
 	}
 	if requiredRetry == nil ||
 		!errors.Is(err, errSimulatedToolCallRequired) {
 		return result, err
 	}
+	return retryRequiredResponsesSimulation(result, err, policy, requiredRetry)
+}
 
+// retryEmptyResponsesSimulation asks again when the turn parsed cleanly but
+// carried neither content nor a call.
+func retryEmptyResponsesSimulation(
+	result responsesSimulationResult,
+	policy responsesToolPolicy,
+	emptyRetry func() (string, error),
+) (responsesSimulationResult, error) {
+	if emptyRetry == nil ||
+		!responsesResultEmpty(result.content, result.toolCalls) {
+		return result, nil
+	}
+	retryText, retryErr := emptyRetry()
+	if retryErr != nil {
+		return responsesSimulationResult{}, fmt.Errorf(
+			"empty simulated response retry failed: %w",
+			retryErr,
+		)
+	}
+	return parseResponsesSimulation(retryText, policy)
+}
+
+// retryRequiredResponsesSimulation asks again when tool_choice demanded a call
+// the model did not emit. Two further attempts, then the failure stands.
+func retryRequiredResponsesSimulation(
+	result responsesSimulationResult,
+	err error,
+	policy responsesToolPolicy,
+	requiredRetry func() (string, error),
+) (responsesSimulationResult, error) {
 	for range 2 {
 		retryText, retryErr := requiredRetry()
 		if retryErr != nil {
