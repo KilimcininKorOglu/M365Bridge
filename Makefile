@@ -46,6 +46,7 @@ test: cache
 
 check: cache
 	$(DOCKER_GO) -e CGO_ENABLED=1 $(GO_IMAGE) sh -c '\
+		set -e; \
 		apk add --no-cache gcc musl-dev git >/dev/null; \
 		echo "--- gofmt ---"; test -z "$$(gofmt -l cmd pkg)" || { gofmt -l cmd pkg; exit 1; }; \
 		echo "--- vet ---"; go vet ./...; \
