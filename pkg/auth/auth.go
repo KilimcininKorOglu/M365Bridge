@@ -145,6 +145,13 @@ func aadstsCode(body string) string {
 	return "AADSTS" + digits[:end]
 }
 
+// refreshResponse is the token endpoint's answer to a refresh_token grant.
+type refreshResponse struct {
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+	ExpiresIn    int    `json:"expires_in"`
+}
+
 // refreshLocked performs the refresh token exchange. Callers must hold
 // refreshMu, which keeps the single-use refresh token from being redeemed by
 // two goroutines at once.
@@ -156,6 +163,25 @@ func (tm *TokenManager) refreshLocked() (string, error) {
 		return "", err
 	}
 
+	body, status, err := tm.redeemRefreshToken(refreshToken)
+	if err != nil {
+		return "", err
+	}
+	if status != http.StatusOK {
+		return tm.handleRefreshFailure(status, body)
+	}
+
+	var result refreshResponse
+	if err := json.Unmarshal(body, &result); err != nil {
+		logging.Errorf("TokenManager.Refresh: failed to parse response: %v", err)
+		return "", fmt.Errorf("%w: failed to parse response", ErrRefreshFailed)
+	}
+	return tm.storeRefreshResult(result)
+}
+
+// redeemRefreshToken posts the refresh_token grant and returns the bounded
+// response body with its status, so the caller decides what the status means.
+func (tm *TokenManager) redeemRefreshToken(refreshToken string) ([]byte, int, error) {
 	data := url.Values{}
 	data.Set("client_id", tm.clientID)
 	data.Set("refresh_token", refreshToken)
@@ -164,7 +190,7 @@ func (tm *TokenManager) refreshLocked() (string, error) {
 
 	req, err := http.NewRequest("POST", tm.tokenURL, bytes.NewBufferString(data.Encode()))
 	if err != nil {
-		return "", fmt.Errorf("%w: failed to create request", ErrRefreshFailed)
+		return nil, 0, fmt.Errorf("%w: failed to create request", ErrRefreshFailed)
 	}
 
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -174,47 +200,44 @@ func (tm *TokenManager) refreshLocked() (string, error) {
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("%w: %v", ErrRefreshFailed, err)
+		return nil, 0, fmt.Errorf("%w: %v", ErrRefreshFailed, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	// One extra byte distinguishes "exactly at the limit" from "truncated".
 	body, err := io.ReadAll(io.LimitReader(resp.Body, tokenResponseMax+1))
 	if err != nil {
-		return "", fmt.Errorf("%w: failed to read response", ErrRefreshFailed)
+		return nil, 0, fmt.Errorf("%w: failed to read response", ErrRefreshFailed)
 	}
 	if len(body) > tokenResponseMax {
-		return "", fmt.Errorf("%w: token response exceeds %d bytes", ErrRefreshFailed, tokenResponseMax)
+		return nil, 0, fmt.Errorf("%w: token response exceeds %d bytes", ErrRefreshFailed, tokenResponseMax)
 	}
+	return body, resp.StatusCode, nil
+}
 
-	if resp.StatusCode != http.StatusOK {
-		errMsg := string(body)
-		// Microsoft answers `invalid_grant` whenever the stored refresh token
-		// cannot be redeemed: AADSTS700084 for an expired one, AADSTS9002313 for
-		// a value that is not a token at all, and several more for a revoked or
-		// superseded one. The SSO cookies re-authenticate in every one of those
-		// cases, so the fallback keys on the OAuth error rather than on one
-		// AADSTS number, which left a recoverable install reporting a hard
-		// authentication failure.
-		if refreshTokenRejected(errMsg) && hasSSOCookies() {
-			logging.Warnf("TokenManager.Refresh: refresh token rejected (%s), falling back to SSO cookie re-auth", aadstsCode(errMsg))
-			return tm.reauthWithSSO()
-		}
-		logging.Errorf("TokenManager.Refresh: token refresh failed status=%d: %s", resp.StatusCode, errMsg[:min(200, len(errMsg))])
-		return "", fmt.Errorf("%w: status %d: %s", ErrRefreshFailed, resp.StatusCode, errMsg)
+// handleRefreshFailure answers a non-200 from the token endpoint, and falls
+// back to the SSO cookies when the stored refresh token is the thing that was
+// rejected.
+//
+// Microsoft answers `invalid_grant` whenever the stored refresh token cannot be
+// redeemed: AADSTS700084 for an expired one, AADSTS9002313 for a value that is
+// not a token at all, and several more for a revoked or superseded one. The SSO
+// cookies re-authenticate in every one of those cases, so the fallback keys on
+// the OAuth error rather than on one AADSTS number, which left a recoverable
+// install reporting a hard authentication failure.
+func (tm *TokenManager) handleRefreshFailure(status int, body []byte) (string, error) {
+	errMsg := string(body)
+	if refreshTokenRejected(errMsg) && hasSSOCookies() {
+		logging.Warnf("TokenManager.Refresh: refresh token rejected (%s), falling back to SSO cookie re-auth", aadstsCode(errMsg))
+		return tm.reauthWithSSO()
 	}
+	logging.Errorf("TokenManager.Refresh: token refresh failed status=%d: %s", status, errMsg[:min(200, len(errMsg))])
+	return "", fmt.Errorf("%w: status %d: %s", ErrRefreshFailed, status, errMsg)
+}
 
-	var result struct {
-		AccessToken  string `json:"access_token"`
-		RefreshToken string `json:"refresh_token"`
-		ExpiresIn    int    `json:"expires_in"`
-	}
-
-	if err := json.Unmarshal(body, &result); err != nil {
-		logging.Errorf("TokenManager.Refresh: failed to parse response: %v", err)
-		return "", fmt.Errorf("%w: failed to parse response", ErrRefreshFailed)
-	}
-
+// storeRefreshResult saves the rotated refresh token and caches the access
+// token the exchange returned.
+func (tm *TokenManager) storeRefreshResult(result refreshResponse) (string, error) {
 	// Save new refresh token if provided
 	if result.RefreshToken != "" {
 		if err := tm.writeRefreshToken(result.RefreshToken); err != nil {
