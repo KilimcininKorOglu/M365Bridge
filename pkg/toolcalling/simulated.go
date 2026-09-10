@@ -550,32 +550,28 @@ func finishAnthropicResult(result *SimulatedResult, textParts []string) {
 // scoreAnthropicCandidate scores a parsed JSON object by how much it resembles
 // an Anthropic Messages response. Higher is better; <=0 means unusable.
 func scoreAnthropicCandidate(candidate map[string]any) int {
-	score := 0
+	// Anthropic response has "content" array, "role", "stop_reason", "type":"message"
+	score := scoreAnthropicMarkers(candidate)
 	if isRequestLikeSimulatedPayload(candidate) {
 		score -= 180
 	}
 
-	// Anthropic response has "content" array, "role", "stop_reason", "type":"message"
-	content, hasContent := candidate["content"].([]any)
-	if hasContent && len(content) > 0 {
-		score += 220
-		// Check for tool_use / text blocks
-		for _, block := range content {
-			if bm, ok := block.(map[string]any); ok {
-				if bt, ok := bm["type"].(string); ok {
-					switch bt {
-					case "tool_use":
-						score += 90
-					case "text":
-						if t, ok := bm["text"].(string); ok && strings.TrimSpace(t) != "" {
-							score += 35
-						}
-					}
-				}
-			}
-		}
+	if content, hasContent := candidate["content"].([]any); hasContent && len(content) > 0 {
+		score += 220 + scoreAnthropicBlocks(content)
 	}
 
+	// Penalize OpenAI-shaped objects (choices array)
+	if _, ok := candidate["choices"].([]any); ok {
+		score -= 100
+	}
+
+	return score
+}
+
+// scoreAnthropicMarkers scores the fields that mark the message envelope rather
+// than its content.
+func scoreAnthropicMarkers(candidate map[string]any) int {
+	score := 0
 	if role, ok := candidate["role"].(string); ok && strings.ToLower(role) == "assistant" {
 		score += 30
 	}
@@ -588,12 +584,30 @@ func scoreAnthropicCandidate(candidate map[string]any) int {
 	if id, ok := candidate["id"].(string); ok && strings.HasPrefix(strings.ToLower(id), "msg_") {
 		score += 50
 	}
+	return score
+}
 
-	// Penalize OpenAI-shaped objects (choices array)
-	if _, ok := candidate["choices"].([]any); ok {
-		score -= 100
+// scoreAnthropicBlocks scores the tool_use and text blocks of a content array.
+func scoreAnthropicBlocks(content []any) int {
+	score := 0
+	for _, block := range content {
+		bm, ok := block.(map[string]any)
+		if !ok {
+			continue
+		}
+		bt, ok := bm["type"].(string)
+		if !ok {
+			continue
+		}
+		switch bt {
+		case "tool_use":
+			score += 90
+		case "text":
+			if t, ok := bm["text"].(string); ok && strings.TrimSpace(t) != "" {
+				score += 35
+			}
+		}
 	}
-
 	return score
 }
 
@@ -792,28 +806,8 @@ func scoreSimulatedCandidate(candidate map[string]any) int {
 		score -= 180
 	}
 
-	choices, ok := candidate["choices"].([]any)
-	if ok && len(choices) > 0 {
-		score += 220
-		if first, ok := choices[0].(map[string]any); ok {
-			if message, ok := first["message"].(map[string]any); ok {
-				score += 80
-				if role, ok := message["role"].(string); ok && strings.ToLower(role) == "assistant" {
-					score += 20
-				}
-				if tc, ok := message["tool_calls"].([]any); ok && len(tc) > 0 {
-					score += 90
-				}
-				if content, ok := message["content"].(string); ok && strings.TrimSpace(content) != "" {
-					score += 35
-				} else if arr, ok := message["content"].([]any); ok && len(arr) > 0 {
-					score += 20
-				}
-			}
-			if fr, ok := first["finish_reason"].(string); ok && fr != "" {
-				score += 15
-			}
-		}
+	if choices, ok := candidate["choices"].([]any); ok && len(choices) > 0 {
+		score += 220 + scoreChatChoice(choices[0])
 	}
 
 	if looksLikeChatChoiceObject(candidate) {
@@ -826,6 +820,39 @@ func scoreSimulatedCandidate(candidate map[string]any) int {
 		score += 50
 	}
 
+	return score
+}
+
+// scoreChatChoice scores the first choice of a chat.completion.
+func scoreChatChoice(node any) int {
+	first, ok := node.(map[string]any)
+	if !ok {
+		return 0
+	}
+	score := 0
+	if message, ok := first["message"].(map[string]any); ok {
+		score += 80 + scoreChatMessage(message)
+	}
+	if fr, ok := first["finish_reason"].(string); ok && fr != "" {
+		score += 15
+	}
+	return score
+}
+
+// scoreChatMessage scores the assistant message inside a chat.completion choice.
+func scoreChatMessage(message map[string]any) int {
+	score := 0
+	if role, ok := message["role"].(string); ok && strings.ToLower(role) == "assistant" {
+		score += 20
+	}
+	if tc, ok := message["tool_calls"].([]any); ok && len(tc) > 0 {
+		score += 90
+	}
+	if content, ok := message["content"].(string); ok && strings.TrimSpace(content) != "" {
+		score += 35
+	} else if arr, ok := message["content"].([]any); ok && len(arr) > 0 {
+		score += 20
+	}
 	return score
 }
 
@@ -932,41 +959,23 @@ func extractBalancedJSONSegments(rawText string) []string {
 // extractBalancedJSONSegment returns the balanced segment starting at `start`
 // with opening char `opening` ('{' or '['), or "" if unbalanced.
 func extractBalancedJSONSegment(rawText string, start int, opening byte) string {
-	var closing byte
+	closing := byte(']')
 	if opening == '{' {
 		closing = '}'
-	} else {
-		closing = ']'
 	}
-	depth := 0
-	inString := false
-	escaped := false
 
+	depth := 0
 	for i := start; i < len(rawText); i++ {
-		ch := rawText[i]
-		if inString {
-			if escaped {
-				escaped = false
-				continue
-			}
-			if ch == '\\' {
-				escaped = true
-				continue
-			}
-			if ch == '"' {
-				inString = false
-			}
-			continue
-		}
-		if ch == '"' {
-			inString = true
-			continue
-		}
-		if ch == opening {
+		switch rawText[i] {
+		case '"':
+			// A brace inside a string is text, so the whole string is skipped.
+			// An unterminated one runs the index past the end and the segment is
+			// reported unbalanced.
+			content, _ := scanStreamJSONString(rawText, i+1)
+			i += 1 + len(content)
+		case opening:
 			depth++
-			continue
-		}
-		if ch == closing {
+		case closing:
 			depth--
 			if depth == 0 {
 				return strings.TrimSpace(rawText[start : i+1])
