@@ -76,6 +76,17 @@ func TestModelsCarriesTheRequiredOpenAIFields(t *testing.T) {
 // created_at, and the list response carries first_id, last_id and has_more.
 func TestModelsCarriesTheRequiredAnthropicFields(t *testing.T) {
 	body := rawModels(t)
+	list := entries(t, body)
+	assertAnthropicListFields(t, body, list)
+	for _, e := range list {
+		assertAnthropicModelInfo(t, e)
+	}
+}
+
+// assertAnthropicListFields pins the paging fields of the list response, which
+// Anthropic clients read to decide whether another page exists.
+func assertAnthropicListFields(t *testing.T, body map[string]any, list []map[string]any) {
+	t.Helper()
 	if body["has_more"] != false {
 		t.Fatalf("has_more = %v, want false", body["has_more"])
 	}
@@ -84,34 +95,35 @@ func TestModelsCarriesTheRequiredAnthropicFields(t *testing.T) {
 			t.Fatalf("%s is missing: %v", key, body[key])
 		}
 	}
-
-	list := entries(t, body)
 	if body["first_id"] != list[0]["id"] {
 		t.Errorf("first_id = %v, want %v", body["first_id"], list[0]["id"])
 	}
 	if body["last_id"] != list[len(list)-1]["id"] {
 		t.Errorf("last_id = %v, want %v", body["last_id"], list[len(list)-1]["id"])
 	}
+}
 
-	for _, e := range list {
-		if e["type"] != "model" {
-			t.Errorf("%v: type = %v, want model", e["id"], e["type"])
-		}
-		name, ok := e["display_name"].(string)
-		if !ok || name == "" {
-			t.Errorf("%v: display_name is missing", e["id"])
-		}
-		if name == e["id"] {
-			t.Errorf("%v: display_name repeats the id instead of naming the model", e["id"])
-		}
-		created, ok := e["created_at"].(string)
-		if !ok {
-			t.Errorf("%v: created_at is missing", e["id"])
-			continue
-		}
-		if _, err := time.Parse(time.RFC3339, created); err != nil {
-			t.Errorf("%v: created_at %q is not RFC 3339: %v", e["id"], created, err)
-		}
+// assertAnthropicModelInfo pins the four fields the ModelInfo schema requires
+// of one entry.
+func assertAnthropicModelInfo(t *testing.T, e map[string]any) {
+	t.Helper()
+	if e["type"] != "model" {
+		t.Errorf("%v: type = %v, want model", e["id"], e["type"])
+	}
+	name, ok := e["display_name"].(string)
+	if !ok || name == "" {
+		t.Errorf("%v: display_name is missing", e["id"])
+	}
+	if name == e["id"] {
+		t.Errorf("%v: display_name repeats the id instead of naming the model", e["id"])
+	}
+	created, ok := e["created_at"].(string)
+	if !ok {
+		t.Errorf("%v: created_at is missing", e["id"])
+		return
+	}
+	if _, err := time.Parse(time.RFC3339, created); err != nil {
+		t.Errorf("%v: created_at %q is not RFC 3339: %v", e["id"], created, err)
 	}
 }
 
