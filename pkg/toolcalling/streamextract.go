@@ -124,123 +124,226 @@ func scanStreamContentCandidate(raw string, start int) (streamContentCandidate, 
 	if start < 0 || start >= len(raw) || raw[start] != '{' {
 		return streamContentCandidate{}, false
 	}
+	return newStreamContentScanner(raw, start).scan()
+}
 
-	candidate := streamContentCandidate{
-		start: start,
-		end:   len(raw),
+// scanStep says what the scan should do after reading one character.
+type scanStep int
+
+const (
+	// scanContinue keeps reading.
+	scanContinue scanStep = iota
+	// scanContentFound means the assistant content was located.
+	scanContentFound
+	// scanClosed means the top-level object ended.
+	scanClosed
+	// scanInvalid means the text cannot be the response this scanner reads.
+	scanInvalid
+)
+
+// streamContentScanner walks a partial chat completion looking for the
+// assistant message content, without waiting for the document to be complete.
+//
+// The three keys it tracks are nested: choices holds an array, a choice holds
+// message, and message holds content. Each one is therefore recognized only at
+// the depth the previous one opened, which is what the depth fields record.
+type streamContentScanner struct {
+	raw       string
+	start     int
+	candidate streamContentCandidate
+
+	curlyDepth  int
+	squareDepth int
+
+	choicesArrayDepth  int
+	choiceObjectDepth  int
+	messageObjectDepth int
+
+	expectedChoicesArray  int
+	expectedMessageObject int
+
+	inString    bool
+	escaped     bool
+	stringStart int
+}
+
+// newStreamContentScanner starts a scan at the opening brace at start.
+func newStreamContentScanner(raw string, start int) *streamContentScanner {
+	return &streamContentScanner{
+		raw:                   raw,
+		start:                 start,
+		candidate:             streamContentCandidate{start: start, end: len(raw)},
+		choicesArrayDepth:     -1,
+		choiceObjectDepth:     -1,
+		messageObjectDepth:    -1,
+		expectedChoicesArray:  -1,
+		expectedMessageObject: -1,
+		stringStart:           -1,
 	}
-	curlyDepth := 0
-	squareDepth := 0
-	choicesArrayDepth := -1
-	choiceObjectDepth := -1
-	messageObjectDepth := -1
-	expectedChoicesArray := -1
-	expectedMessageObject := -1
-	inString := false
-	escaped := false
-	stringStart := -1
+}
 
-	for index := start; index < len(raw); index++ {
-		char := raw[index]
-		if inString {
-			if escaped {
-				escaped = false
-				continue
-			}
-			if char == '\\' {
-				escaped = true
-				continue
-			}
-			if char != '"' {
-				continue
-			}
-
-			var token string
-			if err := json.Unmarshal(
-				[]byte(raw[stringStart-1:index+1]),
-				&token,
-			); err == nil {
-				colon := skipStreamWhitespace(raw, index+1)
-				if colon < len(raw) && raw[colon] == ':' {
-					value := skipStreamWhitespace(raw, colon+1)
-					switch {
-					case curlyDepth == 1 &&
-						squareDepth == 0 &&
-						token == "choices":
-						expectedChoicesArray = value
-					case choiceObjectDepth > 0 &&
-						curlyDepth == choiceObjectDepth &&
-						squareDepth == choicesArrayDepth &&
-						token == "message":
-						expectedMessageObject = value
-					case messageObjectDepth > 0 &&
-						curlyDepth == messageObjectDepth &&
-						squareDepth == choicesArrayDepth &&
-						token == "content":
-						candidate.contentFound = true
-						if value < len(raw) && raw[value] == '"' {
-							escapedContent, complete := scanStreamJSONString(
-								raw,
-								value+1,
-							)
-							candidate.content = decodeStreamJSONPrefix(
-								escapedContent,
-								complete,
-							)
-						}
-						candidate.end, candidate.complete = streamJSONEnd(
-							raw,
-							start,
-						)
-						return candidate, true
-					}
-				}
-			}
-			inString = false
-			continue
-		}
-
-		switch char {
-		case '"':
-			inString = true
-			escaped = false
-			stringStart = index + 1
-		case '{':
-			curlyDepth++
-			if index == expectedMessageObject {
-				messageObjectDepth = curlyDepth
-				candidate.shapeFound = true
-			} else if choicesArrayDepth > 0 &&
-				choiceObjectDepth < 0 &&
-				squareDepth == choicesArrayDepth &&
-				curlyDepth == 2 {
-				choiceObjectDepth = curlyDepth
-			}
-		case '}':
-			curlyDepth--
-			if curlyDepth == 0 {
-				candidate.end = index + 1
-				candidate.complete = true
-				return candidate, candidate.shapeFound
-			}
-			if curlyDepth < 0 {
-				return streamContentCandidate{}, false
-			}
-		case '[':
-			squareDepth++
-			if index == expectedChoicesArray {
-				choicesArrayDepth = squareDepth
-			}
-		case ']':
-			squareDepth--
-			if squareDepth < 0 {
-				return streamContentCandidate{}, false
-			}
+// scan reads the text and reports what it found. Text that runs out mid-object
+// still yields a candidate, because the caller is reading a stream.
+func (s *streamContentScanner) scan() (streamContentCandidate, bool) {
+	for index := s.start; index < len(s.raw); index++ {
+		switch s.step(index) {
+		case scanContentFound:
+			return s.candidate, true
+		case scanClosed:
+			return s.candidate, s.candidate.shapeFound
+		case scanInvalid:
+			return streamContentCandidate{}, false
 		}
 	}
+	s.candidate.end = len(s.raw)
+	return s.candidate, s.candidate.shapeFound
+}
 
-	candidate.end = len(raw)
-	return candidate, candidate.shapeFound
+// step reads one character.
+func (s *streamContentScanner) step(index int) scanStep {
+	if s.inString {
+		return s.stringChar(index, s.raw[index])
+	}
+	return s.structuralChar(index, s.raw[index])
+}
+
+// stringChar reads one character inside a JSON string.
+func (s *streamContentScanner) stringChar(index int, char byte) scanStep {
+	if s.escaped {
+		s.escaped = false
+		return scanContinue
+	}
+	if char == '\\' {
+		s.escaped = true
+		return scanContinue
+	}
+	if char != '"' {
+		return scanContinue
+	}
+	step := s.closeString(index)
+	s.inString = false
+	return step
+}
+
+// closeString reads the token that just ended. A token this scanner tracks is
+// only a key when a colon follows it.
+func (s *streamContentScanner) closeString(index int) scanStep {
+	var token string
+	if err := json.Unmarshal([]byte(s.raw[s.stringStart-1:index+1]), &token); err != nil {
+		return scanContinue
+	}
+	colon := skipStreamWhitespace(s.raw, index+1)
+	if colon >= len(s.raw) || s.raw[colon] != ':' {
+		return scanContinue
+	}
+	return s.keyValue(token, skipStreamWhitespace(s.raw, colon+1))
+}
+
+// keyValue records where the value of a tracked key begins.
+func (s *streamContentScanner) keyValue(token string, value int) scanStep {
+	switch {
+	case s.atChoicesKey(token):
+		s.expectedChoicesArray = value
+	case s.atMessageKey(token):
+		s.expectedMessageObject = value
+	case s.atContentKey(token):
+		s.readContent(value)
+		return scanContentFound
+	}
+	return scanContinue
+}
+
+// atChoicesKey reports whether the token is the top-level choices key.
+func (s *streamContentScanner) atChoicesKey(token string) bool {
+	return s.curlyDepth == 1 && s.squareDepth == 0 && token == "choices"
+}
+
+// atMessageKey reports whether the token is the message key of a choice.
+func (s *streamContentScanner) atMessageKey(token string) bool {
+	return s.choiceObjectDepth > 0 &&
+		s.curlyDepth == s.choiceObjectDepth &&
+		s.squareDepth == s.choicesArrayDepth &&
+		token == "message"
+}
+
+// atContentKey reports whether the token is the content key of a message.
+func (s *streamContentScanner) atContentKey(token string) bool {
+	return s.messageObjectDepth > 0 &&
+		s.curlyDepth == s.messageObjectDepth &&
+		s.squareDepth == s.choicesArrayDepth &&
+		token == "content"
+}
+
+// readContent records the content string, which may still be incomplete
+// because the document read so far is only a prefix of the response.
+func (s *streamContentScanner) readContent(value int) {
+	s.candidate.contentFound = true
+	if value < len(s.raw) && s.raw[value] == '"' {
+		escapedContent, complete := scanStreamJSONString(s.raw, value+1)
+		s.candidate.content = decodeStreamJSONPrefix(escapedContent, complete)
+	}
+	s.candidate.end, s.candidate.complete = streamJSONEnd(s.raw, s.start)
+}
+
+// structuralChar reads one character outside a JSON string.
+func (s *streamContentScanner) structuralChar(index int, char byte) scanStep {
+	switch char {
+	case '"':
+		s.inString = true
+		s.escaped = false
+		s.stringStart = index + 1
+	case '{':
+		s.openObject(index)
+	case '}':
+		return s.closeObject(index)
+	case '[':
+		s.squareDepth++
+		if index == s.expectedChoicesArray {
+			s.choicesArrayDepth = s.squareDepth
+		}
+	case ']':
+		s.squareDepth--
+		if s.squareDepth < 0 {
+			return scanInvalid
+		}
+	}
+	return scanContinue
+}
+
+// openObject enters an object and records it when it is the message object the
+// message key pointed at, or the choice object inside the choices array.
+func (s *streamContentScanner) openObject(index int) {
+	s.curlyDepth++
+	if index == s.expectedMessageObject {
+		s.messageObjectDepth = s.curlyDepth
+		s.candidate.shapeFound = true
+		return
+	}
+	if s.atChoiceObject() {
+		s.choiceObjectDepth = s.curlyDepth
+	}
+}
+
+// atChoiceObject reports whether the object being entered is the first choice.
+func (s *streamContentScanner) atChoiceObject() bool {
+	return s.choicesArrayDepth > 0 &&
+		s.choiceObjectDepth < 0 &&
+		s.squareDepth == s.choicesArrayDepth &&
+		s.curlyDepth == 2
+}
+
+// closeObject leaves an object and reports the end of the top-level one.
+func (s *streamContentScanner) closeObject(index int) scanStep {
+	s.curlyDepth--
+	if s.curlyDepth == 0 {
+		s.candidate.end = index + 1
+		s.candidate.complete = true
+		return scanClosed
+	}
+	if s.curlyDepth < 0 {
+		return scanInvalid
+	}
+	return scanContinue
 }
 
 func skipStreamWhitespace(raw string, index int) int {
