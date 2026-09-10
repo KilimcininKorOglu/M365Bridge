@@ -6770,54 +6770,29 @@ func (api *APIServer) streamResponses(
 	toolPolicy responsesToolPolicy,
 	goalOpen bool,
 ) {
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "close")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-
-	flusher, ok := w.(http.Flusher)
+	flusher, ok := api.beginSSE(w)
 	if !ok {
-		api.sendError(w, http.StatusInternalServerError, "Streaming not supported")
 		return
 	}
 
 	responseID, createdAt := newResponsesIdentity()
-	openaiModel := cfg.OpenAIID
-
-	// Helper to send a Responses SSE event
-	sequenceNumber := 0
-	sendEvent := func(eventType string, data map[string]any) {
-		data["type"] = eventType
-		data["sequence_number"] = sequenceNumber
-		sequenceNumber++
-		jsonData, _ := json.Marshal(data)
-		_, _ = fmt.Fprintf(w, "data: %s\n\n", jsonData)
-		flusher.Flush()
-	}
-	sendFailed := func(code, message string) {
-		event := buildResponsesFailedEvent(
-			responseID,
-			createdAt,
-			openaiModel,
-			code,
-			message,
-			sequenceNumber,
-		)
-		sequenceNumber++
-		jsonData, _ := json.Marshal(event)
-		_, _ = fmt.Fprintf(w, "data: %s\n\n", jsonData)
-		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
-		flusher.Flush()
+	stream := &responsesStream{
+		api:         api,
+		w:           w,
+		flusher:     flusher,
+		responseID:  responseID,
+		createdAt:   createdAt,
+		model:       cfg.OpenAIID,
+		msgID:       fmt.Sprintf("msg_%s", responseID),
+		reasoningID: fmt.Sprintf("rs_%s", responseID),
 	}
 
-	// Send response.created event
-	sendEvent("response.created", map[string]any{
-		"response": responsesStatusObject(responseID, openaiModel, "in_progress", createdAt),
+	// Send response.created and response.in_progress events
+	stream.event("response.created", map[string]any{
+		"response": responsesStatusObject(responseID, stream.model, "in_progress", createdAt),
 	})
-
-	// Send response.in_progress event
-	sendEvent("response.in_progress", map[string]any{
-		"response": responsesStatusObject(responseID, openaiModel, "in_progress", createdAt),
+	stream.event("response.in_progress", map[string]any{
+		"response": responsesStatusObject(responseID, stream.model, "in_progress", createdAt),
 	})
 
 	ch := responsesStreamWithEmptyRetry(
@@ -6825,11 +6800,7 @@ func (api *APIServer) streamResponses(
 		convID,
 		responsesEmptyRetrySchedule(toolPolicy.simulate),
 		toolPolicy.simulate,
-		func() {
-			if sid != "" {
-				api.ctxCache.Delete(sessionKeyPrefix + sid)
-			}
-		},
+		func() { api.forgetSession(sid) },
 		func(
 			callContext context.Context,
 			callConversationID string,
@@ -6847,109 +6818,6 @@ func (api *APIServer) streamResponses(
 		},
 	)
 
-	var fullTextBuilder strings.Builder
-	var thinkingText strings.Builder
-	truncated := false
-
-	// When tool calling is enabled, buffer all text and parse at the end
-	toolCallingEnabled := toolPolicy.simulate
-	var contentExtractor toolcalling.ContentStreamExtractor
-
-	// Track whether we've emitted the message output item
-	messageItemEmitted := false
-	reasoningItemEmitted := false
-	messageOutputIndex := 0
-	msgID := fmt.Sprintf("msg_%s", responseID)
-	reasoningID := fmt.Sprintf("rs_%s", responseID)
-	simulatedPublishedText := ""
-	emitSimulatedDelta := func(delta string) {
-		delta, published, limited := limitResponsesStreamDelta(
-			simulatedPublishedText,
-			delta,
-			maxTokens,
-		)
-		simulatedPublishedText = published
-		if limited {
-			truncated = true
-		}
-		if delta == "" {
-			return
-		}
-		if !messageItemEmitted {
-			outputIdx := 0
-			if reasoningItemEmitted {
-				outputIdx = 1
-			}
-			messageOutputIndex = outputIdx
-			sendEvent("response.output_item.added", map[string]any{
-				"output_index": outputIdx,
-				"item": map[string]any{
-					"id":      msgID,
-					"type":    "message",
-					"status":  "in_progress",
-					"role":    "assistant",
-					"phase":   "commentary",
-					"content": []any{},
-				},
-			})
-			sendEvent("response.content_part.added", map[string]any{
-				"item_id":       msgID,
-				"output_index":  outputIdx,
-				"content_index": 0,
-				"part": map[string]any{
-					"type":        "output_text",
-					"text":        "",
-					"annotations": []any{},
-				},
-			})
-			messageItemEmitted = true
-		}
-		sendEvent("response.output_text.delta", map[string]any{
-			"item_id":       msgID,
-			"output_index":  messageOutputIndex,
-			"content_index": 0,
-			"delta":         delta,
-		})
-	}
-
-	// Reasoning is streamed live; under simulated tool calling it passes through
-	// thinkingFilter first so the transport envelope never leaks. reasoningEmitted
-	// accumulates exactly what was published for the terminal done events.
-	var thinkingFilter toolcalling.ThinkingStreamFilter
-	var reasoningEmitted strings.Builder
-	reasoningFlushed := false
-	emitReasoning := func(delta string) {
-		if delta == "" {
-			return
-		}
-		reasoningEmitted.WriteString(delta)
-		if !reasoningItemEmitted {
-			sendEvent("response.output_item.added", map[string]any{
-				"output_index": 0,
-				"item": map[string]any{
-					"id":      reasoningID,
-					"type":    "reasoning",
-					"status":  "in_progress",
-					"summary": []map[string]any{{"type": "summary_text", "text": ""}},
-				},
-			})
-			sendEvent("response.reasoning_summary_part.added", map[string]any{
-				"item_id":       reasoningID,
-				"output_index":  0,
-				"summary_index": 0,
-				"part":          map[string]any{"type": "summary_text", "text": ""},
-			})
-			reasoningItemEmitted = true
-		}
-		sendEvent("response.reasoning_summary_text.delta", map[string]any{
-			"item_id":       reasoningID,
-			"output_index":  0,
-			"summary_index": 0,
-			"delta":         delta,
-		})
-	}
-
-	var finalConvID string
 	keepalive := time.NewTicker(sseKeepaliveInterval)
 	defer keepalive.Stop()
 	for {
@@ -6957,463 +6825,608 @@ func (api *APIServer) streamResponses(
 		if !more {
 			break
 		}
-		if chunk.Error != nil {
-			if sid != "" {
-				api.ctxCache.Delete(sessionKeyPrefix + sid)
-			}
-			_, code, message := streamErrorFields("responses", chunk.Error)
-			sendFailed(code, message)
+		step := stream.chunk(chunk, ch, maxTokens, toolPolicy.simulate, goalOpen, sid)
+		if step == streamLoopFailed {
 			return
 		}
-
-		if chunk.IsFinal {
-			finalConvID = chunk.ConversationID
+		if step == streamLoopStop {
 			break
 		}
-
-		chunk.Text = api.routeGeneratedImages(chunk.Text)
-
-		// Stream reasoning live. Under simulated tool calling it is filtered so
-		// the transport envelope never leaks; otherwise it passes through raw.
-		if chunk.Thinking != "" {
-			thinkingText.WriteString(chunk.Thinking)
-			if toolCallingEnabled {
-				emitReasoning(thinkingFilter.Feed(chunk.Thinking))
-			} else {
-				emitReasoning(chunk.Thinking)
-			}
-		}
-
-		// Handle text content
-		if chunk.Text != "" {
-			if toolCallingEnabled {
-				// Flush remaining reasoning before content so the reasoning item
-				// is fully emitted at output_index 0 ahead of the message item.
-				if !reasoningFlushed {
-					emitReasoning(thinkingFilter.Flush())
-					reasoningFlushed = true
-				}
-				// Keep the raw transport for final tool-call parsing, while
-				// publishing only decoded assistant content.
-				fullTextBuilder.WriteString(chunk.Text)
-				emitSimulatedDelta(contentExtractor.Feed(chunk.Text))
-			} else {
-				if !messageItemEmitted {
-					// Emit message output item
-					outputIdx := 0
-					if reasoningItemEmitted {
-						outputIdx = 1
-					}
-					sendEvent("response.output_item.added", map[string]any{
-						"output_index": outputIdx,
-						"item": map[string]any{
-							"id":     msgID,
-							"type":   "message",
-							"status": "in_progress",
-							"role":   "assistant",
-							// No tool call is known yet; the terminal item below names
-							// the phase again once the turn is parsed.
-							"phase":   responsesMessagePhase(goalOpen, nil),
-							"content": []any{},
-						},
-					})
-					sendEvent("response.content_part.added", map[string]any{
-						"item_id":       msgID,
-						"output_index":  outputIdx,
-						"content_index": 0,
-						"part": map[string]any{
-							"type":        "output_text",
-							"text":        "",
-							"annotations": []any{},
-						},
-					})
-					messageItemEmitted = true
-				}
-
-				// Check max_tokens
-				if maxTokens > 0 && countTokens(fullTextBuilder.String()+chunk.Text) > maxTokens {
-					remaining := maxTokens - countTokens(fullTextBuilder.String())
-					if remaining > 0 {
-						delta, _ := truncateToTokens(chunk.Text, remaining)
-						if delta != "" {
-							fullTextBuilder.WriteString(delta)
-							outputIdx := 0
-							if reasoningItemEmitted {
-								outputIdx = 1
-							}
-							sendEvent("response.output_text.delta", map[string]any{
-								"item_id":       msgID,
-								"output_index":  outputIdx,
-								"content_index": 0,
-								"delta":         delta,
-							})
-						}
-					}
-					truncated = true
-					// Drain remaining chunks
-					go func() {
-						for range ch {
-						}
-					}()
-					break
-				}
-
-				fullTextBuilder.WriteString(chunk.Text)
-				outputIdx := 0
-				if reasoningItemEmitted {
-					outputIdx = 1
-				}
-				sendEvent("response.output_text.delta", map[string]any{
-					"item_id":       msgID,
-					"output_index":  outputIdx,
-					"content_index": 0,
-					"delta":         chunk.Text,
-				})
-			}
-		}
 	}
-	fullText := fullTextBuilder.String()
+
+	fullText := stream.fullText.String()
 	if api.responsesRequestCanceled(ctx, sid) {
 		return
 	}
+	if !api.responsesStreamProducedContent(stream, sid, toolPolicy.simulate, fullText) {
+		return
+	}
+	stream.finalizeReasoning(toolPolicy.simulate)
 
-	if !toolCallingEnabled && responsesResultEmpty(fullText, nil) {
-		if sid != "" {
-			api.ctxCache.Delete(sessionKeyPrefix + sid)
-		}
-		sendFailed(
-			upstreamEmptyResponseCode,
-			"The upstream completed without assistant content or a tool call.",
-		)
+	fullText, toolCalls, finishReason, ok := api.finishResponsesStream(
+		ctx, stream, messages, cfg, sid, maxTokens, toolPolicy, goalOpen, fullText,
+	)
+	if !ok {
+		return
+	}
+	api.completeResponsesStream(stream, messages, toolPolicy, goalOpen, fullText, toolCalls, finishReason, sid)
+}
+
+// responsesStream carries what one Responses turn streams.
+//
+// The wire format is a numbered sequence of output items, so the sequence
+// number, which items were opened and the index each one sits at all have to
+// survive between chunks.
+type responsesStream struct {
+	api     *APIServer
+	w       http.ResponseWriter
+	flusher http.Flusher
+
+	responseID  string
+	createdAt   int64
+	model       string
+	msgID       string
+	reasoningID string
+
+	sequenceNumber int
+
+	fullText  strings.Builder
+	thinking  strings.Builder
+	truncated bool
+	convID    string
+
+	// contentExtractor decodes assistant content out of the transport envelope
+	// while the raw text is kept for the final tool-call parse.
+	contentExtractor toolcalling.ContentStreamExtractor
+	// thinkingFilter strips the transport envelope out of the reasoning
+	// channel, and reasoningEmitted accumulates exactly what was published.
+	thinkingFilter   toolcalling.ThinkingStreamFilter
+	reasoningEmitted strings.Builder
+	reasoningFlushed bool
+
+	messageItemEmitted   bool
+	reasoningItemEmitted bool
+	messageOutputIndex   int
+	publishedText        string
+}
+
+// event writes one Responses SSE event, numbering it in order.
+func (s *responsesStream) event(eventType string, data map[string]any) {
+	data["type"] = eventType
+	data["sequence_number"] = s.sequenceNumber
+	s.sequenceNumber++
+	jsonData, _ := json.Marshal(data)
+	_, _ = fmt.Fprintf(s.w, "data: %s\n\n", jsonData)
+	s.flusher.Flush()
+}
+
+// failed reports a failed turn and ends the stream.
+func (s *responsesStream) failed(code, message string) {
+	event := buildResponsesFailedEvent(
+		s.responseID,
+		s.createdAt,
+		s.model,
+		code,
+		message,
+		s.sequenceNumber,
+	)
+	s.sequenceNumber++
+	jsonData, _ := json.Marshal(event)
+	_, _ = fmt.Fprintf(s.w, "data: %s\n\n", jsonData)
+	_, _ = fmt.Fprint(s.w, "data: [DONE]\n\n")
+	s.flusher.Flush()
+}
+
+// failParse reports a simulation that could not be parsed. A required call the
+// model never made has its own code, because a client can act on that one.
+func (s *responsesStream) failParse(parseErr error) {
+	if errors.Is(parseErr, errSimulatedToolCallRequired) {
+		s.failed(simulatedToolCallRequiredCode, parseErr.Error())
+		return
+	}
+	s.failed("upstream_error", parseErr.Error())
+}
+
+// outputIndexAfterReasoning returns the item index that follows the reasoning
+// item, which occupies index 0 whenever it exists.
+func (s *responsesStream) outputIndexAfterReasoning() int {
+	if s.reasoningItemEmitted {
+		return 1
+	}
+	return 0
+}
+
+// openMessageItem announces the assistant message item and its content part.
+func (s *responsesStream) openMessageItem(outputIdx int, phase string) {
+	s.messageOutputIndex = outputIdx
+	s.event("response.output_item.added", map[string]any{
+		"output_index": outputIdx,
+		"item": map[string]any{
+			"id":      s.msgID,
+			"type":    "message",
+			"status":  "in_progress",
+			"role":    "assistant",
+			"phase":   phase,
+			"content": []any{},
+		},
+	})
+	s.event("response.content_part.added", map[string]any{
+		"item_id":       s.msgID,
+		"output_index":  outputIdx,
+		"content_index": 0,
+		"part": map[string]any{
+			"type":        "output_text",
+			"text":        "",
+			"annotations": []any{},
+		},
+	})
+	s.messageItemEmitted = true
+}
+
+// textDelta publishes one fragment of the assistant message.
+func (s *responsesStream) textDelta(outputIdx int, delta string) {
+	s.event("response.output_text.delta", map[string]any{
+		"item_id":       s.msgID,
+		"output_index":  outputIdx,
+		"content_index": 0,
+		"delta":         delta,
+	})
+}
+
+// emitSimulatedDelta publishes decoded assistant content under the token
+// ceiling, opening the message item on the first delta that survives it.
+func (s *responsesStream) emitSimulatedDelta(delta string, maxTokens int) {
+	delta, published, limited := limitResponsesStreamDelta(
+		s.publishedText,
+		delta,
+		maxTokens,
+	)
+	s.publishedText = published
+	if limited {
+		s.truncated = true
+	}
+	if delta == "" {
+		return
+	}
+	if !s.messageItemEmitted {
+		s.openMessageItem(s.outputIndexAfterReasoning(), "commentary")
+	}
+	s.textDelta(s.messageOutputIndex, delta)
+}
+
+// emitReasoning publishes one fragment of the reasoning summary, opening the
+// reasoning item on the first one.
+func (s *responsesStream) emitReasoning(delta string) {
+	if delta == "" {
+		return
+	}
+	s.reasoningEmitted.WriteString(delta)
+	if !s.reasoningItemEmitted {
+		s.event("response.output_item.added", map[string]any{
+			"output_index": 0,
+			"item": map[string]any{
+				"id":      s.reasoningID,
+				"type":    "reasoning",
+				"status":  "in_progress",
+				"summary": []map[string]any{{"type": "summary_text", "text": ""}},
+			},
+		})
+		s.event("response.reasoning_summary_part.added", map[string]any{
+			"item_id":       s.reasoningID,
+			"output_index":  0,
+			"summary_index": 0,
+			"part":          map[string]any{"type": "summary_text", "text": ""},
+		})
+		s.reasoningItemEmitted = true
+	}
+	s.event("response.reasoning_summary_text.delta", map[string]any{
+		"item_id":       s.reasoningID,
+		"output_index":  0,
+		"summary_index": 0,
+		"delta":         delta,
+	})
+}
+
+// finalizeReasoning releases whatever reasoning is still held and closes the
+// reasoning item.
+//
+// The flush covers the thinking-only case, where no content chunk triggered the
+// in-loop one. reasoningEmitted holds exactly what was published: raw text on
+// the plain path, filtered text under simulated tool calling.
+func (s *responsesStream) finalizeReasoning(simulate bool) {
+	if simulate && !s.reasoningFlushed {
+		s.emitReasoning(s.thinkingFilter.Flush())
+	}
+	if !s.reasoningItemEmitted {
 		return
 	}
 
-	// Flush any remaining filtered reasoning for the thinking-only case where no
-	// content chunk triggered the in-loop flush.
-	if toolCallingEnabled && !reasoningFlushed {
-		emitReasoning(thinkingFilter.Flush())
-	}
-
-	// Finalize reasoning item if emitted. reasoningEmitted holds exactly what was
-	// published (raw for non-simulated, filtered under simulated tool calling).
-	if reasoningItemEmitted {
-		reasoningFinal := reasoningEmitted.String()
-		sendEvent("response.reasoning_summary_text.done", map[string]any{
-			"item_id":       reasoningID,
-			"output_index":  0,
-			"summary_index": 0,
-			"text":          reasoningFinal,
-		})
-		sendEvent("response.reasoning_summary_part.done", map[string]any{
-			"item_id":       reasoningID,
-			"output_index":  0,
-			"summary_index": 0,
-			"part": map[string]any{
-				"type": "summary_text",
-				"text": reasoningFinal,
-			},
-		})
-		sendEvent("response.output_item.done", map[string]any{
-			"output_index": 0,
-			"item": map[string]any{
-				"id":     reasoningID,
-				"type":   "reasoning",
-				"status": "completed",
-				"summary": []map[string]any{
-					{
-						"type": "summary_text",
-						"text": reasoningFinal,
-					},
+	reasoningFinal := s.reasoningEmitted.String()
+	s.event("response.reasoning_summary_text.done", map[string]any{
+		"item_id":       s.reasoningID,
+		"output_index":  0,
+		"summary_index": 0,
+		"text":          reasoningFinal,
+	})
+	s.event("response.reasoning_summary_part.done", map[string]any{
+		"item_id":       s.reasoningID,
+		"output_index":  0,
+		"summary_index": 0,
+		"part": map[string]any{
+			"type": "summary_text",
+			"text": reasoningFinal,
+		},
+	})
+	s.event("response.output_item.done", map[string]any{
+		"output_index": 0,
+		"item": map[string]any{
+			"id":     s.reasoningID,
+			"type":   "reasoning",
+			"status": "completed",
+			"summary": []map[string]any{
+				{
+					"type": "summary_text",
+					"text": reasoningFinal,
 				},
 			},
-		})
+		},
+	})
+}
+
+// chunk reads one upstream chunk of a Responses turn.
+func (s *responsesStream) chunk(chunk client.StreamChunk, ch <-chan client.StreamChunk, maxTokens int, simulate, goalOpen bool, sid string) streamLoopStep {
+	if chunk.Error != nil {
+		s.api.forgetSession(sid)
+		_, code, message := streamErrorFields("responses", chunk.Error)
+		s.failed(code, message)
+		return streamLoopFailed
+	}
+	if chunk.IsFinal {
+		s.convID = chunk.ConversationID
+		return streamLoopStop
 	}
 
-	// Handle tool calling: parse buffered text for simulated tool calls
-	var toolCalls []client.ToolCall
-	finishReason := "stop"
+	chunk.Text = s.api.routeGeneratedImages(chunk.Text)
 
-	if toolCallingEnabled {
-		initialParseText := contentExtractor.ParseText()
-		simulated, parseErr := parseResponsesSimulationWithRetry(
-			initialParseText,
-			toolPolicy,
-			func() (string, error) {
-				if sid != "" {
-					api.ctxCache.Delete(sessionKeyPrefix + sid)
-				}
-				retryResult, retryErr := api.responsesConversationOnce(
-					ctx,
-					responsesSimulationRetryMessages(messages, toolPolicy),
-					cfg,
-					"",
-					true,
-				)
-				if retryErr != nil {
-					return "", retryErr
-				}
-				fullText = retryResult.text
-				finalConvID = retryResult.conversationID
-				if !messageItemEmitted {
-					contentExtractor = toolcalling.ContentStreamExtractor{}
-					contentExtractor.Feed(retryResult.text)
-				}
-				return retryResult.text, nil
-			},
-			func() (string, error) {
-				if sid != "" {
-					api.ctxCache.Delete(sessionKeyPrefix + sid)
-				}
-				retryResult, retryErr := api.responsesConversationOnce(
-					ctx,
-					messages,
-					cfg,
-					"",
-					true,
-				)
-				if retryErr != nil {
-					return "", retryErr
-				}
-				fullText = retryResult.text
-				finalConvID = retryResult.conversationID
-				if !messageItemEmitted {
-					contentExtractor = toolcalling.ContentStreamExtractor{}
-					contentExtractor.Feed(retryResult.text)
-				}
-				return retryResult.text, nil
-			},
-		)
-		if parseErr != nil {
-			if sid != "" {
-				api.ctxCache.Delete(sessionKeyPrefix + sid)
-			}
-			if api.responsesRequestCanceled(ctx, sid) {
-				return
-			}
-			if errors.Is(parseErr, errSimulatedToolCallRequired) {
-				sendFailed(
-					simulatedToolCallRequiredCode,
-					parseErr.Error(),
-				)
-			} else {
-				sendFailed("upstream_error", parseErr.Error())
-			}
-			return
+	// Stream reasoning live. Under simulated tool calling it is filtered so the
+	// transport envelope never leaks; otherwise it passes through raw.
+	if chunk.Thinking != "" {
+		s.thinking.WriteString(chunk.Thinking)
+		if simulate {
+			s.emitReasoning(s.thinkingFilter.Feed(chunk.Thinking))
+		} else {
+			s.emitReasoning(chunk.Thinking)
 		}
-		committedContent := contentExtractor.Commit(
-			toolPolicy.allowedToolNames,
-		)
-		emitSimulatedDelta(committedContent)
-		if len(simulated.toolCalls) == 0 &&
-			(committedContent != "" || simulated.content == "") {
-			simulated.content = simulatedPublishedText
-		} else if messageItemEmitted {
-			simulated.content = simulatedPublishedText
-		}
-		fullText = simulated.content
-		toolCalls = simulated.toolCalls
-		finishReason = simulated.finishReason
-		// This is the one streaming path that publishes assistant content as it
-		// decodes it, so the claim cannot be replaced here.
-		warnOnUnverifiedCompletionClaim(fullText, toolPolicy.simulate, toolPolicy.ledger, len(toolCalls))
-		if truncated {
-			finishReason = "length"
-		}
-		if responsesResultEmpty(fullText, toolCalls) {
-			if sid != "" {
-				api.ctxCache.Delete(sessionKeyPrefix + sid)
-			}
-			sendFailed(
-				upstreamEmptyResponseCode,
-				"The upstream completed without assistant content or a tool call.",
-			)
-			return
-		}
+	}
 
-		// Now emit the buffered text and tool calls as Responses events
-		outputIdx := 0
-		if reasoningItemEmitted {
-			outputIdx = 1
-		}
-		if messageItemEmitted {
-			outputIdx = messageOutputIndex + 1
-		}
+	// Handle text content
+	if chunk.Text == "" {
+		return streamLoopContinue
+	}
+	if simulate {
+		s.feedSimulatedText(chunk.Text, maxTokens)
+		return streamLoopContinue
+	}
+	return s.streamPlainText(chunk.Text, ch, maxTokens, goalOpen)
+}
 
-		if messageItemEmitted {
-			phase := responsesMessagePhase(goalOpen, toolCalls)
-			sendEvent("response.output_text.done", map[string]any{
-				"item_id":       msgID,
-				"output_index":  messageOutputIndex,
-				"content_index": 0,
-				"text":          fullText,
-			})
-			sendEvent("response.content_part.done", map[string]any{
-				"item_id":       msgID,
-				"output_index":  messageOutputIndex,
-				"content_index": 0,
-				"part": map[string]any{
+// feedSimulatedText keeps the raw transport for the final tool-call parse while
+// publishing only the decoded assistant content.
+func (s *responsesStream) feedSimulatedText(text string, maxTokens int) {
+	// Flush remaining reasoning before content so the reasoning item is fully
+	// emitted at output_index 0 ahead of the message item.
+	if !s.reasoningFlushed {
+		s.emitReasoning(s.thinkingFilter.Flush())
+		s.reasoningFlushed = true
+	}
+	s.fullText.WriteString(text)
+	s.emitSimulatedDelta(s.contentExtractor.Feed(text), maxTokens)
+}
+
+// streamPlainText publishes answer text as it arrives, which is what a turn
+// with no simulated tool calling does.
+func (s *responsesStream) streamPlainText(text string, ch <-chan client.StreamChunk, maxTokens int, goalOpen bool) streamLoopStep {
+	if !s.messageItemEmitted {
+		// No tool call is known yet; the terminal item names the phase again
+		// once the turn is parsed.
+		s.openMessageItem(s.outputIndexAfterReasoning(), responsesMessagePhase(goalOpen, nil))
+	}
+
+	// Check max_tokens
+	if maxTokens > 0 && countTokens(s.fullText.String()+text) > maxTokens {
+		s.emitFinalPlainDelta(text, maxTokens)
+		s.truncated = true
+		// Drain remaining chunks
+		go drainStream(ch)
+		return streamLoopStop
+	}
+
+	s.fullText.WriteString(text)
+	s.textDelta(s.outputIndexAfterReasoning(), text)
+	return streamLoopContinue
+}
+
+// emitFinalPlainDelta publishes whatever of a chunk still fits under the token
+// ceiling.
+func (s *responsesStream) emitFinalPlainDelta(text string, maxTokens int) {
+	remaining := maxTokens - countTokens(s.fullText.String())
+	if remaining <= 0 {
+		return
+	}
+	delta, _ := truncateToTokens(text, remaining)
+	if delta == "" {
+		return
+	}
+	s.fullText.WriteString(delta)
+	s.textDelta(s.outputIndexAfterReasoning(), delta)
+}
+
+// finalizeMessage closes the message item that was opened while streaming.
+func (s *responsesStream) finalizeMessage(outputIdx int, fullText, phase string) {
+	if !s.messageItemEmitted {
+		return
+	}
+	s.event("response.output_text.done", map[string]any{
+		"item_id":       s.msgID,
+		"output_index":  outputIdx,
+		"content_index": 0,
+		"text":          fullText,
+	})
+	s.event("response.content_part.done", map[string]any{
+		"item_id":       s.msgID,
+		"output_index":  outputIdx,
+		"content_index": 0,
+		"part": map[string]any{
+			"type":        "output_text",
+			"text":        fullText,
+			"annotations": []any{},
+		},
+	})
+	s.event("response.output_item.done", map[string]any{
+		"output_index": outputIdx,
+		"item": map[string]any{
+			"id":     s.msgID,
+			"type":   "message",
+			"status": "completed",
+			"role":   "assistant",
+			"phase":  phase,
+			"content": []map[string]any{
+				{
 					"type":        "output_text",
 					"text":        fullText,
 					"annotations": []any{},
 				},
-			})
-			sendEvent("response.output_item.done", map[string]any{
-				"output_index": messageOutputIndex,
-				"item": map[string]any{
-					"id":     msgID,
-					"type":   "message",
-					"status": "completed",
-					"role":   "assistant",
-					"phase":  phase,
-					"content": []map[string]any{
-						{
-							"type":        "output_text",
-							"text":        fullText,
-							"annotations": []any{},
-						},
-					},
-				},
-			})
-		} else if fullText != "" || len(toolCalls) == 0 {
-			// Emit buffered text when no incremental content was available.
-			// Enforce max_output_tokens
-			if maxTokens > 0 {
-				if truncated, ok := truncateToTokens(fullText, maxTokens); ok {
-					fullText = truncated
-					finishReason = "length"
-				}
-			}
-			phase := responsesMessagePhase(goalOpen, toolCalls)
+			},
+		},
+	})
+}
 
-			sendEvent("response.output_item.added", map[string]any{
-				"output_index": outputIdx,
-				"item": map[string]any{
-					"id":      msgID,
-					"type":    "message",
-					"status":  "in_progress",
-					"role":    "assistant",
-					"phase":   phase,
-					"content": []any{},
-				},
-			})
-			sendEvent("response.content_part.added", map[string]any{
-				"item_id":       msgID,
-				"output_index":  outputIdx,
-				"content_index": 0,
-				"part": map[string]any{
-					"type":        "output_text",
-					"text":        "",
-					"annotations": []any{},
-				},
-			})
-			sendEvent("response.output_text.delta", map[string]any{
-				"item_id":       msgID,
-				"output_index":  outputIdx,
-				"content_index": 0,
-				"delta":         fullText,
-			})
-			sendEvent("response.output_text.done", map[string]any{
-				"item_id":       msgID,
-				"output_index":  outputIdx,
-				"content_index": 0,
-				"text":          fullText,
-			})
-			sendEvent("response.content_part.done", map[string]any{
-				"item_id":       msgID,
-				"output_index":  outputIdx,
-				"content_index": 0,
-				"part": map[string]any{
+// emitWholeMessage writes a buffered answer as a complete message item, which
+// is what a turn that published no incremental content needs.
+func (s *responsesStream) emitWholeMessage(outputIdx int, fullText, phase string) {
+	s.event("response.output_item.added", map[string]any{
+		"output_index": outputIdx,
+		"item": map[string]any{
+			"id":      s.msgID,
+			"type":    "message",
+			"status":  "in_progress",
+			"role":    "assistant",
+			"phase":   phase,
+			"content": []any{},
+		},
+	})
+	s.event("response.content_part.added", map[string]any{
+		"item_id":       s.msgID,
+		"output_index":  outputIdx,
+		"content_index": 0,
+		"part": map[string]any{
+			"type":        "output_text",
+			"text":        "",
+			"annotations": []any{},
+		},
+	})
+	s.textDelta(outputIdx, fullText)
+	s.event("response.output_text.done", map[string]any{
+		"item_id":       s.msgID,
+		"output_index":  outputIdx,
+		"content_index": 0,
+		"text":          fullText,
+	})
+	s.event("response.content_part.done", map[string]any{
+		"item_id":       s.msgID,
+		"output_index":  outputIdx,
+		"content_index": 0,
+		"part": map[string]any{
+			"type":        "output_text",
+			"text":        fullText,
+			"annotations": []any{},
+		},
+	})
+	s.event("response.output_item.done", map[string]any{
+		"output_index": outputIdx,
+		"item": map[string]any{
+			"id":     s.msgID,
+			"type":   "message",
+			"status": "completed",
+			"role":   "assistant",
+			"phase":  phase,
+			"content": []map[string]any{
+				{
 					"type":        "output_text",
 					"text":        fullText,
 					"annotations": []any{},
 				},
-			})
-			sendEvent("response.output_item.done", map[string]any{
-				"output_index": outputIdx,
-				"item": map[string]any{
-					"id":     msgID,
-					"type":   "message",
-					"status": "completed",
-					"role":   "assistant",
-					"phase":  phase,
-					"content": []map[string]any{
-						{
-							"type":        "output_text",
-							"text":        fullText,
-							"annotations": []any{},
-						},
-					},
-				},
-			})
-			outputIdx++
-		}
+			},
+		},
+	})
+}
 
-		// Emit tool call items after the user-facing commentary.
-		toolTypes := responsesToolTypes(toolPolicy.tools)
-		for _, tc := range toolCalls {
-			callID := tc.ID
-			if callID == "" {
-				callID = "call_" + uuid.NewString()
-			}
-			sendEvent("response.output_item.added", map[string]any{
-				"output_index": outputIdx,
-				"item":         buildResponsesToolCallItem(callID, tc, toolTypes, "in_progress"),
-			})
-			for _, event := range responsesToolInputEvents(callID, tc, toolTypes, outputIdx) {
-				sendEvent(event.name, event.data)
-			}
-			sendEvent("response.output_item.done", map[string]any{
-				"output_index": outputIdx,
-				"item":         buildResponsesToolCallItem(callID, tc, toolTypes, "completed"),
-			})
-			outputIdx++
+// emitToolCallItems writes each tool call as its own output item, after the
+// user-facing commentary.
+func (s *responsesStream) emitToolCallItems(toolCalls []client.ToolCall, toolTypes map[string]string, outputIdx int) {
+	for _, tc := range toolCalls {
+		callID := tc.ID
+		if callID == "" {
+			callID = "call_" + uuid.NewString()
 		}
-	} else {
-		// Non-tool-calling mode: finalize message item if emitted
-		if messageItemEmitted {
-			outputIdx := 0
-			if reasoningItemEmitted {
-				outputIdx = 1
-			}
-			if truncated {
+		s.event("response.output_item.added", map[string]any{
+			"output_index": outputIdx,
+			"item":         buildResponsesToolCallItem(callID, tc, toolTypes, "in_progress"),
+		})
+		for _, event := range responsesToolInputEvents(callID, tc, toolTypes, outputIdx) {
+			s.event(event.name, event.data)
+		}
+		s.event("response.output_item.done", map[string]any{
+			"output_index": outputIdx,
+			"item":         buildResponsesToolCallItem(callID, tc, toolTypes, "completed"),
+		})
+		outputIdx++
+	}
+}
+
+// emitSimulatedOutput writes the message and the tool call items of a parsed
+// turn, and reports the text and finish reason the token ceiling left.
+func (s *responsesStream) emitSimulatedOutput(fullText, finishReason string, toolCalls []client.ToolCall, maxTokens int, goalOpen bool, toolPolicy responsesToolPolicy) (string, string) {
+	// Now emit the buffered text and tool calls as Responses events
+	outputIdx := s.outputIndexAfterReasoning()
+	if s.messageItemEmitted {
+		outputIdx = s.messageOutputIndex + 1
+	}
+	phase := responsesMessagePhase(goalOpen, toolCalls)
+
+	switch {
+	case s.messageItemEmitted:
+		s.finalizeMessage(s.messageOutputIndex, fullText, phase)
+	case fullText != "" || len(toolCalls) == 0:
+		// Emit buffered text when no incremental content was available.
+		// Enforce max_output_tokens
+		if maxTokens > 0 {
+			if truncated, ok := truncateToTokens(fullText, maxTokens); ok {
+				fullText = truncated
 				finishReason = "length"
 			}
-			sendEvent("response.output_text.done", map[string]any{
-				"item_id":       msgID,
-				"output_index":  outputIdx,
-				"content_index": 0,
-				"text":          fullText,
-			})
-			sendEvent("response.content_part.done", map[string]any{
-				"item_id":       msgID,
-				"output_index":  outputIdx,
-				"content_index": 0,
-				"part": map[string]any{
-					"type":        "output_text",
-					"text":        fullText,
-					"annotations": []any{},
-				},
-			})
-			sendEvent("response.output_item.done", map[string]any{
-				"output_index": outputIdx,
-				"item": map[string]any{
-					"id":     msgID,
-					"type":   "message",
-					"status": "completed",
-					"role":   "assistant",
-					"phase":  responsesMessagePhase(goalOpen, toolCalls),
-					"content": []map[string]any{
-						{
-							"type":        "output_text",
-							"text":        fullText,
-							"annotations": []any{},
-						},
-					},
-				},
-			})
 		}
+		s.emitWholeMessage(outputIdx, fullText, phase)
+		outputIdx++
 	}
 
+	s.emitToolCallItems(toolCalls, responsesToolTypes(toolPolicy.tools), outputIdx)
+	return fullText, finishReason
+}
+
+// responsesStreamProducedContent reports whether a plain turn produced
+// anything. A simulated turn is judged after its parse instead.
+func (api *APIServer) responsesStreamProducedContent(stream *responsesStream, sid string, simulate bool, fullText string) bool {
+	if simulate || !responsesResultEmpty(fullText, nil) {
+		return true
+	}
+	api.forgetSession(sid)
+	stream.failed(
+		upstreamEmptyResponseCode,
+		"The upstream completed without assistant content or a tool call.",
+	)
+	return false
+}
+
+// retryResponsesStream runs a fresh turn for a simulated Responses stream and
+// adopts its conversation. The extractor is reprimed only when nothing was
+// published yet, because a delta already on the wire cannot be taken back.
+func (api *APIServer) retryResponsesStream(ctx context.Context, stream *responsesStream, messages []payload.Message, cfg models.ModelConfig, sid string) (string, error) {
+	api.forgetSession(sid)
+	retryResult, retryErr := api.responsesConversationOnce(ctx, messages, cfg, "", true)
+	if retryErr != nil {
+		return "", retryErr
+	}
+	stream.convID = retryResult.conversationID
+	if !stream.messageItemEmitted {
+		stream.contentExtractor = toolcalling.ContentStreamExtractor{}
+		stream.contentExtractor.Feed(retryResult.text)
+	}
+	return retryResult.text, nil
+}
+
+// simulatedResponsesText decides what the turn's final text is. Content that
+// was already published wins, because a delta cannot be taken back.
+func simulatedResponsesText(simulated responsesSimulationResult, stream *responsesStream, committedContent string) string {
+	if len(simulated.toolCalls) == 0 &&
+		(committedContent != "" || simulated.content == "") {
+		return stream.publishedText
+	}
+	if stream.messageItemEmitted {
+		return stream.publishedText
+	}
+	return simulated.content
+}
+
+// finishResponsesStream parses the turn and writes its output items. ok is
+// false when the request has already been answered.
+func (api *APIServer) finishResponsesStream(ctx context.Context, stream *responsesStream, messages []payload.Message, cfg models.ModelConfig, sid string, maxTokens int, toolPolicy responsesToolPolicy, goalOpen bool, fullText string) (string, []client.ToolCall, string, bool) {
+	if toolPolicy.simulate {
+		return api.finishSimulatedResponsesStream(ctx, stream, messages, cfg, sid, maxTokens, toolPolicy, goalOpen)
+	}
+
+	// Non-tool-calling mode: finalize message item if emitted
+	finishReason := "stop"
+	if stream.truncated {
+		finishReason = "length"
+	}
+	stream.finalizeMessage(stream.outputIndexAfterReasoning(), fullText, responsesMessagePhase(goalOpen, nil))
+	return fullText, nil, finishReason, true
+}
+
+// finishSimulatedResponsesStream parses the buffered transport of a
+// tool-enabled turn and writes its output items.
+//
+// It takes no accumulated text: the raw transport lives in the extractor, and
+// what reaches the client is decided from the parse and from what was already
+// published.
+func (api *APIServer) finishSimulatedResponsesStream(ctx context.Context, stream *responsesStream, messages []payload.Message, cfg models.ModelConfig, sid string, maxTokens int, toolPolicy responsesToolPolicy, goalOpen bool) (string, []client.ToolCall, string, bool) {
+	simulated, parseErr := parseResponsesSimulationWithRetry(
+		stream.contentExtractor.ParseText(),
+		toolPolicy,
+		func() (string, error) {
+			return api.retryResponsesStream(ctx, stream, responsesSimulationRetryMessages(messages, toolPolicy), cfg, sid)
+		},
+		func() (string, error) {
+			return api.retryResponsesStream(ctx, stream, messages, cfg, sid)
+		},
+	)
+	if parseErr != nil {
+		api.forgetSession(sid)
+		if api.responsesRequestCanceled(ctx, sid) {
+			return "", nil, "", false
+		}
+		stream.failParse(parseErr)
+		return "", nil, "", false
+	}
+
+	committedContent := stream.contentExtractor.Commit(toolPolicy.allowedToolNames)
+	stream.emitSimulatedDelta(committedContent, maxTokens)
+	fullText := simulatedResponsesText(simulated, stream, committedContent)
+	toolCalls := simulated.toolCalls
+	finishReason := simulated.finishReason
+
+	// This is the one streaming path that publishes assistant content as it
+	// decodes it, so the claim cannot be replaced here.
+	warnOnUnverifiedCompletionClaim(fullText, toolPolicy.simulate, toolPolicy.ledger, len(toolCalls))
+	if stream.truncated {
+		finishReason = "length"
+	}
+	if responsesResultEmpty(fullText, toolCalls) {
+		api.forgetSession(sid)
+		stream.failed(
+			upstreamEmptyResponseCode,
+			"The upstream completed without assistant content or a tool call.",
+		)
+		return "", nil, "", false
+	}
+
+	fullText, finishReason = stream.emitSimulatedOutput(fullText, finishReason, toolCalls, maxTokens, goalOpen, toolPolicy)
+	return fullText, toolCalls, finishReason, true
+}
+
+// completeResponsesStream writes the final response object and ends the stream.
+func (api *APIServer) completeResponsesStream(stream *responsesStream, messages []payload.Message, toolPolicy responsesToolPolicy, goalOpen bool, fullText string, toolCalls []client.ToolCall, finishReason, sid string) {
 	// Build final response object for response.completed
 	status := "completed"
 	if finishReason == "length" {
@@ -7422,26 +7435,24 @@ func (api *APIServer) streamResponses(
 
 	promptTok := countPromptTokens(messages, toolPolicy.tools, toolPolicy.promptChoice)
 	completionTok := countTokens(fullText) + outputProtocolTokens
-	reasoningText := thinkingText.String()
+	reasoningText := stream.thinking.String()
 	reasoningTok := countTokens(reasoningText)
 
-	finalResponse := buildResponsesObject(responseID, createdAt, openaiModel, fullText, reasoningText, toolCalls, responsesToolTypes(toolPolicy.tools), goalOpen, finishReason, promptTok, completionTok, reasoningTok)
+	finalResponse := buildResponsesObject(stream.responseID, stream.createdAt, stream.model, fullText, reasoningText, toolCalls, responsesToolTypes(toolPolicy.tools), goalOpen, finishReason, promptTok, completionTok, reasoningTok)
 	finalResponse["status"] = status
 
-	if sid != "" {
-		if shouldResetResponsesSession(fullText, toolCalls, nil) {
-			api.ctxCache.Delete(sessionKeyPrefix + sid)
-		} else {
-			api.storeSessionMapping(sid, finalConvID)
-		}
-	}
+	api.storeResponsesSession(sid, responsesTurn{
+		text:      fullText,
+		toolCalls: toolCalls,
+		convID:    stream.convID,
+	})
 
-	sendEvent("response.completed", map[string]any{
+	stream.event("response.completed", map[string]any{
 		"response": finalResponse,
 	})
 
-	_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
-	flusher.Flush()
+	_, _ = fmt.Fprintf(stream.w, "data: [DONE]\n\n")
+	stream.flusher.Flush()
 }
 
 // ===================================================================
