@@ -5661,26 +5661,9 @@ type responsesReasoning struct {
 
 // handleResponses handles OpenAI Responses API requests.
 func (api *APIServer) handleResponses(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodOptions {
-		api.handleCORS(w, r)
-		return
-	}
-	if r.Method != http.MethodPost {
-		api.sendError(w, http.StatusMethodNotAllowed, "Method not allowed")
-		return
-	}
-
-	limitRequestBody(w, r, requestBodyMax)
-	bodyBytes, err := io.ReadAll(r.Body)
-	if err != nil {
-		api.sendRequestBodyError(w, err)
-		return
-	}
-	_ = r.Body.Close()
-
 	var req responsesRequest
-	if err := json.Unmarshal(bodyBytes, &req); err != nil {
-		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Invalid JSON: %v", err))
+	bodyBytes, ok := api.readJSONRequest(w, r, &req, "handleResponses")
+	if !ok {
 		return
 	}
 
@@ -5693,63 +5676,33 @@ func (api *APIServer) handleResponses(w http.ResponseWriter, r *http.Request) {
 
 	// Parse model (may contain session ID suffix: "gpt5.5:my-session")
 	modelKey, modelSessionID := parseModelSessionID(req.Model)
-	cfg, ok := api.resolveModel(w, modelKey)
+	cfg, ok := api.responsesModelConfig(w, modelKey, req.Reasoning)
 	if !ok {
 		return
 	}
 
-	deliberate, err := reasoningEffortRequestsDeliberation(req.Reasoning)
-	if err != nil {
-		logging.Errorf("handleResponses: %v", err)
-		api.sendError(w, http.StatusBadRequest, err.Error())
+	toolPolicy, localTools, ok := api.responsesToolSetup(w, &req)
+	if !ok {
 		return
 	}
-	cfg = applyReasoningEffort(modelKey, cfg, deliberate)
-
-	req.Tools = mergeLoadedResponsesTools(req.Input, req.Tools)
-	preparedTools, localTools := api.prepareCodingTools(req.Tools, false)
-	req.Tools = preparedTools
-	toolPolicy, err := newResponsesToolPolicy(req.Tools, req.ToolChoice)
-	if err != nil {
-		api.sendError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	toolPolicy.noParallel = refusesParallelToolCalls(req.ParallelToolCalls)
 	requestJSON := replaceRequestTools(bodyBytes, req.Tools)
 
 	// Convert Responses API input to payload.Message list
 	messages := responsesInputToMessages(req.Input)
 
-	// Codex CLI opens a provider with a reachability probe: a POST carrying no
-	// input at all. Answer it here rather than sending an empty turn upstream,
-	// which costs a round trip and one message of the conversation quota.
-	if strings.TrimSpace(req.Instructions) == "" && responsesInputIsEmpty(messages) {
-		api.respondResponsesProbe(w, cfg.OpenAIID, req.Stream)
+	if api.answeredResponsesProbe(w, req, cfg, messages) {
 		return
 	}
 
-	if err := validateToolResultMessages(messages); err != nil {
-		logging.Errorf("handleResponses: %v", err)
-		api.sendError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	ledger := buildToolLedger(messages)
-	if api.exceededToolRoundLimit(ledger) {
-		api.sendToolRoundLimitError(w, ledger)
+	ledger, ok := api.prepareToolLedger(w, messages, "handleResponses")
+	if !ok {
 		return
 	}
 	// The simulation prompt collapses the input into one message, so the
 	// evidence has to travel with the policy to reach the parser.
 	toolPolicy.ledger = ledger
 
-	// Prepend instructions as first user message (M365 has no system role)
-	if strings.TrimSpace(req.Instructions) != "" && len(messages) > 0 {
-		instrMsg := payload.Message{
-			Role:    "user",
-			Content: "Instructions: " + strings.TrimSpace(req.Instructions),
-		}
-		messages = append([]payload.Message{instrMsg}, messages...)
-	}
+	messages = prependResponsesInstructions(messages, req.Instructions)
 
 	// Inject one Responses-aware simulation prompt unless tool_choice disables
 	// client tool use.
@@ -5757,20 +5710,12 @@ func (api *APIServer) handleResponses(w http.ResponseWriter, r *http.Request) {
 		injectSimulatedPromptResponses(&messages, requestJSON, toolPolicy.promptChoice, toolPolicy.ledger.EvidenceNote())
 	}
 
-	sid := resolveSessionID(r, sessionSources{
+	sid, convID := api.sessionAndConversation(r, sessionSources{
 		ModelSuffix:        modelSessionID,
 		PreviousResponseID: req.PreviousResponseID,
 		BodySessionID:      req.SessionID,
 		BodyUser:           req.User,
-	})
-	if sid == "" {
-		sid = api.hashSessionIDFromMessages(r, messages)
-	}
-
-	var convID string
-	if sid != "" {
-		convID = api.ctxCache.Get(sessionKeyPrefix + sid)
-	}
+	}, messages)
 
 	// Upload any images found in multimodal content
 	api.uploadImagesAndAnnotate(&messages, convID)
@@ -5780,51 +5725,101 @@ func (api *APIServer) handleResponses(w http.ResponseWriter, r *http.Request) {
 	goalOpen := responsesGoalContinuationOpen(req.Input)
 
 	if len(localTools) > 0 {
-		result, err := api.runToolLoop(r, toolLoopOpenAI, messages, cfg, sid, convID, req.Tools, toolPolicy.noParallel, localTools)
-		if err != nil {
-			api.sendUpstreamError(w, "response", err)
-			return
-		}
-		api.respondBufferedResponses(
-			w,
-			result,
-			messages,
-			cfg,
-			sid,
-			req.MaxOutputTokens,
-			req.Stream,
-			responsesToolTypes(toolPolicy.tools),
-			goalOpen,
-			toolPolicy.tools,
-			toolPolicy.promptChoice,
-		)
+		api.runResponsesToolLoop(w, r, req, messages, cfg, sid, convID, toolPolicy, localTools, goalOpen)
 		return
 	}
-	if req.Stream {
-		api.streamResponses(
-			r.Context(),
-			w,
-			messages,
-			cfg,
-			sid,
-			convID,
-			req.MaxOutputTokens,
-			toolPolicy,
-			goalOpen,
-		)
-	} else {
-		api.nonStreamResponses(
-			r.Context(),
-			w,
-			messages,
-			cfg,
-			sid,
-			convID,
-			req.MaxOutputTokens,
-			toolPolicy,
-			goalOpen,
-		)
+	api.dispatchResponses(r.Context(), w, messages, cfg, sid, convID, req.MaxOutputTokens, req.Stream, toolPolicy, goalOpen)
+}
+
+// answeredResponsesProbe answers Codex CLI's reachability probe, which is a
+// POST carrying no input at all. Answering it here avoids a round trip and one
+// message of the conversation quota.
+func (api *APIServer) answeredResponsesProbe(w http.ResponseWriter, req responsesRequest, cfg models.ModelConfig, messages []payload.Message) bool {
+	if strings.TrimSpace(req.Instructions) != "" || !responsesInputIsEmpty(messages) {
+		return false
 	}
+	api.respondResponsesProbe(w, cfg.OpenAIID, req.Stream)
+	return true
+}
+
+// dispatchResponses routes a Responses turn to the streaming or the buffered
+// responder.
+func (api *APIServer) dispatchResponses(ctx context.Context, w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, sid, convID string, maxOutputTokens int, stream bool, toolPolicy responsesToolPolicy, goalOpen bool) {
+	if stream {
+		api.streamResponses(ctx, w, messages, cfg, sid, convID, maxOutputTokens, toolPolicy, goalOpen)
+		return
+	}
+	api.nonStreamResponses(ctx, w, messages, cfg, sid, convID, maxOutputTokens, toolPolicy, goalOpen)
+}
+
+// responsesModelConfig resolves the model and applies the reasoning effort the
+// request asked for. ok is false when the request has already been answered.
+func (api *APIServer) responsesModelConfig(w http.ResponseWriter, modelKey string, reasoning *responsesReasoning) (models.ModelConfig, bool) {
+	cfg, ok := api.resolveModel(w, modelKey)
+	if !ok {
+		return models.ModelConfig{}, false
+	}
+	deliberate, err := reasoningEffortRequestsDeliberation(reasoning)
+	if err != nil {
+		logging.Errorf("handleResponses: %v", err)
+		api.sendError(w, http.StatusBadRequest, err.Error())
+		return models.ModelConfig{}, false
+	}
+	return applyReasoningEffort(modelKey, cfg, deliberate), true
+}
+
+// responsesToolSetup merges the loaded tools, separates the built-in ones and
+// builds the request's tool policy. ok is false when the request has already
+// been answered.
+func (api *APIServer) responsesToolSetup(w http.ResponseWriter, req *responsesRequest) (responsesToolPolicy, map[string]bool, bool) {
+	req.Tools = mergeLoadedResponsesTools(req.Input, req.Tools)
+	preparedTools, localTools := api.prepareCodingTools(req.Tools, false)
+	req.Tools = preparedTools
+
+	toolPolicy, err := newResponsesToolPolicy(req.Tools, req.ToolChoice)
+	if err != nil {
+		api.sendError(w, http.StatusBadRequest, err.Error())
+		return responsesToolPolicy{}, nil, false
+	}
+	toolPolicy.noParallel = refusesParallelToolCalls(req.ParallelToolCalls)
+	return toolPolicy, localTools, true
+}
+
+// prependResponsesInstructions puts the instructions first as a user message,
+// because M365 has no system role.
+func prependResponsesInstructions(messages []payload.Message, instructions string) []payload.Message {
+	trimmed := strings.TrimSpace(instructions)
+	if trimmed == "" || len(messages) == 0 {
+		return messages
+	}
+	instrMsg := payload.Message{
+		Role:    "user",
+		Content: "Instructions: " + trimmed,
+	}
+	return append([]payload.Message{instrMsg}, messages...)
+}
+
+// runResponsesToolLoop runs the built-in coding tool loop for a Responses
+// request, which answers whole because the loop takes several turns.
+func (api *APIServer) runResponsesToolLoop(w http.ResponseWriter, r *http.Request, req responsesRequest, messages []payload.Message, cfg models.ModelConfig, sid, convID string, toolPolicy responsesToolPolicy, localTools map[string]bool, goalOpen bool) {
+	result, err := api.runToolLoop(r, toolLoopOpenAI, messages, cfg, sid, convID, req.Tools, toolPolicy.noParallel, localTools)
+	if err != nil {
+		api.sendUpstreamError(w, "response", err)
+		return
+	}
+	api.respondBufferedResponses(
+		w,
+		result,
+		messages,
+		cfg,
+		sid,
+		req.MaxOutputTokens,
+		req.Stream,
+		responsesToolTypes(toolPolicy.tools),
+		goalOpen,
+		toolPolicy.tools,
+		toolPolicy.promptChoice,
+	)
 }
 
 // responsesInputToMessages converts the Responses API input field (string or
@@ -7290,82 +7285,29 @@ func responsesCompactionConversationID(string) string {
 // It sends the conversation history to M365 Copilot with a compaction prompt,
 // then returns the summary wrapped in a compaction output item.
 func (api *APIServer) handleResponsesCompact(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodOptions {
-		api.handleCORS(w, r)
-		return
-	}
-	if r.Method != http.MethodPost {
-		api.sendError(w, http.StatusMethodNotAllowed, "Method not allowed")
-		return
-	}
-
-	limitRequestBody(w, r, requestBodyMax)
-	bodyBytes, err := io.ReadAll(r.Body)
-	if err != nil {
-		api.sendRequestBodyError(w, err)
-		return
-	}
-	_ = r.Body.Close()
-
 	var req responsesRequest
-	if err := json.Unmarshal(bodyBytes, &req); err != nil {
-		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Invalid JSON: %v", err))
+	if _, ok := api.readJSONRequest(w, r, &req, "handleResponsesCompact"); !ok {
 		return
 	}
 
 	// Parse model (may contain session ID suffix)
 	modelKey, modelSessionID := parseModelSessionID(req.Model)
-	cfg, ok := api.resolveModel(w, modelKey)
+	cfg, ok := api.responsesModelConfig(w, modelKey, req.Reasoning)
 	if !ok {
 		return
 	}
 
-	deliberate, err := reasoningEffortRequestsDeliberation(req.Reasoning)
-	if err != nil {
-		logging.Errorf("handleResponsesCompact: %v", err)
-		api.sendError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	cfg = applyReasoningEffort(modelKey, cfg, deliberate)
-
-	// Convert Responses API input to payload.Message list
-	inputMessages := responsesInputToMessages(req.Input)
-
-	// Flatten the conversation history into a single user message with
-	// compaction instructions. M365 has no system role and responds to the
-	// last user message, so we must merge everything into one message to
-	// prevent the model from answering the conversation instead of summarizing it.
-	compactionInstr := defaultCompactionPrompt
-	instructions := strings.TrimSpace(req.Instructions)
-	if instructions != "" {
-		compactionInstr = instructions
-	}
-
-	var conversationText strings.Builder
-	conversationText.WriteString(compactionInstr)
-	conversationText.WriteString("\n\n")
-	for _, m := range inputMessages {
-		fmt.Fprintf(&conversationText, "%s: %s\n", m.Role, m.Content)
-	}
-	conversationText.WriteString("\nPlease provide the summary now.")
-
 	messages := []payload.Message{
-		{Role: "user", Content: conversationText.String()},
+		{Role: "user", Content: compactionPromptText(req)},
 	}
 
-	sid := resolveSessionID(r, sessionSources{
+	sid, storedConvID := api.sessionAndConversation(r, sessionSources{
 		ModelSuffix:        modelSessionID,
 		PreviousResponseID: req.PreviousResponseID,
 		BodySessionID:      req.SessionID,
 		BodyUser:           req.User,
-	})
-	if sid == "" {
-		sid = api.hashSessionIDFromMessages(r, messages)
-	}
-
-	convID := responsesCompactionConversationID(
-		api.ctxCache.Get(sessionKeyPrefix + sid),
-	)
+	}, messages)
+	convID := responsesCompactionConversationID(storedConvID)
 
 	// Upload any images found in multimodal content
 	api.uploadImagesAndAnnotate(&messages, convID)
@@ -7376,9 +7318,31 @@ func (api *APIServer) handleResponsesCompact(w http.ResponseWriter, r *http.Requ
 
 	if req.Stream {
 		api.streamResponsesCompact(r.Context(), w, messages, cfg, sid, convID, req.MaxOutputTokens, hasTools, req.Tools)
-	} else {
-		api.nonStreamResponsesCompact(w, messages, cfg, sid, convID, req.MaxOutputTokens, hasTools, req.Tools)
+		return
 	}
+	api.nonStreamResponsesCompact(w, messages, cfg, sid, convID, req.MaxOutputTokens, hasTools, req.Tools)
+}
+
+// compactionPromptText flattens the conversation history into a single user
+// message carrying the compaction instructions.
+//
+// M365 has no system role and answers the last user message, so everything has
+// to be merged into one message; otherwise the model continues the conversation
+// instead of summarizing it.
+func compactionPromptText(req responsesRequest) string {
+	compactionInstr := defaultCompactionPrompt
+	if instructions := strings.TrimSpace(req.Instructions); instructions != "" {
+		compactionInstr = instructions
+	}
+
+	var conversationText strings.Builder
+	conversationText.WriteString(compactionInstr)
+	conversationText.WriteString("\n\n")
+	for _, m := range responsesInputToMessages(req.Input) {
+		fmt.Fprintf(&conversationText, "%s: %s\n", m.Role, m.Content)
+	}
+	conversationText.WriteString("\nPlease provide the summary now.")
+	return conversationText.String()
 }
 
 // buildCompactionResponseObject constructs the non-streaming compact response.
