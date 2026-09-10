@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"mime/multipart"
 	"net"
 	"net/http"
 	neturl "net/url"
@@ -7689,143 +7690,42 @@ func (api *APIServer) handleImageGenerations(w http.ResponseWriter, r *http.Requ
 // It accepts multipart/form-data with an image file, prompt, and optional mask,
 // uploads the image to M365, sends the edit prompt, and returns the result.
 func (api *APIServer) handleImageEdits(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodOptions {
-		api.handleCORS(w, r)
-		return
-	}
-	if r.Method != http.MethodPost {
-		api.sendError(w, http.StatusMethodNotAllowed, "Method not allowed")
-		return
-	}
-
-	// Parse multipart form
-	limitRequestBody(w, r, imageEditBodyMax)
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
-		logging.Errorf("handleImageEdits: failed to parse multipart form: %v", err)
-		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Failed to parse multipart form: %v", err))
-		return
-	}
-
-	prompt := r.FormValue("prompt")
-	if prompt == "" {
-		api.sendError(w, http.StatusBadRequest, "prompt is required")
-		return
-	}
-
-	modelKey := r.FormValue("model")
-	if modelKey == "" {
-		modelKey = "gpt5.5-reasoning"
-	}
-	modelKey, modelSessionID := parseModelSessionID(modelKey)
-	cfg, ok := api.resolveModel(w, modelKey)
+	form, ok := api.parseImageEditForm(w, r)
 	if !ok {
 		return
 	}
-	logging.Infof("handleImageEdits: model=%s prompt_len=%d images=%d responseFormat=%s", modelKey, len(prompt), len(r.MultipartForm.File["image"]), r.FormValue("response_format"))
 
-	n := 1
-	if nStr := r.FormValue("n"); nStr != "" {
-		if v, err := fmtAtoi(nStr); err == nil && v > 0 {
-			n = v
-		}
-	}
-	size := r.FormValue("size")
-	quality := r.FormValue("quality")
-	style := r.FormValue("style")
-	responseFormat := r.FormValue("response_format")
-
-	// Read image file(s). OpenAI API supports up to 16 images for GPT image models.
-	// Multipart form-data may send "image" as multiple form files.
-	imageFiles := r.MultipartForm.File["image"]
-	if len(imageFiles) == 0 {
-		api.sendError(w, http.StatusBadRequest, "image file is required")
+	images, ok := api.imageEditUploads(w, r)
+	if !ok {
 		return
 	}
-
-	var images []payload.ImageData
-	for i, fh := range imageFiles {
-		if i >= 16 {
-			break
-		}
-		f, err := fh.Open()
-		if err != nil {
-			api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Failed to open image %d: %v", i, err))
-			return
-		}
-		imgBytes, err := io.ReadAll(f)
-		_ = f.Close()
-		if err != nil {
-			api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Failed to read image %d: %v", i, err))
-			return
-		}
-		imgB64 := base64.StdEncoding.EncodeToString(imgBytes)
-		imgMime := fh.Header.Get("Content-Type")
-		if imgMime == "" {
-			imgMime = "image/png"
-		}
-		imgExt := extFromMediaType(imgMime)
-		imgName := fmt.Sprintf("edit-%d.%s", i, imgExt)
-		images = append(images, payload.ImageData{
-			Base64:    imgB64,
-			MediaType: imgMime,
-			FileName:  imgName,
-		})
+	mask, ok := api.imageEditMask(w, r)
+	if !ok {
+		return
+	}
+	if mask != nil {
+		images = append(images, *mask)
 	}
 
-	// Read optional mask
-	var maskB64, maskFileName, maskMimeType string
-	if maskFile, maskHeader, err := r.FormFile("mask"); err == nil {
-		maskBytes, err := io.ReadAll(maskFile)
-		_ = maskFile.Close()
-		if err != nil {
-			api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Failed to read mask: %v", err))
-			return
-		}
-		maskB64 = base64.StdEncoding.EncodeToString(maskBytes)
-		maskMimeType = maskHeader.Header.Get("Content-Type")
-		if maskMimeType == "" {
-			maskMimeType = "image/png"
-		}
-		maskFileName = "mask." + extFromMediaType(maskMimeType)
-	}
+	sid := imageEditSessionID(r, form.modelSessionID)
+	convID := api.ctxCache.Get(sessionKeyPrefix + sid)
 
-	// Resolve session ID
-	sid := resolveSessionID(r, sessionSources{
-		ModelSuffix:   modelSessionID,
-		BodySessionID: r.FormValue("session_id"),
-		BodyUser:      r.FormValue("user"),
-	})
-	if sid == "" {
-		// An edit carries no message to hash, so an unnamed one gets a fresh
-		// session rather than joining another request's conversation.
-		sid = "img-edit-" + uuid.New().String()[:8]
-	}
-
-	var convID string
-	if sid != "" {
-		convID = api.ctxCache.Get(sessionKeyPrefix + sid)
-	}
-
-	// Build prompt with hints
-	fullPrompt := buildImagePromptWithHints(prompt, size, quality, style)
-
-	// Build multimodal message with image annotations
-	msg := payload.Message{Role: "user", Content: fullPrompt}
-	msg.Images = images
-	if maskB64 != "" {
-		msg.Images = append(msg.Images, payload.ImageData{
-			Base64:    maskB64,
-			MediaType: maskMimeType,
-			FileName:  maskFileName,
-		})
-	}
-
-	messages := []payload.Message{msg}
+	// Build the multimodal message: the prompt with its hints, and the images
+	messages := []payload.Message{{
+		Role: "user",
+		Content: buildImagePromptWithHints(
+			form.prompt,
+			r.FormValue("size"),
+			r.FormValue("quality"),
+			r.FormValue("style"),
+		),
+		Images: images,
+	}}
 
 	// Upload images and attach annotations
 	api.uploadImagesAndAnnotate(&messages, convID)
 
-	respText, _, _, _, finalConvID, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, false)
+	respText, _, _, _, finalConvID, err := api.m365Client.ChatConversation(messages, form.cfg.Tone, form.cfg.Override, convID, api.config.UserOID, api.config.TenantID, false)
 	if err != nil {
 		api.sendUpstreamError(w, "image edit", err)
 		return
@@ -7834,7 +7734,7 @@ func (api *APIServer) handleImageEdits(w http.ResponseWriter, r *http.Request) {
 	api.storeSessionMapping(sid, finalConvID)
 
 	// Extract image URLs from response
-	dataItems := api.buildOpenAIImageData(respText, n, prompt, responseFormat)
+	dataItems := api.buildOpenAIImageData(respText, imageEditCount(r.FormValue("n")), form.prompt, r.FormValue("response_format"))
 	if len(dataItems) == 0 {
 		api.sendError(w, http.StatusInternalServerError, "No edited images were generated. The model may not have produced an image.")
 		return
@@ -7844,6 +7744,150 @@ func (api *APIServer) handleImageEdits(w http.ResponseWriter, r *http.Request) {
 		"created": time.Now().Unix(),
 		"data":    dataItems,
 	})
+}
+
+// imageEditForm is what an image edit request declares once its form is parsed.
+type imageEditForm struct {
+	prompt         string
+	modelSessionID string
+	cfg            models.ModelConfig
+}
+
+// parseImageEditForm answers the method gate, parses the multipart form and
+// resolves the model. ok is false when the request has already been answered.
+func (api *APIServer) parseImageEditForm(w http.ResponseWriter, r *http.Request) (imageEditForm, bool) {
+	if r.Method == http.MethodOptions {
+		api.handleCORS(w, r)
+		return imageEditForm{}, false
+	}
+	if r.Method != http.MethodPost {
+		api.sendError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return imageEditForm{}, false
+	}
+
+	// Parse multipart form
+	limitRequestBody(w, r, imageEditBodyMax)
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		logging.Errorf("handleImageEdits: failed to parse multipart form: %v", err)
+		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Failed to parse multipart form: %v", err))
+		return imageEditForm{}, false
+	}
+
+	prompt := r.FormValue("prompt")
+	if prompt == "" {
+		api.sendError(w, http.StatusBadRequest, "prompt is required")
+		return imageEditForm{}, false
+	}
+
+	modelKey := r.FormValue("model")
+	if modelKey == "" {
+		modelKey = "gpt5.5-reasoning"
+	}
+	modelKey, modelSessionID := parseModelSessionID(modelKey)
+	cfg, ok := api.resolveModel(w, modelKey)
+	if !ok {
+		return imageEditForm{}, false
+	}
+	logging.Infof("handleImageEdits: model=%s prompt_len=%d images=%d responseFormat=%s", modelKey, len(prompt), len(r.MultipartForm.File["image"]), r.FormValue("response_format"))
+	return imageEditForm{prompt: prompt, modelSessionID: modelSessionID, cfg: cfg}, true
+}
+
+// imageEditSessionID resolves the session an edit belongs to. An edit carries
+// no message to hash, so an unnamed one gets a fresh session rather than
+// joining another request's conversation.
+func imageEditSessionID(r *http.Request, modelSessionID string) string {
+	sid := resolveSessionID(r, sessionSources{
+		ModelSuffix:   modelSessionID,
+		BodySessionID: r.FormValue("session_id"),
+		BodyUser:      r.FormValue("user"),
+	})
+	if sid == "" {
+		return "img-edit-" + uuid.New().String()[:8]
+	}
+	return sid
+}
+
+// imageEditCount reads how many images the caller asked for, defaulting to one.
+func imageEditCount(raw string) int {
+	if raw == "" {
+		return 1
+	}
+	if v, err := fmtAtoi(raw); err == nil && v > 0 {
+		return v
+	}
+	return 1
+}
+
+// imageEditUploads reads the uploaded images. OpenAI supports up to 16 of them
+// for GPT image models, and multipart form-data may send "image" as several
+// form files. ok is false when the request has already been answered.
+func (api *APIServer) imageEditUploads(w http.ResponseWriter, r *http.Request) ([]payload.ImageData, bool) {
+	imageFiles := r.MultipartForm.File["image"]
+	if len(imageFiles) == 0 {
+		api.sendError(w, http.StatusBadRequest, "image file is required")
+		return nil, false
+	}
+
+	var images []payload.ImageData
+	for i, fh := range imageFiles {
+		if i >= 16 {
+			break
+		}
+		image, err := readUploadedImage(fh, fmt.Sprintf("edit-%d", i))
+		if err != nil {
+			api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Failed to read image %d: %v", i, err))
+			return nil, false
+		}
+		images = append(images, image)
+	}
+	return images, true
+}
+
+// readUploadedImage reads one uploaded file, naming it after baseName and
+// falling back to PNG when the client declared no type.
+func readUploadedImage(fh *multipart.FileHeader, baseName string) (payload.ImageData, error) {
+	f, err := fh.Open()
+	if err != nil {
+		return payload.ImageData{}, err
+	}
+	imgBytes, err := io.ReadAll(f)
+	_ = f.Close()
+	if err != nil {
+		return payload.ImageData{}, err
+	}
+	mediaType := fh.Header.Get("Content-Type")
+	if mediaType == "" {
+		mediaType = "image/png"
+	}
+	return payload.ImageData{
+		Base64:    base64.StdEncoding.EncodeToString(imgBytes),
+		MediaType: mediaType,
+		FileName:  baseName + "." + extFromMediaType(mediaType),
+	}, nil
+}
+
+// imageEditMask reads the optional mask. It reports a nil mask when the request
+// carries none, and ok false when the request has already been answered.
+func (api *APIServer) imageEditMask(w http.ResponseWriter, r *http.Request) (*payload.ImageData, bool) {
+	maskFile, maskHeader, err := r.FormFile("mask")
+	if err != nil {
+		return nil, true
+	}
+	maskBytes, err := io.ReadAll(maskFile)
+	_ = maskFile.Close()
+	if err != nil {
+		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Failed to read mask: %v", err))
+		return nil, false
+	}
+	mediaType := maskHeader.Header.Get("Content-Type")
+	if mediaType == "" {
+		mediaType = "image/png"
+	}
+	return &payload.ImageData{
+		Base64:    base64.StdEncoding.EncodeToString(maskBytes),
+		MediaType: mediaType,
+		FileName:  "mask." + extFromMediaType(mediaType),
+	}, true
 }
 
 // buildImagePromptWithHints appends size, quality, and style hints to the prompt
