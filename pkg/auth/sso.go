@@ -223,6 +223,126 @@ func (tm *TokenManager) M365CookieHeader() (string, error) {
 	return strings.Join(cookieParts, "; "), nil
 }
 
+// cookieHeaderFrom renders stored SSO cookies as one Cookie header.
+func cookieHeaderFrom(cookies []SSOCookie) string {
+	var parts []string
+	for _, c := range cookies {
+		parts = append(parts, c.Name+"="+c.Value)
+	}
+	return strings.Join(parts, "; ")
+}
+
+// ssoBrowserRequest builds a GET the sign-in flow accepts: the SSO cookies plus
+// the browser headers the authorize endpoint expects.
+func ssoBrowserRequest(target, cookieHeader string) (*http.Request, error) {
+	req, err := http.NewRequest("GET", target, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
+	req.Header.Set("Referer", "https://m365.cloud.microsoft/")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Cookie", cookieHeader)
+	return req, nil
+}
+
+// authorizeTarget builds the silent authorize URL.
+//
+// sso_reload=True tells the server to use the SSO cookies and skip the
+// BssoInterrupt page. prompt=none breaks SSO cookie recognition, so it is
+// omitted.
+func (tm *TokenManager) authorizeTarget(challenge string) string {
+	params := url.Values{
+		"client_id":             {tm.clientID},
+		"response_type":         {"code"},
+		"redirect_uri":          {defaultRedirectURI},
+		"scope":                 {tm.scope + " offline_access"},
+		"response_mode":         {"fragment"},
+		"code_challenge":        {challenge},
+		"code_challenge_method": {"S256"},
+		"state":                 {"m365bridge-sso"},
+		"sso_reload":            {"True"},
+	}
+	return fmt.Sprintf(authorizeURLTemplate, tm.tenant) + "?" + params.Encode()
+}
+
+// nextLocation reports where the sign-in flow goes next. With no Location
+// header the page itself may carry a meta refresh, which is how the flow
+// continues through an interstitial.
+func nextLocation(resp *http.Response) (string, error) {
+	if location := resp.Header.Get("Location"); location != "" {
+		return location, nil
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, authPageMax+1))
+	if len(body) > authPageMax {
+		logging.Warnf("sign-in page exceeds %d bytes; a meta refresh past the cap is not followed", authPageMax)
+		body = body[:authPageMax]
+	}
+	bodyStr := string(body)
+	if metaURL := extractMetaRefreshURL(bodyStr); metaURL != "" {
+		return metaURL, nil
+	}
+	return "", fmt.Errorf("%w: no redirect from authorize (status %d): %s",
+		ErrRefreshFailed, resp.StatusCode, textcut.Truncate(bodyStr, 2000))
+}
+
+// authCodeFromRedirect reads the authorization code out of a redirect target.
+// response_mode=fragment puts the code in the fragment rather than the query,
+// and reports a refused sign-in there too. An empty code with no error means
+// this redirect is not the last one.
+func authCodeFromRedirect(location string) (string, error) {
+	locURL, err := url.Parse(location)
+	if err != nil {
+		return "", fmt.Errorf("%w: failed to parse redirect URL: %v", ErrRefreshFailed, err)
+	}
+	if code := locURL.Query().Get("code"); code != "" {
+		return code, nil
+	}
+	if locURL.Fragment == "" {
+		return "", nil
+	}
+	fragParams, _ := url.ParseQuery(locURL.Fragment)
+	if code := fragParams.Get("code"); code != "" {
+		return code, nil
+	}
+	return "", fmt.Errorf("%w: authorize returned error: %s: %s", ErrRefreshFailed,
+		fragParams.Get("error"), fragParams.Get("error_description"))
+}
+
+// followSSORedirects walks the sign-in redirects by hand until one carries the
+// authorization code. The client is configured not to follow them itself,
+// because the code arrives on a redirect that is never fetched.
+func followSSORedirects(client *http.Client, resp *http.Response, cookieHeader string) (string, error) {
+	current := resp
+	for {
+		location, err := nextLocation(current)
+		if err != nil {
+			return "", err
+		}
+
+		if strings.Contains(location, "m365.cloud.microsoft") {
+			authCode, codeErr := authCodeFromRedirect(location)
+			if codeErr != nil {
+				return "", codeErr
+			}
+			if authCode != "" {
+				return authCode, nil
+			}
+		}
+
+		redirectReq, err := ssoBrowserRequest(location, cookieHeader)
+		if err != nil {
+			return "", fmt.Errorf("%w: failed to create redirect request: %v", ErrRefreshFailed, err)
+		}
+		_ = current.Body.Close()
+		current, err = client.Do(redirectReq)
+		if err != nil {
+			return "", fmt.Errorf("%w: redirect request failed: %v", ErrRefreshFailed, err)
+		}
+		defer func() { _ = current.Body.Close() }()
+	}
+}
+
 // reauthWithSSO performs silent re-authentication using stored SSO cookies.
 // It uses the OAuth2 authorize endpoint with prompt=none and PKCE.
 // If the SSO session is still valid, it returns new access and refresh tokens.
@@ -235,13 +355,7 @@ func (tm *TokenManager) reauthWithSSO() (string, error) {
 	}
 
 	logging.Debugf("reauthWithSSO: loaded %d SSO cookies captured at %s", len(store.Cookies), store.CapturedAt.Format(time.RFC3339))
-
-	// Build Cookie header string from SSO cookies
-	var cookieParts []string
-	for _, c := range store.Cookies {
-		cookieParts = append(cookieParts, c.Name+"="+c.Value)
-	}
-	cookieHeader := strings.Join(cookieParts, "; ")
+	cookieHeader := cookieHeaderFrom(store.Cookies)
 
 	client := &http.Client{
 		// Don't follow redirects automatically; we need to capture the auth code
@@ -257,30 +371,10 @@ func (tm *TokenManager) reauthWithSSO() (string, error) {
 		return "", fmt.Errorf("%w: %v", ErrRefreshFailed, err)
 	}
 
-	// Build authorize URL for silent auth using SSO cookies
-	// sso_reload=True tells the server to use SSO cookies and skip the BssoInterrupt page.
-	// prompt=none breaks SSO cookie recognition, so we omit it.
-	authorizeURL := fmt.Sprintf(authorizeURLTemplate, tm.tenant)
-	params := url.Values{
-		"client_id":             {tm.clientID},
-		"response_type":         {"code"},
-		"redirect_uri":          {defaultRedirectURI},
-		"scope":                 {tm.scope + " offline_access"},
-		"response_mode":         {"fragment"},
-		"code_challenge":        {challenge},
-		"code_challenge_method": {"S256"},
-		"state":                 {"m365bridge-sso"},
-		"sso_reload":            {"True"},
-	}
-
-	authReq, err := http.NewRequest("GET", authorizeURL+"?"+params.Encode(), nil)
+	authReq, err := ssoBrowserRequest(tm.authorizeTarget(challenge), cookieHeader)
 	if err != nil {
 		return "", fmt.Errorf("%w: failed to create authorize request: %v", ErrRefreshFailed, err)
 	}
-	authReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
-	authReq.Header.Set("Referer", "https://m365.cloud.microsoft/")
-	authReq.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-	authReq.Header.Set("Cookie", cookieHeader)
 
 	authResp, err := client.Do(authReq)
 	if err != nil {
@@ -288,72 +382,14 @@ func (tm *TokenManager) reauthWithSSO() (string, error) {
 	}
 	defer func() { _ = authResp.Body.Close() }()
 
-	// Follow redirects manually until we get the auth code or reach redirect_uri
-	currentResp := authResp
-	for {
-		location := currentResp.Header.Get("Location")
-		if location == "" {
-			body, _ := io.ReadAll(io.LimitReader(currentResp.Body, authPageMax+1))
-			if len(body) > authPageMax {
-				logging.Warnf("sign-in page exceeds %d bytes; a meta refresh past the cap is not followed", authPageMax)
-				body = body[:authPageMax]
-			}
-			bodyStr := string(body)
-			// Check for meta refresh redirect in HTML
-			if metaURL := extractMetaRefreshURL(bodyStr); metaURL != "" {
-				location = metaURL
-			} else {
-				bodyStr = textcut.Truncate(bodyStr, 2000)
-				return "", fmt.Errorf("%w: no redirect from authorize (status %d): %s", ErrRefreshFailed, currentResp.StatusCode, bodyStr)
-			}
-		}
-
-		// Check if this is the redirect_uri with auth code
-		if strings.Contains(location, "m365.cloud.microsoft") {
-			// Parse auth code from redirect URL
-			locURL, err := url.Parse(location)
-			if err != nil {
-				return "", fmt.Errorf("%w: failed to parse redirect URL: %v", ErrRefreshFailed, err)
-			}
-
-			authCode := locURL.Query().Get("code")
-			if authCode == "" {
-				// Check for code in fragment (response_mode=fragment)
-				fragment := locURL.Fragment
-				if fragment != "" {
-					fragParams, _ := url.ParseQuery(fragment)
-					authCode = fragParams.Get("code")
-					if authCode == "" {
-						errCode := fragParams.Get("error")
-						errDesc := fragParams.Get("error_description")
-						return "", fmt.Errorf("%w: authorize returned error: %s: %s", ErrRefreshFailed, errCode, errDesc)
-					}
-				}
-			}
-			if authCode != "" {
-				// Exchange auth code for tokens
-				logging.Info("reauthWithSSO: obtained auth code, exchanging for tokens")
-				return tm.exchangeAuthCode(authCode, verifier)
-			}
-		}
-
-		// Follow the redirect
-		redirectReq, err := http.NewRequest("GET", location, nil)
-		if err != nil {
-			return "", fmt.Errorf("%w: failed to create redirect request: %v", ErrRefreshFailed, err)
-		}
-		redirectReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
-		redirectReq.Header.Set("Referer", "https://m365.cloud.microsoft/")
-		redirectReq.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-		redirectReq.Header.Set("Cookie", cookieHeader)
-
-		_ = currentResp.Body.Close()
-		currentResp, err = client.Do(redirectReq)
-		if err != nil {
-			return "", fmt.Errorf("%w: redirect request failed: %v", ErrRefreshFailed, err)
-		}
-		defer func() { _ = currentResp.Body.Close() }()
+	authCode, err := followSSORedirects(client, authResp, cookieHeader)
+	if err != nil {
+		return "", err
 	}
+
+	// Exchange auth code for tokens
+	logging.Info("reauthWithSSO: obtained auth code, exchanging for tokens")
+	return tm.exchangeAuthCode(authCode, verifier)
 }
 
 // extractMetaRefreshURL parses an HTML body and extracts the URL from a
