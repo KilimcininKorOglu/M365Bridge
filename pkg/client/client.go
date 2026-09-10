@@ -523,286 +523,441 @@ func (c *M365Client) ChatConversationStreamGenContext(
 			}
 		}
 
-		conn, hexSID, uuidSID, err := c.dialConnection(conversationID, userOID, tenantID)
-		if err != nil {
-			logging.Errorf("ChatConversationStreamGen: dial failed: %v", err)
-			if ctx.Err() == nil {
-				emit(StreamChunk{Error: err})
-			}
-			return
-		}
-		defer func() { _ = conn.Close() }()
-		contextWatchDone := make(chan struct{})
-		defer close(contextWatchDone)
-		go func() {
-			select {
-			case <-ctx.Done():
-				_ = conn.Close()
-			case <-contextWatchDone:
-			}
-		}()
-
-		payloadStr, err := payload.BuildConversationPayload(
-			hexSID,
-			uuidSID,
-			messages,
-			conversationID == "",
-			tone,
-			gptOverride,
-			false,
-			hasTools,
-			c.webSearchEnabled,
-			nil,
-		)
-		if err != nil {
-			logging.Errorf("ChatConversationStreamGen: payload build failed: %v", err)
-			emit(StreamChunk{Error: err})
-			return
-		}
-
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(payloadStr+signalRDelimiter)); err != nil {
-			logging.Errorf("ChatConversationStreamGen: write failed: %v", err)
-			emit(StreamChunk{Error: err})
-			return
-		}
-		logging.Debug("ChatConversationStreamGen: payload sent, waiting for response")
-
-		toolCalls := []ToolCall{}
-		seenImages := map[string]bool{}
-		var acc answerAccumulator
-		var accThinking strings.Builder
-		// citations holds back a citation run that has not finished arriving,
-		// because a delta already emitted cannot be retracted.
-		var citations citationFilter
-		var finalConvID string
-		var throttling *ThrottlingInfo
-
-		for {
-			// Image generation moves the read deadline out for the rest of the
-			// turn. The backend goes quiet for a minute or more while it draws,
-			// and its own pings normally carry the connection through that; this
-			// is what keeps the turn alive when they stop.
-			readTimeout := c.recvFinalTimeout
-			if acc.noticedImage {
-				readTimeout = c.imageRecvTimeout
-			}
-			_ = conn.SetReadDeadline(time.Now().Add(readTimeout))
-			msgType, message, err := conn.ReadMessage()
-			if err != nil {
-				if ctx.Err() != nil {
-					return
-				}
-				if websocket.IsCloseError(err) || websocket.IsUnexpectedCloseError(err) {
-					logging.Warnf("ChatConversationStreamGen: connection closed: %v", err)
-					emit(StreamChunk{Error: ErrConnectionClosed})
-				} else {
-					logging.Errorf("ChatConversationStreamGen: read error: %v", err)
-					emit(StreamChunk{Error: err})
-				}
-				return
-			}
-			_ = conn.SetReadDeadline(time.Time{})
-
-			if msgType != websocket.TextMessage {
-				continue
-			}
-
-			text := string(message)
-			parts := strings.SplitSeq(text, signalRDelimiter)
-
-			for part := range parts {
-				part = strings.TrimSpace(part)
-				if part == "" {
-					continue
-				}
-
-				var data map[string]any
-				if err := json.Unmarshal([]byte(part), &data); err != nil {
-					continue
-				}
-
-				// DEBUG: log every WebSocket message type and target (ConvStream)
-				if mt, ok := data["type"].(float64); ok {
-					target, _ := data["target"].(string)
-					logging.Debugf("ConvStream raw: type=%d target=%s", int(mt), target)
-				}
-				// DEBUG: log type=6 message content
-				if mt, ok := data["type"].(float64); ok && int(mt) == 6 {
-					j, _ := json.Marshal(data)
-					s := string(j)
-					if len(s) > 3000 {
-						s = textcut.Truncate(s, 3000) + "...(truncated)"
-					}
-					logging.Debugf("ConvStream type=6: %s", s)
-				}
-				if msgType, ok := data["type"].(float64); ok && int(msgType) == 1 {
-					if target, ok := data["target"].(string); ok && target == "update" {
-						if args, ok := data["arguments"].([]any); ok {
-							for _, arg := range args {
-								if argMap, ok := arg.(map[string]any); ok {
-									// DEBUG: log all keys in argMap
-									logging.Debugf("ConvStream argMap keys: %v", mapKeys(argMap))
-									// Capture the conversation quota counters. They arrive on
-									// their own update frames, separate from message frames.
-									if rawThrottling, ok := argMap["throttling"].(map[string]any); ok {
-										if info := parseThrottling(rawThrottling); info != nil {
-											throttling = info
-											logging.Infof("ConvStream throttling: %s", info.Summary())
-											if c.throttlingObserver != nil {
-												c.throttlingObserver(info)
-											}
-										}
-									}
-									// Extract conversationId from type:1 update if present (rare)
-									if convID, ok := argMap["conversationId"].(string); ok && convID != "" {
-										finalConvID = convID
-									}
-									if msgs, ok := argMap["messages"].([]any); ok {
-										// DEBUG: log all messages' messageType and contentOrigin
-										for _, msg := range msgs {
-											if msgMap, ok := msg.(map[string]any); ok {
-												mt, _ := msgMap["messageType"].(string)
-												co, _ := msgMap["contentOrigin"].(string)
-												logging.Debugf("ConvWS msg: messageType=%s contentOrigin=%s keys=%v", mt, co, mapKeys(msgMap))
-											}
-										}
-										// Check all messages for tool calls and thinking
-										for _, msg := range msgs {
-											if msgMap, ok := msg.(map[string]any); ok {
-												if messageType, ok := msgMap["messageType"].(string); ok {
-													if funcName, exists := models.ToolMessageType[messageType]; exists {
-														if tc := extractToolCall(msgMap, funcName); tc != nil {
-															toolCalls = append(toolCalls, *tc)
-														}
-													}
-													// Extract thinking from Progress + ChainOfThoughtSummary
-													if messageType == progressMessageType {
-														if co, _ := msgMap["contentOrigin"].(string); co == "ChainOfThoughtSummary" {
-															if t, _ := msgMap["text"].(string); t != "" {
-																accThinking.WriteString(t)
-																if !emit(StreamChunk{Thinking: t, IsFinal: false}) {
-																	return
-																}
-															}
-														}
-														// Extract generated image URLs from contentGenerationProgressList
-														if co, _ := msgMap["contentOrigin"].(string); co == "ImageGeneration" {
-															if !acc.emitGeneratedImage(msgMap, seenImages, emit) {
-																return
-															}
-														}
-														// Extract web search tool calls from searchQueries field
-														if sq, ok := msgMap["searchQueries"].([]any); ok && len(sq) > 0 {
-															for _, q := range sq {
-																if query, ok := q.(string); ok && query != "" {
-																	tc := makeSearchToolCall(query, msgMap)
-																	toolCalls = append(toolCalls, *tc)
-																}
-															}
-														}
-													}
-												}
-											}
-										}
-										// Only process text from the last message, and only when
-										// that message is the answer rather than the backend's
-										// own tool traffic.
-										if len(msgs) > 0 {
-											if lastMsg, ok := msgs[len(msgs)-1].(map[string]any); ok {
-												if carriesAnswerText(lastMsg) {
-													if newText, ok := lastMsg["text"].(string); ok && newText != "" {
-														// The snapshot restates the whole answer, so
-														// it is stripped whole rather than through the
-														// streaming filter, and stays comparable with
-														// the accumulation that was already filtered.
-														newText = stripCitations(newText)
-														chunk, advanced := snapshotDelta(acc.baseline(), newText)
-														if !advanced {
-															// A diverging snapshot is normally a
-															// re-encoding of text already delivered,
-															// which is why it is dropped. Count it so a
-															// turn that really did lose content is not
-															// invisible: two drops on an ordinary turn
-															// is the measured norm, and a spike is not.
-															acc.dropSnapshot()
-														} else {
-															acc.replaceAnswer(newText)
-															if chunk != "" {
-																if !emit(StreamChunk{Text: chunk, IsFinal: false}) {
-																	return
-																}
-															}
-														}
-													}
-												}
-											}
-										}
-									}
-									if writeAtCursor, ok := argMap["writeAtCursor"].(string); ok {
-										// A citation run can straddle two deltas, so the
-										// filter holds the tail back rather than emitting
-										// text it would have to retract.
-										if emitText := citations.push(writeAtCursor); emitText != "" {
-											acc.appendAnswer(emitText)
-											if !emit(StreamChunk{Text: emitText, IsFinal: false}) {
-												return
-											}
-										}
-									}
-								}
-							}
-						}
-					}
-				} else if msgType, ok := data["type"].(float64); ok && int(msgType) == 2 {
-					// type: 2 is invocation completion; contains item.conversationId
-					// and the backend's verdict on the turn.
-					if item, ok := data["item"].(map[string]any); ok {
-						if convID, ok := item["conversationId"].(string); ok && convID != "" {
-							finalConvID = convID
-						}
-						if failure := parseTurnResult(item); failure != nil {
-							// Text already on the wire cannot be retracted, so a
-							// partial answer is delivered rather than replaced by
-							// an error.
-							if acc.emittedBytes() > 0 {
-								logging.Warnf("ChatConversationStreamGen: %v, keeping the %d bytes already emitted", failure, acc.emittedBytes())
-							} else {
-								logging.Errorf("ChatConversationStreamGen: %v", failure)
-								emit(StreamChunk{Error: failure})
-								return
-							}
-						}
-					}
-				} else if msgType, ok := data["type"].(float64); ok && int(msgType) == 3 {
-					// A run still held here never closed, so it was a truncated
-					// citation marker rather than answer text. Report the drop
-					// instead of letting it vanish silently.
-					if held := citations.flush(); held != "" {
-						logging.Warnf("ChatConversationStreamGen: dropped %d bytes of an unterminated citation marker", len(held))
-					}
-					if acc.emptyTurn(toolCalls) {
-						logging.Errorf("ChatConversationStreamGen: %v (thinking=%d bytes)", ErrEmptyTurn, accThinking.Len())
-						emit(StreamChunk{Error: ErrEmptyTurn})
-						return
-					}
-					finishReason := "stop"
-					if len(toolCalls) > 0 {
-						finishReason = "tool_calls"
-					}
-					logging.Infof("ChatConversationStreamGen: completed finishReason=%s toolCalls=%d bytes=%d droppedSnapshots=%d",
-						finishReason, len(toolCalls), acc.emittedBytes(), acc.droppedSnapshots)
-					emit(StreamChunk{Text: "", IsFinal: true, ConversationID: finalConvID, ToolCalls: toolCalls, FinishReason: finishReason, Throttling: throttling})
-					return
-				} else if msgType, ok := data["type"].(float64); ok && int(msgType) == -1 {
-					logging.Errorf("ChatConversationStreamGen: server error: %v", data)
-					emit(StreamChunk{Error: fmt.Errorf("server error: %v", data)})
-					return
-				}
-			}
-		}
+		c.runConversationStream(ctx, emit, messages, tone, gptOverride, conversationID, userOID, tenantID, hasTools)
 	}()
 
 	return ch
+}
+
+// runConversationStream dials one WebSocket, sends the turn and reads its
+// frames until the turn ends or the caller goes away.
+func (c *M365Client) runConversationStream(
+	ctx context.Context,
+	emit func(StreamChunk) bool,
+	messages []payload.Message,
+	tone, gptOverride, conversationID, userOID, tenantID string,
+	hasTools bool,
+) {
+	conn, hexSID, uuidSID, err := c.dialConnection(conversationID, userOID, tenantID)
+	if err != nil {
+		logging.Errorf("ChatConversationStreamGen: dial failed: %v", err)
+		if ctx.Err() == nil {
+			emit(StreamChunk{Error: err})
+		}
+		return
+	}
+	defer func() { _ = conn.Close() }()
+	contextWatchDone := make(chan struct{})
+	defer close(contextWatchDone)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-contextWatchDone:
+		}
+	}()
+
+	payloadStr, err := payload.BuildConversationPayload(
+		hexSID,
+		uuidSID,
+		messages,
+		conversationID == "",
+		tone,
+		gptOverride,
+		false,
+		hasTools,
+		c.webSearchEnabled,
+		nil,
+	)
+	if err != nil {
+		logging.Errorf("ChatConversationStreamGen: payload build failed: %v", err)
+		emit(StreamChunk{Error: err})
+		return
+	}
+
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(payloadStr+signalRDelimiter)); err != nil {
+		logging.Errorf("ChatConversationStreamGen: write failed: %v", err)
+		emit(StreamChunk{Error: err})
+		return
+	}
+	logging.Debug("ChatConversationStreamGen: payload sent, waiting for response")
+
+	stream := &conversationStream{
+		client:     c,
+		emit:       emit,
+		toolCalls:  []ToolCall{},
+		seenImages: map[string]bool{},
+	}
+	stream.read(ctx, conn)
+}
+
+// streamStep says whether a streamed turn keeps reading.
+type streamStep int
+
+const (
+	// streamContinue keeps reading frames.
+	streamContinue streamStep = iota
+	// streamStop ends the turn. Everything the caller needed was already
+	// emitted, including an error chunk when there was one.
+	streamStop
+)
+
+// conversationStream holds what one streamed turn has accumulated.
+type conversationStream struct {
+	client *M365Client
+	emit   func(StreamChunk) bool
+
+	acc      answerAccumulator
+	thinking strings.Builder
+	// citations holds back a citation run that has not finished arriving,
+	// because a delta already emitted cannot be retracted.
+	citations   citationFilter
+	toolCalls   []ToolCall
+	seenImages  map[string]bool
+	finalConvID string
+	throttling  *ThrottlingInfo
+}
+
+// read consumes frames until the turn ends, the caller goes away, or the
+// connection fails.
+func (s *conversationStream) read(ctx context.Context, conn *websocket.Conn) {
+	for {
+		// Image generation moves the read deadline out for the rest of the
+		// turn. The backend goes quiet for a minute or more while it draws,
+		// and its own pings normally carry the connection through that; this
+		// is what keeps the turn alive when they stop.
+		readTimeout := s.client.recvFinalTimeout
+		if s.acc.noticedImage {
+			readTimeout = s.client.imageRecvTimeout
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(readTimeout))
+		msgType, message, err := conn.ReadMessage()
+		if err != nil {
+			s.reportReadError(ctx, err)
+			return
+		}
+		_ = conn.SetReadDeadline(time.Time{})
+
+		if msgType != websocket.TextMessage {
+			continue
+		}
+
+		for part := range strings.SplitSeq(string(message), signalRDelimiter) {
+			if s.frame(part) == streamStop {
+				return
+			}
+		}
+	}
+}
+
+// reportReadError tells the caller why the turn stopped, unless the caller is
+// the reason it stopped.
+func (s *conversationStream) reportReadError(ctx context.Context, err error) {
+	if ctx.Err() != nil {
+		return
+	}
+	if websocket.IsCloseError(err) || websocket.IsUnexpectedCloseError(err) {
+		logging.Warnf("ChatConversationStreamGen: connection closed: %v", err)
+		s.emit(StreamChunk{Error: ErrConnectionClosed})
+		return
+	}
+	logging.Errorf("ChatConversationStreamGen: read error: %v", err)
+	s.emit(StreamChunk{Error: err})
+}
+
+// frame reads one SignalR frame.
+func (s *conversationStream) frame(part string) streamStep {
+	data, ok := decodeSignalRFrame(part)
+	if !ok {
+		return streamContinue
+	}
+	logStreamFrame(data)
+
+	switch signalRFrameType(data) {
+	case 1:
+		return s.update(data)
+	case 2:
+		return s.completion(data)
+	case 3:
+		return s.finish()
+	case -1:
+		logging.Errorf("ChatConversationStreamGen: server error: %v", data)
+		s.emit(StreamChunk{Error: fmt.Errorf("server error: %v", data)})
+		return streamStop
+	}
+	return streamContinue
+}
+
+// logStreamFrame records every frame's type and target, and dumps a type 6
+// frame in full because that is the one whose shape is undocumented.
+func logStreamFrame(data map[string]any) {
+	mt, ok := data["type"].(float64)
+	if !ok {
+		return
+	}
+	target, _ := data["target"].(string)
+	logging.Debugf("ConvStream raw: type=%d target=%s", int(mt), target)
+	if int(mt) != 6 {
+		return
+	}
+	j, _ := json.Marshal(data)
+	dump := string(j)
+	if len(dump) > 3000 {
+		dump = textcut.Truncate(dump, 3000) + "...(truncated)"
+	}
+	logging.Debugf("ConvStream type=6: %s", dump)
+}
+
+// update reads a type 1 frame, which carries the turn's incremental content.
+func (s *conversationStream) update(data map[string]any) streamStep {
+	if target, ok := data["target"].(string); !ok || target != "update" {
+		return streamContinue
+	}
+	args, ok := data["arguments"].([]any)
+	if !ok {
+		return streamContinue
+	}
+	for _, arg := range args {
+		argMap, ok := arg.(map[string]any)
+		if !ok {
+			continue
+		}
+		if s.updateArg(argMap) == streamStop {
+			return streamStop
+		}
+	}
+	return streamContinue
+}
+
+// updateArg reads one argument of an update frame.
+func (s *conversationStream) updateArg(argMap map[string]any) streamStep {
+	// DEBUG: log all keys in argMap
+	logging.Debugf("ConvStream argMap keys: %v", mapKeys(argMap))
+	s.applyThrottling(argMap)
+
+	// Extract conversationId from type:1 update if present (rare)
+	if convID, ok := argMap["conversationId"].(string); ok && convID != "" {
+		s.finalConvID = convID
+	}
+	if msgs, ok := argMap["messages"].([]any); ok {
+		if s.applyMessages(msgs) == streamStop {
+			return streamStop
+		}
+	}
+	return s.applyCursor(argMap)
+}
+
+// applyThrottling captures the conversation quota counters. They arrive on
+// their own update frames, separate from message frames.
+func (s *conversationStream) applyThrottling(argMap map[string]any) {
+	rawThrottling, ok := argMap["throttling"].(map[string]any)
+	if !ok {
+		return
+	}
+	info := parseThrottling(rawThrottling)
+	if info == nil {
+		return
+	}
+	s.throttling = info
+	logging.Infof("ConvStream throttling: %s", info.Summary())
+	if s.client.throttlingObserver != nil {
+		s.client.throttlingObserver(info)
+	}
+}
+
+// applyMessages reads the messages of one update argument.
+func (s *conversationStream) applyMessages(msgs []any) streamStep {
+	logMessageTypes(msgs)
+
+	// Check all messages for tool calls and thinking
+	for _, msg := range msgs {
+		msgMap, ok := msg.(map[string]any)
+		if !ok {
+			continue
+		}
+		if s.applyMessage(msgMap) == streamStop {
+			return streamStop
+		}
+	}
+	return s.applyAnswerSnapshot(msgs)
+}
+
+// logMessageTypes records what the backend sent, which is how a message type
+// this client does not handle yet gets noticed.
+func logMessageTypes(msgs []any) {
+	for _, msg := range msgs {
+		msgMap, ok := msg.(map[string]any)
+		if !ok {
+			continue
+		}
+		mt, _ := msgMap["messageType"].(string)
+		co, _ := msgMap["contentOrigin"].(string)
+		logging.Debugf("ConvWS msg: messageType=%s contentOrigin=%s keys=%v", mt, co, mapKeys(msgMap))
+	}
+}
+
+// applyMessage reads one message: the backend's own tool calls, and the
+// progress notes that carry reasoning and generated images.
+func (s *conversationStream) applyMessage(msgMap map[string]any) streamStep {
+	messageType, ok := msgMap["messageType"].(string)
+	if !ok {
+		return streamContinue
+	}
+	if funcName, exists := models.ToolMessageType[messageType]; exists {
+		if tc := extractToolCall(msgMap, funcName); tc != nil {
+			s.toolCalls = append(s.toolCalls, *tc)
+		}
+	}
+	if messageType != progressMessageType {
+		return streamContinue
+	}
+	return s.applyProgress(msgMap)
+}
+
+// applyProgress reads a Progress message, which carries the reasoning summary,
+// the generated image and the backend's own web searches.
+func (s *conversationStream) applyProgress(msgMap map[string]any) streamStep {
+	co, _ := msgMap["contentOrigin"].(string)
+	switch co {
+	case "ChainOfThoughtSummary":
+		// Extract thinking from Progress + ChainOfThoughtSummary
+		if s.applyThinking(msgMap) == streamStop {
+			return streamStop
+		}
+	case "ImageGeneration":
+		// Extract generated image URLs from contentGenerationProgressList
+		if !s.acc.emitGeneratedImage(msgMap, s.seenImages, s.emit) {
+			return streamStop
+		}
+	}
+	s.applySearchQueries(msgMap)
+	return streamContinue
+}
+
+// applyThinking emits the reasoning summary as it arrives.
+func (s *conversationStream) applyThinking(msgMap map[string]any) streamStep {
+	t, _ := msgMap["text"].(string)
+	if t == "" {
+		return streamContinue
+	}
+	s.thinking.WriteString(t)
+	if !s.emit(StreamChunk{Thinking: t, IsFinal: false}) {
+		return streamStop
+	}
+	return streamContinue
+}
+
+// applySearchQueries records the backend's own web searches as tool calls.
+func (s *conversationStream) applySearchQueries(msgMap map[string]any) {
+	sq, ok := msgMap["searchQueries"].([]any)
+	if !ok || len(sq) == 0 {
+		return
+	}
+	for _, q := range sq {
+		if query, ok := q.(string); ok && query != "" {
+			s.toolCalls = append(s.toolCalls, *makeSearchToolCall(query, msgMap))
+		}
+	}
+}
+
+// applyAnswerSnapshot reads the answer restatement the last message carries.
+//
+// Only the last message is read, and only when it is the answer rather than
+// the backend's own tool traffic.
+func (s *conversationStream) applyAnswerSnapshot(msgs []any) streamStep {
+	newText, ok := lastAnswerText(msgs)
+	if !ok || newText == "" {
+		return streamContinue
+	}
+
+	// The snapshot restates the whole answer, so it is stripped whole rather
+	// than through the streaming filter, and stays comparable with the
+	// accumulation that was already filtered.
+	newText = stripCitations(newText)
+	chunk, advanced := snapshotDelta(s.acc.baseline(), newText)
+	if !advanced {
+		// A diverging snapshot is normally a re-encoding of text already
+		// delivered, which is why it is dropped. Count it so a turn that really
+		// did lose content is not invisible: two drops on an ordinary turn is
+		// the measured norm, and a spike is not.
+		s.acc.dropSnapshot()
+		return streamContinue
+	}
+
+	s.acc.replaceAnswer(newText)
+	if chunk != "" && !s.emit(StreamChunk{Text: chunk, IsFinal: false}) {
+		return streamStop
+	}
+	return streamContinue
+}
+
+// applyCursor emits the incremental answer text. A citation run can straddle
+// two deltas, so the filter holds the tail back rather than emitting text it
+// would have to retract.
+func (s *conversationStream) applyCursor(argMap map[string]any) streamStep {
+	writeAtCursor, ok := argMap["writeAtCursor"].(string)
+	if !ok {
+		return streamContinue
+	}
+	emitText := s.citations.push(writeAtCursor)
+	if emitText == "" {
+		return streamContinue
+	}
+	s.acc.appendAnswer(emitText)
+	if !s.emit(StreamChunk{Text: emitText, IsFinal: false}) {
+		return streamStop
+	}
+	return streamContinue
+}
+
+// completion reads a type 2 frame, the invocation completion. It carries
+// item.conversationId and the backend's verdict on the turn.
+func (s *conversationStream) completion(data map[string]any) streamStep {
+	item, ok := data["item"].(map[string]any)
+	if !ok {
+		return streamContinue
+	}
+	if convID, ok := item["conversationId"].(string); ok && convID != "" {
+		s.finalConvID = convID
+	}
+	failure := parseTurnResult(item)
+	if failure == nil {
+		return streamContinue
+	}
+
+	// Text already on the wire cannot be retracted, so a partial answer is
+	// delivered rather than replaced by an error.
+	if s.acc.emittedBytes() > 0 {
+		logging.Warnf("ChatConversationStreamGen: %v, keeping the %d bytes already emitted", failure, s.acc.emittedBytes())
+		return streamContinue
+	}
+	logging.Errorf("ChatConversationStreamGen: %v", failure)
+	s.emit(StreamChunk{Error: failure})
+	return streamStop
+}
+
+// finish reads a type 3 frame, which ends the turn.
+func (s *conversationStream) finish() streamStep {
+	// A run still held here never closed, so it was a truncated citation
+	// marker rather than answer text. Report the drop instead of letting it
+	// vanish silently.
+	if held := s.citations.flush(); held != "" {
+		logging.Warnf("ChatConversationStreamGen: dropped %d bytes of an unterminated citation marker", len(held))
+	}
+	if s.acc.emptyTurn(s.toolCalls) {
+		logging.Errorf("ChatConversationStreamGen: %v (thinking=%d bytes)", ErrEmptyTurn, s.thinking.Len())
+		s.emit(StreamChunk{Error: ErrEmptyTurn})
+		return streamStop
+	}
+
+	finishReason := "stop"
+	if len(s.toolCalls) > 0 {
+		finishReason = "tool_calls"
+	}
+	logging.Infof("ChatConversationStreamGen: completed finishReason=%s toolCalls=%d bytes=%d droppedSnapshots=%d",
+		finishReason, len(s.toolCalls), s.acc.emittedBytes(), s.acc.droppedSnapshots)
+	s.emit(StreamChunk{Text: "", IsFinal: true, ConversationID: s.finalConvID, ToolCalls: s.toolCalls, FinishReason: finishReason, Throttling: s.throttling})
+	return streamStop
 }
 
 // sendRecv sends a payload and waits for the complete response.
@@ -884,7 +1039,11 @@ func (s *sendRecvState) applyUpdate(data map[string]any) {
 		if !ok {
 			continue
 		}
-		if text, ok := lastAnswerText(argMap); ok {
+		msgs, ok := argMap["messages"].([]any)
+		if !ok {
+			continue
+		}
+		if text, ok := lastAnswerText(msgs); ok {
 			// This path replaces rather than accumulates, so the whole text is
 			// stripped each time.
 			s.fullText = stripCitations(text)
@@ -920,9 +1079,8 @@ func (s *sendRecvState) completion() error {
 // lastAnswerText reads the last message of an update argument when it carries
 // answer text. carriesAnswerText is what keeps the backend's own tool traffic
 // out of the answer.
-func lastAnswerText(argMap map[string]any) (string, bool) {
-	msgs, ok := argMap["messages"].([]any)
-	if !ok || len(msgs) == 0 {
+func lastAnswerText(msgs []any) (string, bool) {
+	if len(msgs) == 0 {
 		return "", false
 	}
 	lastMsg, ok := msgs[len(msgs)-1].(map[string]any)
