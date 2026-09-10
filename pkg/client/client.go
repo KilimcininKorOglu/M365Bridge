@@ -1158,33 +1158,46 @@ func extractImageGenerationMarkdown(msg map[string]any, seenImages map[string]bo
 		if !ok {
 			continue
 		}
-		// DEBUG: log full progress item as JSON (truncated to 2000 chars)
-		if j, err := json.Marshal(itemMap); err == nil {
-			s := string(j)
-			if len(s) > 2000 {
-				s = textcut.Truncate(s, 2000) + "...(truncated)"
-			}
-			logging.Debugf("ImageGen progress item JSON: %s", s)
-		}
+		logProgressItem(itemMap)
 		urls, ok := itemMap["ImageReferenceUrls"].([]any)
 		if !ok {
 			continue
 		}
-		for _, urlVal := range urls {
-			url, ok := urlVal.(string)
-			if !ok || url == "" {
-				continue
-			}
-			if seenImages[url] {
-				continue
-			}
-			seenImages[url] = true
-			logging.Infof("ImageGen: extracted image URL: %s", url)
-			parts = append(parts, fmt.Sprintf("\n\n![image](%s)\n\n", url))
-		}
+		parts = append(parts, unseenImageMarkdown(urls, seenImages)...)
 	}
 
 	return strings.Join(parts, "")
+}
+
+// logProgressItem records one progress item for diagnosis, truncated so a long
+// one does not fill the log.
+func logProgressItem(itemMap map[string]any) {
+	j, err := json.Marshal(itemMap)
+	if err != nil {
+		return
+	}
+	s := string(j)
+	if len(s) > 2000 {
+		s = textcut.Truncate(s, 2000) + "...(truncated)"
+	}
+	logging.Debugf("ImageGen progress item JSON: %s", s)
+}
+
+// unseenImageMarkdown renders each address that has not been emitted yet, and
+// records it. M365 sends the same URL in several Progress updates as the image
+// generation completes.
+func unseenImageMarkdown(urls []any, seenImages map[string]bool) []string {
+	var parts []string
+	for _, urlVal := range urls {
+		url, ok := urlVal.(string)
+		if !ok || url == "" || seenImages[url] {
+			continue
+		}
+		seenImages[url] = true
+		logging.Infof("ImageGen: extracted image URL: %s", url)
+		parts = append(parts, fmt.Sprintf("\n\n![image](%s)\n\n", url))
+	}
+	return parts
 }
 
 // mapKeys returns the keys of a map as a slice (for debug logging).

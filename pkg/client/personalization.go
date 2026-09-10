@@ -53,6 +53,38 @@ type PersonalizationFlags struct {
 // personalizationRequest issues one settings request with the account-routing
 // headers the M365 web client sends, and returns the flags it answered with.
 func (c *M365Client) personalizationRequest(method, userOID, tenantID string, body []byte) (*PersonalizationFlags, error) {
+	req, err := c.buildPersonalizationRequest(method, userOID, tenantID, body)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := (&http.Client{Timeout: personalizationTimeout}).Do(req)
+	if err != nil {
+		return nil, &UpstreamError{Op: "personalization", Status: 0, Err: err}
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	respBody, err := readPersonalizationBody(resp)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		logging.Errorf("personalization: %s failed status=%d body=%s",
+			method, resp.StatusCode, string(respBody)[:min(300, len(respBody))])
+		return nil, &UpstreamError{Op: "personalization", Status: resp.StatusCode, Err: errors.New(string(respBody))}
+	}
+
+	var flags PersonalizationFlags
+	if err := json.Unmarshal(respBody, &flags); err != nil {
+		return nil, fmt.Errorf("failed to parse personalization response: %w", err)
+	}
+	return &flags, nil
+}
+
+// buildPersonalizationRequest stamps the account-routing headers the M365 web
+// client sends. The setting lives on the account, so the request must name
+// which account it is for.
+func (c *M365Client) buildPersonalizationRequest(method, userOID, tenantID string, body []byte) (*http.Request, error) {
 	if userOID == "" || tenantID == "" {
 		return nil, errors.New("personalization: user OID and tenant ID are required")
 	}
@@ -80,13 +112,11 @@ func (c *M365Client) personalizationRequest(method, userOID, tenantID string, bo
 	req.Header.Set("X-ClientRequestId", uuid.New().String())
 	req.Header.Set("X-RoutingParameter-SessionKey", userOID)
 	req.Header.Set("X-Scenario", "OfficeWebIncludedCopilot")
+	return req, nil
+}
 
-	resp, err := (&http.Client{Timeout: personalizationTimeout}).Do(req)
-	if err != nil {
-		return nil, &UpstreamError{Op: "personalization", Status: 0, Err: err}
-	}
-	defer func() { _ = resp.Body.Close() }()
-
+// readPersonalizationBody reads the response under a byte cap.
+func readPersonalizationBody(resp *http.Response) ([]byte, error) {
 	// One extra byte distinguishes "exactly at the limit" from "truncated".
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, personalizationResponseMax+1))
 	if err != nil {
@@ -95,17 +125,7 @@ func (c *M365Client) personalizationRequest(method, userOID, tenantID string, bo
 	if len(respBody) > personalizationResponseMax {
 		return nil, fmt.Errorf("personalization response exceeds %d bytes", personalizationResponseMax)
 	}
-	if resp.StatusCode != http.StatusOK {
-		logging.Errorf("personalization: %s failed status=%d body=%s",
-			method, resp.StatusCode, string(respBody)[:min(300, len(respBody))])
-		return nil, &UpstreamError{Op: "personalization", Status: resp.StatusCode, Err: errors.New(string(respBody))}
-	}
-
-	var flags PersonalizationFlags
-	if err := json.Unmarshal(respBody, &flags); err != nil {
-		return nil, fmt.Errorf("failed to parse personalization response: %w", err)
-	}
-	return &flags, nil
+	return respBody, nil
 }
 
 // GetPersonalizationFlags reports what Copilot is allowed to remember about the
