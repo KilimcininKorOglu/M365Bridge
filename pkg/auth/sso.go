@@ -693,8 +693,10 @@ func (tm *TokenManager) acquireDesignerToken() (string, int, error) {
 	return requestToken(refreshToken)
 }
 
-// requestDesignerToken exchanges a broker refresh token for a designer access token.
-func (tm *TokenManager) requestDesignerToken(refreshToken string) (string, int, error) {
+// buildDesignerTokenRequest builds the broker token exchange, which is the
+// MSAL.js broker flow rather than the plain refresh_token grant the standard
+// token uses.
+func (tm *TokenManager) buildDesignerTokenRequest(refreshToken string) (*http.Request, error) {
 	// Build the broker token URL with query parameters
 	tokenURL := fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/token?brk_client_id=%s&brk_redirect_uri=%s&client_id=%s&client-request-id=%s",
 		tm.tenant,
@@ -728,15 +730,40 @@ func (tm *TokenManager) requestDesignerToken(refreshToken string) (string, int, 
 	body.Set("brk_client_id", designerClientID)
 	body.Set("brk_redirect_uri", defaultRedirectURI)
 
-	bodyEncoded := body.Encode()
-
-	req, err := http.NewRequest("POST", tokenURL, strings.NewReader(bodyEncoded))
+	req, err := http.NewRequest("POST", tokenURL, strings.NewReader(body.Encode()))
 	if err != nil {
-		return "", 0, fmt.Errorf("failed to create designer broker token request: %w", err)
+		return nil, fmt.Errorf("failed to create designer broker token request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded;charset=utf-8")
 	req.Header.Set("Origin", "https://m365.cloud.microsoft")
 	req.Header.Set("Referer", "https://m365.cloud.microsoft/")
+	return req, nil
+}
+
+// designerTokenFailure reads a non-200 from the broker token endpoint. An OAuth
+// error body becomes a designerOAuthError, which the caller acts on; anything
+// else is reported as the status it was.
+func designerTokenFailure(status int, respBody []byte) error {
+	var oauthResult struct {
+		Error            string `json:"error"`
+		ErrorDescription string `json:"error_description"`
+	}
+	if err := json.Unmarshal(respBody, &oauthResult); err == nil && oauthResult.Error != "" {
+		return &designerOAuthError{
+			Status:      status,
+			Code:        oauthResult.Error,
+			Description: oauthResult.ErrorDescription,
+		}
+	}
+	return fmt.Errorf("designer broker token status %d: %s", status, string(respBody)[:min(300, len(respBody))])
+}
+
+// requestDesignerToken exchanges a broker refresh token for a designer access token.
+func (tm *TokenManager) requestDesignerToken(refreshToken string) (string, int, error) {
+	req, err := tm.buildDesignerTokenRequest(refreshToken)
+	if err != nil {
+		return "", 0, err
+	}
 
 	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Do(req)
@@ -752,27 +779,11 @@ func (tm *TokenManager) requestDesignerToken(refreshToken string) (string, int, 
 	if len(respBody) > tokenResponseMax {
 		return "", 0, fmt.Errorf("designer broker token response exceeds %d bytes", tokenResponseMax)
 	}
-
 	if resp.StatusCode != http.StatusOK {
-		var oauthResult struct {
-			Error            string `json:"error"`
-			ErrorDescription string `json:"error_description"`
-		}
-		if err := json.Unmarshal(respBody, &oauthResult); err == nil && oauthResult.Error != "" {
-			return "", 0, &designerOAuthError{
-				Status:      resp.StatusCode,
-				Code:        oauthResult.Error,
-				Description: oauthResult.ErrorDescription,
-			}
-		}
-		return "", 0, fmt.Errorf("designer broker token status %d: %s", resp.StatusCode, string(respBody)[:min(300, len(respBody))])
+		return "", 0, designerTokenFailure(resp.StatusCode, respBody)
 	}
 
-	var result struct {
-		AccessToken  string `json:"access_token"`
-		RefreshToken string `json:"refresh_token"`
-		ExpiresIn    int    `json:"expires_in"`
-	}
+	var result refreshResponse
 	if err := json.Unmarshal(respBody, &result); err != nil {
 		return "", 0, fmt.Errorf("failed to parse designer broker token response: %w", err)
 	}
