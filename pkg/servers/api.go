@@ -2139,10 +2139,10 @@ func (api *APIServer) streamAnthropicComplete(ctx context.Context, w http.Respon
 			break
 		}
 		step := stream.chunk(chunk, ch, maxTokens, stopWriter)
-		if step == completeFailed {
+		if step == streamLoopFailed {
 			return
 		}
-		if step == completeStop {
+		if step == streamLoopStop {
 			break
 		}
 	}
@@ -2204,16 +2204,16 @@ func drainStream(ch <-chan client.StreamChunk) {
 	}
 }
 
-// completeStreamStep says what the Complete stream loop does next.
-type completeStreamStep int
+// streamLoopStep says what a streaming responder does after one chunk.
+type streamLoopStep int
 
 const (
-	// completeContinue keeps reading chunks.
-	completeContinue completeStreamStep = iota
-	// completeStop ends the turn and writes its final event.
-	completeStop
-	// completeFailed means the error event was already written.
-	completeFailed
+	// streamLoopContinue keeps reading chunks.
+	streamLoopContinue streamLoopStep = iota
+	// streamLoopStop ends the turn and writes its final event.
+	streamLoopStop
+	// streamLoopFailed means the error event was already written.
+	streamLoopFailed
 )
 
 // completeStream carries what one legacy Complete turn accumulates.
@@ -2248,7 +2248,7 @@ func (s *completeStream) delta(text string) {
 }
 
 // chunk reads one upstream chunk of a Complete turn.
-func (s *completeStream) chunk(chunk client.StreamChunk, ch <-chan client.StreamChunk, maxTokens int, stopWriter *stopSequenceWriter) completeStreamStep {
+func (s *completeStream) chunk(chunk client.StreamChunk, ch <-chan client.StreamChunk, maxTokens int, stopWriter *stopSequenceWriter) streamLoopStep {
 	if chunk.Error != nil {
 		// The classification rather than the transport error, which names
 		// request URLs and credential file paths.
@@ -2259,12 +2259,12 @@ func (s *completeStream) chunk(chunk client.StreamChunk, ch <-chan client.Stream
 		})
 		_, _ = fmt.Fprintf(s.w, "event: error\ndata: %s\n\n", errJSON)
 		s.flusher.Flush()
-		return completeFailed
+		return streamLoopFailed
 	}
 
 	if chunk.IsFinal {
 		s.convID = chunk.ConversationID
-		return completeStop
+		return streamLoopStop
 	}
 
 	chunk.Text = s.api.routeGeneratedImages(chunk.Text)
@@ -2273,14 +2273,14 @@ func (s *completeStream) chunk(chunk client.StreamChunk, ch <-chan client.Stream
 	// counted for the usage object but never emitted.
 	if chunk.Thinking != "" {
 		s.thinking.WriteString(chunk.Thinking)
-		return completeContinue
+		return streamLoopContinue
 	}
 
 	// Check max_tokens limit
 	if maxTokens > 0 && countTokens(s.fullText.String()) >= maxTokens {
 		s.truncated = true
 		drainStream(ch)
-		return completeStop
+		return streamLoopStop
 	}
 
 	// Once a stop sequence is reached the writer releases nothing more, but the
@@ -2288,7 +2288,7 @@ func (s *completeStream) chunk(chunk client.StreamChunk, ch <-chan client.Stream
 	// turn belongs to.
 	emit, _ := stopWriter.next(chunk.Text)
 	s.delta(emit)
-	return completeContinue
+	return streamLoopContinue
 }
 
 // streamChatCompletions streams chat completion responses in OpenAI format.
@@ -3316,14 +3316,8 @@ func (api *APIServer) nonStreamAnthropicMessages(w http.ResponseWriter, messages
 
 // streamCompletions streams text completion responses in OpenAI text_completion format.
 func (api *APIServer) streamCompletions(ctx context.Context, w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, maxTokens int, sid, convID string, hasTools bool, tools []toolcalling.ToolDef, toolChoice string, stopSequences []string, includeUsage bool) {
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "close")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-
-	flusher, ok := w.(http.Flusher)
+	flusher, ok := api.beginSSE(w)
 	if !ok {
-		api.sendError(w, http.StatusInternalServerError, "Streaming not supported")
 		return
 	}
 
@@ -3335,47 +3329,22 @@ func (api *APIServer) streamCompletions(ctx context.Context, w http.ResponseWrit
 		return
 	}
 
-	compID := fmt.Sprintf("cmpl-%s", uuid.New().String())
-	openaiModel := cfg.OpenAIID
+	stream := &completionStream{
+		api:     api,
+		w:       w,
+		flusher: flusher,
+		compID:  fmt.Sprintf("cmpl-%s", uuid.New().String()),
+		model:   cfg.OpenAIID,
+	}
 
 	ch := api.m365Client.ChatConversationStreamGenContext(ctx, messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
-
-	var fullTextBuilder strings.Builder
-	var thinkingBuilder strings.Builder
-	truncated := false
-	toolCallingEnabled := hasTools
 
 	// A stop sequence can straddle two chunks, so the deltas of a directly
 	// streamed answer pass through a writer that holds back the tail which
 	// could still complete one. A tool-enabled turn is buffered whole, so it
 	// takes the trailing cut below instead.
 	stopWriter := newStopSequenceWriter(stopSequences)
-	sendTextDelta := func(text string) {
-		if text == "" {
-			return
-		}
-		fullTextBuilder.WriteString(text)
-		chunkData := map[string]any{
-			"id":      compID,
-			"object":  "text_completion",
-			"created": time.Now().Unix(),
-			"model":   openaiModel,
-			"choices": []map[string]any{
-				{
-					"index":         0,
-					"text":          text,
-					"finish_reason": nil,
-					"logprobs":      nil,
-				},
-			},
-		}
-		jsonData, _ := json.Marshal(chunkData)
-		_, _ = fmt.Fprintf(w, "data: %s\n\n", jsonData)
-		flusher.Flush()
-	}
 
-	var finalConvID string
-	var finalToolCalls []client.ToolCall
 	keepalive := time.NewTicker(sseKeepaliveInterval)
 	defer keepalive.Stop()
 	for {
@@ -3383,147 +3352,152 @@ func (api *APIServer) streamCompletions(ctx context.Context, w http.ResponseWrit
 		if !more {
 			break
 		}
-		if chunk.Error != nil {
-			// An error object rather than completion text, for the same reason
-			// the chat stream carries one: text would be stored as the answer.
-			status, code, message := streamErrorFields("completion", chunk.Error)
-			errChunk := map[string]any{
-				"id":      compID,
-				"object":  "text_completion",
-				"created": time.Now().Unix(),
-				"model":   openaiModel,
-				"error": map[string]any{
-					"message": message,
-					"type":    openAIErrorType(status),
-					"code":    code,
-				},
-			}
-			jsonData, _ := json.Marshal(errChunk)
-			_, _ = fmt.Fprintf(w, "data: %s\n\n", jsonData)
-			_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
-			flusher.Flush()
+		step := stream.chunk(chunk, ch, maxTokens, hasTools, stopWriter)
+		if step == streamLoopFailed {
 			return
 		}
-
-		if chunk.IsFinal {
-			finalConvID = chunk.ConversationID
-			finalToolCalls = chunk.ToolCalls
+		if step == streamLoopStop {
 			break
 		}
-
-		chunk.Text = api.routeGeneratedImages(chunk.Text)
-
-		// Accumulate thinking text (not sent as content for text_completion)
-		if chunk.Thinking != "" {
-			thinkingBuilder.WriteString(chunk.Thinking)
-			continue
-		}
-
-		// Check max_tokens limit before sending more content
-		if maxTokens > 0 && countTokens(fullTextBuilder.String()) >= maxTokens {
-			truncated = true
-			for range ch {
-			}
-			break
-		}
-
-		// If tool calling is not enabled, stream text directly. The writer
-		// decides what is safe to release, and it also feeds the accumulator,
-		// so the reported usage matches what the client received.
-		if !toolCallingEnabled {
-			emit, _ := stopWriter.next(chunk.Text)
-			sendTextDelta(emit)
-			continue
-		}
-		fullTextBuilder.WriteString(chunk.Text)
 	}
-	if !toolCallingEnabled {
+	if !hasTools {
 		// Whatever the writer held back belongs to the answer when no stop
 		// sequence ever arrived.
-		sendTextDelta(stopWriter.flush())
-	}
-	_ = finalToolCalls
-	fullText := fullTextBuilder.String()
-
-	// Parse simulated tool calls from buffered text if tool calling is enabled
-	var simToolCalls []toolcalling.ToolCall
-	if toolCallingEnabled {
-		contracts := toolcalling.ContractsFor(tools).WithChoice(toolChoice)
-		sim := toolcalling.ParseSimulatedResponse(fullText, toolNamesFromDefs(tools), contracts)
-		sim = api.repairSimulatedToolCalls(toolLoopOpenAI, messages, cfg, tools, contracts, fullText, sim)
-		sim = dropSettledToolCalls(buildToolLedger(messages), toolChoice, sim)
-		if sim.HasPayload {
-			if len(sim.ToolCalls) > 0 {
-				simToolCalls = sim.ToolCalls
-				fullText = ""
-			} else {
-				fullText = sim.Content
-			}
-		} else {
-			fullText = toolcalling.WithholdTransportEnvelope(fullText)
-			if toolcalling.IsContentPolicyBlock(fullText) {
-				// The stream is already open, so the refusal cannot be turned
-				// into an HTTP error the way the non-streaming paths do.
-				logging.Warn("upstream content refusal on a streaming turn: M365 declined the request instead of answering")
-			}
-		}
-		fullText = replaceUnverifiedCompletionClaim(fullText, hasTools, buildToolLedger(messages), len(simToolCalls))
-		// A tool-enabled turn is buffered whole and emitted below, so its stop
-		// sequence is applied here rather than through the writer.
-		if cut, matched := cutAtStopSequence(fullText, stopSequences); matched != "" {
-			fullText = cut
-		}
+		stream.delta(stopWriter.flush())
 	}
 
-	// If tool calling buffered text, send it now as a single chunk
-	if toolCallingEnabled && fullText != "" && len(simToolCalls) == 0 {
-		chunkData := map[string]any{
-			"id":      compID,
-			"object":  "text_completion",
-			"created": time.Now().Unix(),
-			"model":   openaiModel,
-			"choices": []map[string]any{
-				{
-					"index":         0,
-					"text":          fullText,
-					"finish_reason": nil,
-					"logprobs":      nil,
-				},
-			},
-		}
-		jsonData, _ := json.Marshal(chunkData)
-		_, _ = fmt.Fprintf(w, "data: %s\n\n", jsonData)
-		flusher.Flush()
-	}
+	fullText, simToolCalls := api.completionToolCalls(stream, messages, cfg, tools, toolChoice, stopSequences, hasTools)
 
-	// Send final done chunk
-	finishReason := "stop"
-	if truncated {
-		finishReason = "length"
-	}
-	if len(simToolCalls) > 0 {
-		finishReason = "tool_calls"
-	}
-	doneChunk := map[string]any{
-		"id":      compID,
+	api.storeSessionMapping(sid, stream.convID)
+	stream.finish(fullText, simToolCalls, messages, tools, toolChoice, includeUsage)
+}
+
+// completionStream carries what one text_completion turn streams.
+type completionStream struct {
+	api     *APIServer
+	w       http.ResponseWriter
+	flusher http.Flusher
+	compID  string
+	model   string
+
+	fullText  strings.Builder
+	thinking  strings.Builder
+	truncated bool
+	convID    string
+}
+
+// textChunk builds one text_completion chunk object.
+func (s *completionStream) textChunk(text string, finishReason any) map[string]any {
+	return map[string]any{
+		"id":      s.compID,
 		"object":  "text_completion",
 		"created": time.Now().Unix(),
-		"model":   openaiModel,
+		"model":   s.model,
 		"choices": []map[string]any{
 			{
 				"index":         0,
-				"text":          "",
+				"text":          text,
 				"finish_reason": finishReason,
 				"logprobs":      nil,
 			},
 		},
 	}
+}
+
+// sendText writes one chunk without recording it, which is what a buffered
+// answer needs because it was accumulated as it arrived.
+func (s *completionStream) sendText(text string) {
+	jsonData, _ := json.Marshal(s.textChunk(text, nil))
+	_, _ = fmt.Fprintf(s.w, "data: %s\n\n", jsonData)
+	s.flusher.Flush()
+}
+
+// delta writes one streamed chunk and records the text it carried.
+func (s *completionStream) delta(text string) {
+	if text == "" {
+		return
+	}
+	s.fullText.WriteString(text)
+	s.sendText(text)
+}
+
+// fail reports a failed turn as an error object rather than as completion text,
+// for the same reason the chat stream carries one: text would be stored as the
+// answer.
+func (s *completionStream) fail(err error) {
+	status, code, message := streamErrorFields("completion", err)
+	errChunk := map[string]any{
+		"id":      s.compID,
+		"object":  "text_completion",
+		"created": time.Now().Unix(),
+		"model":   s.model,
+		"error": map[string]any{
+			"message": message,
+			"type":    openAIErrorType(status),
+			"code":    code,
+		},
+	}
+	jsonData, _ := json.Marshal(errChunk)
+	_, _ = fmt.Fprintf(s.w, "data: %s\n\n", jsonData)
+	_, _ = fmt.Fprintf(s.w, "data: [DONE]\n\n")
+	s.flusher.Flush()
+}
+
+// chunk reads one upstream chunk of a text_completion turn.
+func (s *completionStream) chunk(chunk client.StreamChunk, ch <-chan client.StreamChunk, maxTokens int, hasTools bool, stopWriter *stopSequenceWriter) streamLoopStep {
+	if chunk.Error != nil {
+		s.fail(chunk.Error)
+		return streamLoopFailed
+	}
+	if chunk.IsFinal {
+		s.convID = chunk.ConversationID
+		return streamLoopStop
+	}
+
+	chunk.Text = s.api.routeGeneratedImages(chunk.Text)
+
+	// Accumulate thinking text (not sent as content for text_completion)
+	if chunk.Thinking != "" {
+		s.thinking.WriteString(chunk.Thinking)
+		return streamLoopContinue
+	}
+
+	// Check max_tokens limit before sending more content
+	if maxTokens > 0 && countTokens(s.fullText.String()) >= maxTokens {
+		s.truncated = true
+		drainStream(ch)
+		return streamLoopStop
+	}
+
+	// If tool calling is not enabled, stream text directly. The writer decides
+	// what is safe to release, and it also feeds the accumulator, so the
+	// reported usage matches what the client received.
+	if !hasTools {
+		emit, _ := stopWriter.next(chunk.Text)
+		s.delta(emit)
+		return streamLoopContinue
+	}
+	s.fullText.WriteString(chunk.Text)
+	return streamLoopContinue
+}
+
+// finish writes the terminating chunk with the turn's finish reason and usage.
+func (s *completionStream) finish(fullText string, simToolCalls []toolcalling.ToolCall, messages []payload.Message, tools []toolcalling.ToolDef, toolChoice string, includeUsage bool) {
+	finishReason := "stop"
+	if s.truncated {
+		finishReason = "length"
+	}
+	if len(simToolCalls) > 0 {
+		finishReason = "tool_calls"
+	}
+	doneChunk := s.textChunk("", finishReason)
+
 	// This route reported no usage at all, unlike every other streaming
 	// endpoint, so the reasoning it accumulated reached no client.
 	if includeUsage {
 		promptTok := countPromptTokens(messages, tools, toolChoice)
 		completionTok := countTokens(fullText) + outputProtocolTokens
-		reasoningTok := countTokens(thinkingBuilder.String())
+		reasoningTok := countTokens(s.thinking.String())
 		doneChunk["usage"] = map[string]any{
 			"prompt_tokens":     promptTok,
 			"completion_tokens": completionTok,
@@ -3532,12 +3506,54 @@ func (api *APIServer) streamCompletions(ctx context.Context, w http.ResponseWrit
 			"usage_source":      usageSource(),
 		}
 	}
-	api.storeSessionMapping(sid, finalConvID)
 
 	jsonData, _ := json.Marshal(doneChunk)
-	_, _ = fmt.Fprintf(w, "data: %s\n\n", jsonData)
-	_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
-	flusher.Flush()
+	_, _ = fmt.Fprintf(s.w, "data: %s\n\n", jsonData)
+	_, _ = fmt.Fprintf(s.w, "data: [DONE]\n\n")
+	s.flusher.Flush()
+}
+
+// completionToolCalls parses the simulated tool calls out of a buffered
+// tool-enabled turn and emits whatever text is left as one chunk. A turn with
+// no tools streamed its text already and passes through untouched.
+func (api *APIServer) completionToolCalls(stream *completionStream, messages []payload.Message, cfg models.ModelConfig, tools []toolcalling.ToolDef, toolChoice string, stopSequences []string, hasTools bool) (string, []toolcalling.ToolCall) {
+	fullText := stream.fullText.String()
+	if !hasTools {
+		return fullText, nil
+	}
+
+	var simToolCalls []toolcalling.ToolCall
+	contracts := toolcalling.ContractsFor(tools).WithChoice(toolChoice)
+	sim := toolcalling.ParseSimulatedResponse(fullText, toolNamesFromDefs(tools), contracts)
+	sim = api.repairSimulatedToolCalls(toolLoopOpenAI, messages, cfg, tools, contracts, fullText, sim)
+	sim = dropSettledToolCalls(buildToolLedger(messages), toolChoice, sim)
+	switch {
+	case !sim.HasPayload:
+		fullText = toolcalling.WithholdTransportEnvelope(fullText)
+		if toolcalling.IsContentPolicyBlock(fullText) {
+			// The stream is already open, so the refusal cannot be turned into
+			// an HTTP error the way the non-streaming paths do.
+			logging.Warn("upstream content refusal on a streaming turn: M365 declined the request instead of answering")
+		}
+	case len(sim.ToolCalls) > 0:
+		simToolCalls = sim.ToolCalls
+		fullText = ""
+	default:
+		fullText = sim.Content
+	}
+
+	fullText = replaceUnverifiedCompletionClaim(fullText, hasTools, buildToolLedger(messages), len(simToolCalls))
+	// A tool-enabled turn is buffered whole and emitted here, so its stop
+	// sequence is applied now rather than through the writer.
+	if cut, matched := cutAtStopSequence(fullText, stopSequences); matched != "" {
+		fullText = cut
+	}
+
+	// If tool calling buffered text, send it now as a single chunk
+	if fullText != "" && len(simToolCalls) == 0 {
+		stream.sendText(fullText)
+	}
+	return fullText, simToolCalls
 }
 
 // nonStreamCompletions handles non-streaming text completion.
