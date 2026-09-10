@@ -278,47 +278,62 @@ func protected(path string) bool {
 	return false
 }
 
+// skipProtected tells a directory walk to leave a protected path alone: a
+// directory is not descended into and a file is not reported.
+func skipProtected(entry fs.DirEntry) error {
+	if entry.IsDir() {
+		return filepath.SkipDir
+	}
+	return nil
+}
+
+// listing accumulates the names one directory walk found.
+type listing struct {
+	manager   *Manager
+	root      string
+	recursive bool
+	names     []string
+}
+
+// visit is the walk callback that records one entry.
+func (l *listing) visit(current string, entry fs.DirEntry, walkErr error) error {
+	if walkErr != nil {
+		return walkErr
+	}
+	if current == l.root {
+		return nil
+	}
+	rel, relErr := filepath.Rel(l.manager.workspace, current)
+	if relErr != nil {
+		return relErr
+	}
+	if protected(rel) {
+		return skipProtected(entry)
+	}
+	if entry.Type()&os.ModeSymlink != 0 {
+		return nil
+	}
+	if !l.recursive && entry.IsDir() {
+		l.names = append(l.names, filepath.ToSlash(rel)+"/")
+		return filepath.SkipDir
+	}
+	if !entry.IsDir() {
+		l.names = append(l.names, filepath.ToSlash(rel))
+	}
+	return nil
+}
+
 func (m *Manager) listFiles(a map[string]any) (string, bool, error) {
 	path, err := m.resolve(optionalString(a, "path"), false)
 	if err != nil {
 		return "", false, err
 	}
-	recursive := booleanArg(a, "recursive")
-	var names []string
-	err = filepath.WalkDir(path, func(current string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if current == path {
-			return nil
-		}
-		rel, relErr := filepath.Rel(m.workspace, current)
-		if relErr != nil {
-			return relErr
-		}
-		if protected(rel) {
-			if entry.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if entry.Type()&os.ModeSymlink != 0 {
-			return nil
-		}
-		if !recursive && entry.IsDir() {
-			names = append(names, filepath.ToSlash(rel)+"/")
-			return filepath.SkipDir
-		}
-		if !entry.IsDir() {
-			names = append(names, filepath.ToSlash(rel))
-		}
-		return nil
-	})
-	if err != nil {
+	walk := &listing{manager: m, root: path, recursive: booleanArg(a, "recursive")}
+	if err := filepath.WalkDir(path, walk.visit); err != nil {
 		return "", false, err
 	}
-	sort.Strings(names)
-	return bound(strings.Join(names, "\n"), m.config.MaxOutput)
+	sort.Strings(walk.names)
+	return bound(strings.Join(walk.names, "\n"), m.config.MaxOutput)
 }
 
 func (m *Manager) readFile(a map[string]any) (string, bool, error) {
@@ -374,6 +389,43 @@ func (m *Manager) writeFile(a map[string]any) (string, error) {
 	return fmt.Sprintf("wrote %d bytes", len(content)), nil
 }
 
+// search accumulates the matching lines one directory walk found.
+type search struct {
+	manager *Manager
+	query   string
+	matches []string
+}
+
+// visit is the walk callback that searches one file.
+func (s *search) visit(path string, entry fs.DirEntry, walkErr error) error {
+	if walkErr != nil {
+		return walkErr
+	}
+	rel, _ := filepath.Rel(s.manager.workspace, path)
+	if protected(rel) {
+		return skipProtected(entry)
+	}
+	if entry.IsDir() || entry.Type()&os.ModeSymlink != 0 {
+		return nil
+	}
+	data, readErr := s.manager.readWalkedFile(path)
+	if readErr != nil || int64(len(data)) > s.manager.config.MaxReadBytes {
+		return nil
+	}
+	s.collectMatches(rel, data)
+	return nil
+}
+
+// collectMatches records every line of one file that contains the query, with
+// its line number.
+func (s *search) collectMatches(rel string, data []byte) {
+	for number, line := range strings.Split(string(data), "\n") {
+		if strings.Contains(line, s.query) {
+			s.matches = append(s.matches, fmt.Sprintf("%s:%d:%s", filepath.ToSlash(rel), number+1, line))
+		}
+	}
+}
+
 func (m *Manager) searchFiles(a map[string]any) (string, bool, error) {
 	query, err := stringArg(a, "query", true)
 	if err != nil {
@@ -383,36 +435,11 @@ func (m *Manager) searchFiles(a map[string]any) (string, bool, error) {
 	if err != nil {
 		return "", false, err
 	}
-	var matches []string
-	err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		rel, _ := filepath.Rel(m.workspace, path)
-		if protected(rel) {
-			if entry.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if entry.IsDir() || entry.Type()&os.ModeSymlink != 0 {
-			return nil
-		}
-		data, readErr := m.readWalkedFile(path)
-		if readErr != nil || int64(len(data)) > m.config.MaxReadBytes {
-			return nil
-		}
-		for number, line := range strings.Split(string(data), "\n") {
-			if strings.Contains(line, query) {
-				matches = append(matches, fmt.Sprintf("%s:%d:%s", filepath.ToSlash(rel), number+1, line))
-			}
-		}
-		return nil
-	})
-	if err != nil {
+	walk := &search{manager: m, query: query}
+	if err := filepath.WalkDir(root, walk.visit); err != nil {
 		return "", false, err
 	}
-	return bound(strings.Join(matches, "\n"), m.config.MaxOutput)
+	return bound(strings.Join(walk.matches, "\n"), m.config.MaxOutput)
 }
 
 // readWalkedFile reads a file a directory walk found.
