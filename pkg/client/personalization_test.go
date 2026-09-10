@@ -56,14 +56,30 @@ const flagsOff = `{"isMemoryEnabled":false,"isCustomInstructionEnabled":true,` +
 	`"isPersonalizationEnabledByTenant":true,"isInsightsFromConversationHistoryEnabled":false,` +
 	`"isM365GraphContentEnabled":false,"result":{"value":"Success"}}`
 
+// capturedRequest is what the test endpoint saw.
+type capturedRequest struct {
+	Method   string
+	Path     string
+	Anchor   string
+	Scenario string
+	Auth     string
+}
+
+// captureRequest records the parts of a request this test asserts on.
+func captureRequest(r *http.Request) capturedRequest {
+	return capturedRequest{
+		Method:   r.Method,
+		Path:     r.URL.RequestURI(),
+		Anchor:   r.Header.Get("X-AnchorMailbox"),
+		Scenario: r.Header.Get("X-Scenario"),
+		Auth:     r.Header.Get("Authorization"),
+	}
+}
+
 func TestGetPersonalizationFlagsReadsEveryFlag(t *testing.T) {
-	var gotMethod, gotAnchor, gotScenario, gotAuth, gotPath string
+	var got capturedRequest
 	withEndpoint(t, func(w http.ResponseWriter, r *http.Request) {
-		gotMethod = r.Method
-		gotPath = r.URL.RequestURI()
-		gotAnchor = r.Header.Get("X-AnchorMailbox")
-		gotScenario = r.Header.Get("X-Scenario")
-		gotAuth = r.Header.Get("Authorization")
+		got = captureRequest(r)
 		_, _ = io.WriteString(w, flagsOn)
 	})
 
@@ -72,24 +88,36 @@ func TestGetPersonalizationFlagsReadsEveryFlag(t *testing.T) {
 		t.Fatalf("GetPersonalizationFlags: %v", err)
 	}
 
-	if gotMethod != http.MethodGet {
-		t.Errorf("method = %q", gotMethod)
+	assertPersonalizationRouting(t, got)
+	assertFlagsOn(t, flags)
+}
+
+// assertPersonalizationRouting pins the request half of the read.
+func assertPersonalizationRouting(t *testing.T, got capturedRequest) {
+	t.Helper()
+	if got.Method != http.MethodGet {
+		t.Errorf("method = %q", got.Method)
 	}
 	// The variants query gates the endpoint's own feature, so it has to travel.
-	if !strings.Contains(gotPath, "variants=feature.EnablePersonalization") {
-		t.Errorf("path = %q, missing the variants query", gotPath)
+	if !strings.Contains(got.Path, "variants=feature.EnablePersonalization") {
+		t.Errorf("path = %q, missing the variants query", got.Path)
 	}
 	// Without the routing headers the request reaches the wrong mailbox.
-	if gotAnchor != "Oid:oid-1@tid-2" {
-		t.Errorf("X-AnchorMailbox = %q", gotAnchor)
+	if got.Anchor != "Oid:oid-1@tid-2" {
+		t.Errorf("X-AnchorMailbox = %q", got.Anchor)
 	}
-	if gotScenario != "OfficeWebIncludedCopilot" {
-		t.Errorf("X-Scenario = %q", gotScenario)
+	if got.Scenario != "OfficeWebIncludedCopilot" {
+		t.Errorf("X-Scenario = %q", got.Scenario)
 	}
-	if !strings.HasPrefix(gotAuth, "Bearer ") {
-		t.Errorf("Authorization = %q", gotAuth)
+	if !strings.HasPrefix(got.Auth, "Bearer ") {
+		t.Errorf("Authorization = %q", got.Auth)
 	}
+}
 
+// assertFlagsOn pins every flag the flagsOn body declares, so a field dropped
+// from the struct fails here instead of quietly reading false.
+func assertFlagsOn(t *testing.T, flags *PersonalizationFlags) {
+	t.Helper()
 	if !flags.MemoryEnabled || !flags.InsightsFromHistoryEnabled || !flags.CustomInstructionEnabled {
 		t.Errorf("flags = %+v, want the enabled ones true", flags)
 	}

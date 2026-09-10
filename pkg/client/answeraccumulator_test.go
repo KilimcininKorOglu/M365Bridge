@@ -84,6 +84,20 @@ func TestEmitGeneratedImageAnnouncesAPictureBeforeItArrives(t *testing.T) {
 			t.Fatal("the announcement stopped the stream")
 		}
 	}
+	assertOnlyNotice(t, &acc, chunks)
+
+	// The address arrives and goes out as the image itself.
+	const url = "https://designerapp.officeapps.live.com/i.png?fileToken=x"
+	if !acc.emitGeneratedImage(imageProgressMessage(t, url), seen, emit) {
+		t.Fatal("the image stopped the stream")
+	}
+	assertImageFollowedNotice(t, &acc, chunks, url)
+}
+
+// assertOnlyNotice pins that the repeated announcement produced one notice and
+// no answer content.
+func assertOnlyNotice(t *testing.T, acc *answerAccumulator, chunks []StreamChunk) {
+	t.Helper()
 	if len(chunks) != 1 {
 		t.Fatalf("emitted %d chunks, want one notice", len(chunks))
 	}
@@ -96,12 +110,12 @@ func TestEmitGeneratedImageAnnouncesAPictureBeforeItArrives(t *testing.T) {
 	if acc.emittedBytes() != 0 {
 		t.Fatalf("emittedBytes = %d, want 0; a notice is not content", acc.emittedBytes())
 	}
+}
 
-	// The address arrives and goes out as the image itself.
-	const url = "https://designerapp.officeapps.live.com/i.png?fileToken=x"
-	if !acc.emitGeneratedImage(imageProgressMessage(t, url), seen, emit) {
-		t.Fatal("the image stopped the stream")
-	}
+// assertImageFollowedNotice pins that the address went out as the image and
+// stayed out of the answer baseline.
+func assertImageFollowedNotice(t *testing.T, acc *answerAccumulator, chunks []StreamChunk, url string) {
+	t.Helper()
 	if len(chunks) != 2 || !strings.Contains(chunks[1].Text, url) {
 		t.Fatalf("chunks = %+v, want the image after the notice", chunks)
 	}
