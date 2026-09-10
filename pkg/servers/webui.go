@@ -118,21 +118,32 @@ func cacheControlFor(requestPath string) string {
 	return "no-cache"
 }
 
+// servesWebUI reports whether this request belongs to the interface.
+//
+// "/" is the mux fallback pattern, so an unmatched API path arrives at the
+// interface handler too. It has to stay a 404 rather than be answered with
+// HTML no API client can parse.
+func (api *APIServer) servesWebUI(r *http.Request) bool {
+	if !api.config.EnableWebUI {
+		return false
+	}
+	for _, namespace := range apiNamespaces {
+		if strings.HasPrefix(r.URL.Path, namespace) || r.URL.Path == strings.TrimSuffix(namespace, "/") {
+			return false
+		}
+	}
+	return true
+}
+
 // handleWebUI serves the browser interface.
 //
 // The document is served without an API key, because the screen that asks for
 // the key cannot itself require one. Every data call the interface makes stays
 // behind withAuth.
 func (api *APIServer) handleWebUI(w http.ResponseWriter, r *http.Request) {
-	if !api.config.EnableWebUI {
+	if !api.servesWebUI(r) {
 		api.sendError(w, http.StatusNotFound, "Not found")
 		return
-	}
-	for _, namespace := range apiNamespaces {
-		if strings.HasPrefix(r.URL.Path, namespace) || r.URL.Path == strings.TrimSuffix(namespace, "/") {
-			api.sendError(w, http.StatusNotFound, "Not found")
-			return
-		}
 	}
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		api.sendError(w, http.StatusMethodNotAllowed, "Method not allowed")

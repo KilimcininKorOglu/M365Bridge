@@ -109,36 +109,45 @@ func classifyUpstreamError(err error) (int, string) {
 
 	// Checked before the status lookup below: a failed turn reached the backend
 	// and carries no HTTP status, so it would otherwise fall through to the
-	// generic internal error and read as a bug on this side. A turn that ended
-	// with neither an answer nor a verdict gets the same treatment, because the
-	// client can act on it the same way.
-	if _, ok := client.TurnFailure(err); ok {
-		return http.StatusBadGateway, upstreamTurnFailedCode
-	}
-	if errors.Is(err, client.ErrEmptyTurn) {
+	// generic internal error and read as a bug on this side.
+	if turnFailed(err) {
 		return http.StatusBadGateway, upstreamTurnFailedCode
 	}
 
 	if status, ok := client.UpstreamStatus(err); ok {
-		switch status {
-		case http.StatusUnauthorized:
-			return http.StatusUnauthorized, upstreamAuthFailedCode
-		case http.StatusForbidden:
-			return http.StatusForbidden, upstreamForbiddenCode
-		case http.StatusPaymentRequired, http.StatusTooManyRequests:
-			return http.StatusTooManyRequests, upstreamRateLimitCode
-		case http.StatusServiceUnavailable:
-			return http.StatusServiceUnavailable, upstreamUnavailableCode
-		case http.StatusGatewayTimeout, http.StatusRequestTimeout:
-			return http.StatusGatewayTimeout, upstreamTimeoutCode
-		default:
-			// A dial that never reached a response reports status zero. The
-			// backend was still unreachable, which is a gateway failure.
-			return http.StatusBadGateway, upstreamRejectedCode
-		}
+		return classifyUpstreamStatus(status)
 	}
 
 	return http.StatusInternalServerError, internalProcessingCode
+}
+
+// turnFailed reports a turn that reached the backend and produced no answer. A
+// turn that ended with neither an answer nor a verdict counts too, because the
+// client can act on both the same way.
+func turnFailed(err error) bool {
+	if _, ok := client.TurnFailure(err); ok {
+		return true
+	}
+	return errors.Is(err, client.ErrEmptyTurn)
+}
+
+// classifyUpstreamStatus maps the backend's own HTTP status onto ours.
+func classifyUpstreamStatus(status int) (int, string) {
+	switch status {
+	case http.StatusUnauthorized:
+		return http.StatusUnauthorized, upstreamAuthFailedCode
+	case http.StatusForbidden:
+		return http.StatusForbidden, upstreamForbiddenCode
+	case http.StatusPaymentRequired, http.StatusTooManyRequests:
+		return http.StatusTooManyRequests, upstreamRateLimitCode
+	case http.StatusServiceUnavailable:
+		return http.StatusServiceUnavailable, upstreamUnavailableCode
+	case http.StatusGatewayTimeout, http.StatusRequestTimeout:
+		return http.StatusGatewayTimeout, upstreamTimeoutCode
+	}
+	// A dial that never reached a response reports status zero. The backend was
+	// still unreachable, which is a gateway failure.
+	return http.StatusBadGateway, upstreamRejectedCode
 }
 
 // upstreamErrorMessage states what failed without quoting the transport error.
