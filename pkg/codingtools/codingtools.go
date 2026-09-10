@@ -96,66 +96,100 @@ func (m *Manager) Tools() []Tool {
 
 // Execute invokes one named tool with JSON-compatible arguments.
 func (m *Manager) Execute(ctx context.Context, name string, arguments map[string]any) Result {
-	result := Result{Tool: name}
 	if !m.config.Enabled {
-		result.Error = "coding tools are disabled"
+		return Result{Tool: name, Error: "coding tools are disabled"}
+	}
+	if result, handled := m.executeCommandTool(ctx, name, arguments); handled {
 		return result
 	}
-	var output string
-	var truncated bool
-	var err error
+	output, truncated, err := m.executeTextTool(ctx, name, arguments)
+	return textResult(name, output, truncated, err)
+}
+
+// executeCommandTool runs the tools that shell out. handled is false when the
+// name belongs to a tool that produces text instead.
+func (m *Manager) executeCommandTool(ctx context.Context, name string, arguments map[string]any) (Result, bool) {
+	switch name {
+	case "shell_command":
+		return m.shellCommandTool(ctx, name, arguments), true
+	case "git_status":
+		return m.command(ctx, name, []string{"git", "status", "--short"}, nil), true
+	case "git_diff":
+		return m.gitDiffTool(ctx, name, arguments), true
+	case "git_log":
+		return m.gitLogTool(ctx, name, arguments), true
+	case "run_tests":
+		return m.runTestsTool(ctx, name, arguments), true
+	}
+	return Result{}, false
+}
+
+// executeTextTool runs the tools that produce text. An unknown name lands here,
+// because every command tool was already matched by executeCommandTool.
+func (m *Manager) executeTextTool(ctx context.Context, name string, arguments map[string]any) (string, bool, error) {
 	switch name {
 	case "list_files":
-		output, truncated, err = m.listFiles(arguments)
+		return m.listFiles(arguments)
 	case "read_file":
-		output, truncated, err = m.readFile(arguments)
+		return m.readFile(arguments)
 	case "write_file":
-		output, err = m.writeFile(arguments)
+		output, err := m.writeFile(arguments)
+		return output, false, err
 	case "search_files":
-		output, truncated, err = m.searchFiles(arguments)
-	case "shell_command":
-		command, argErr := stringArg(arguments, "command", true)
-		if argErr != nil {
-			err = argErr
-		} else {
-			return m.command(ctx, name, command, nil)
-		}
-	case "git_status":
-		return m.command(ctx, name, []string{"git", "status", "--short"}, nil)
-	case "git_diff":
-		args := []string{"git", "diff"}
-		if booleanArg(arguments, "staged") {
-			args = append(args, "--staged")
-		}
-		return m.command(ctx, name, args, nil)
-	case "git_log":
-		limit, argErr := intArg(arguments, "limit", 10, 1, 100)
-		if argErr != nil {
-			err = argErr
-		} else {
-			return m.command(ctx, name, []string{"git", "log", "--oneline", fmt.Sprintf("-%d", limit)}, nil)
-		}
-	case "run_tests":
-		command, argErr := stringArg(arguments, "command", false)
-		if argErr != nil {
-			err = argErr
-		} else {
-			if command == "" {
-				command = "go test ./..."
-			}
-			return m.command(ctx, name, command, nil)
-		}
+		return m.searchFiles(arguments)
 	case "apply_patch":
-		output, truncated, err = m.applyPatch(ctx, arguments)
-	default:
-		err = fmt.Errorf("unknown tool %q", name)
+		return m.applyPatch(ctx, arguments)
 	}
-	result.Output, result.Truncated = output, truncated
-	result.Success = err == nil
+	return "", false, fmt.Errorf("unknown tool %q", name)
+}
+
+// textResult shapes the answer of a tool that produced text rather than running
+// a process, and of a command tool that never got as far as running one.
+func textResult(name, output string, truncated bool, err error) Result {
+	result := Result{Tool: name, Output: output, Truncated: truncated, Success: err == nil}
 	if err != nil {
 		result.Error = err.Error()
 	}
 	return result
+}
+
+// shellCommandTool runs the command line the caller supplied.
+func (m *Manager) shellCommandTool(ctx context.Context, name string, arguments map[string]any) Result {
+	command, err := stringArg(arguments, "command", true)
+	if err != nil {
+		return textResult(name, "", false, err)
+	}
+	return m.command(ctx, name, command, nil)
+}
+
+// gitDiffTool shows the workspace diff, staged when the caller asked for it.
+func (m *Manager) gitDiffTool(ctx context.Context, name string, arguments map[string]any) Result {
+	args := []string{"git", "diff"}
+	if booleanArg(arguments, "staged") {
+		args = append(args, "--staged")
+	}
+	return m.command(ctx, name, args, nil)
+}
+
+// gitLogTool shows the most recent workspace commits.
+func (m *Manager) gitLogTool(ctx context.Context, name string, arguments map[string]any) Result {
+	limit, err := intArg(arguments, "limit", 10, 1, 100)
+	if err != nil {
+		return textResult(name, "", false, err)
+	}
+	return m.command(ctx, name, []string{"git", "log", "--oneline", fmt.Sprintf("-%d", limit)}, nil)
+}
+
+// runTestsTool runs the caller's test command, defaulting to the Go one.
+func (m *Manager) runTestsTool(ctx context.Context, name string, arguments map[string]any) Result {
+	command, err := stringArg(arguments, "command", false)
+	if err != nil {
+		return textResult(name, "", false, err)
+	}
+	if command == "" {
+		command = "go test ./..."
+	}
+	return m.command(ctx, name, command, nil)
 }
 
 func (m *Manager) resolve(path string, create bool) (string, error) {
