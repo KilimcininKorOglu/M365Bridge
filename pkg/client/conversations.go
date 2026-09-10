@@ -104,24 +104,10 @@ func (c *ConversationClient) loadConversationState(ctx context.Context) (convers
 }
 
 func (c *ConversationClient) request(ctx context.Context, payload any, destination any) error {
-	cookieHeader, err := c.tokenManager.M365CookieHeader()
+	req, err := c.buildRequest(ctx, payload)
 	if err != nil {
 		return err
 	}
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("marshal conversation request: %w", err)
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("create conversation request: %w", err)
-	}
-	req.Header.Set("Cookie", cookieHeader)
-	req.Header.Set("Content-Type", "application/json;charset=utf-8")
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Origin", "https://m365.cloud.microsoft")
-	req.Header.Set("Referer", "https://m365.cloud.microsoft/chat")
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 
 	response, err := c.httpClient.Do(req)
 	if err != nil {
@@ -129,34 +115,76 @@ func (c *ConversationClient) request(ctx context.Context, payload any, destinati
 	}
 	defer func() { _ = response.Body.Close() }()
 
-	responseBody, err := io.ReadAll(io.LimitReader(response.Body, conversationResponseMax+1))
+	responseBody, err := readConversationBody(response)
 	if err != nil {
-		return fmt.Errorf("read M365 conversation response: %w", err)
-	}
-	if len(responseBody) > conversationResponseMax {
-		return fmt.Errorf("M365 conversation response exceeds %d bytes", conversationResponseMax)
-	}
-	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
-		return fmt.Errorf("%w: status %d", ErrConversationAuthentication, response.StatusCode)
-	}
-	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return fmt.Errorf("M365 conversation request returned status %d", response.StatusCode)
-	}
-	if !strings.Contains(strings.ToLower(response.Header.Get("Content-Type")), "json") {
-		return fmt.Errorf("M365 conversation response is not JSON")
+		return err
 	}
 	if destination == nil {
-		var result map[string]any
-		if err := json.Unmarshal(responseBody, &result); err != nil {
-			return fmt.Errorf("parse M365 conversation response: %w", err)
-		}
-		if message, ok := result["error"].(string); ok && message != "" {
-			return fmt.Errorf("M365 conversation request failed: %s", message)
-		}
-		return nil
+		return conversationErrorField(responseBody)
 	}
 	if err := json.Unmarshal(responseBody, destination); err != nil {
 		return fmt.Errorf("parse M365 conversation response: %w", err)
+	}
+	return nil
+}
+
+// buildRequest stamps the browser headers the M365 chat dispatcher expects,
+// including the web app cookies this endpoint authenticates with rather than a
+// bearer token.
+func (c *ConversationClient) buildRequest(ctx context.Context, payload any) (*http.Request, error) {
+	cookieHeader, err := c.tokenManager.M365CookieHeader()
+	if err != nil {
+		return nil, err
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal conversation request: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("create conversation request: %w", err)
+	}
+	req.Header.Set("Cookie", cookieHeader)
+	req.Header.Set("Content-Type", "application/json;charset=utf-8")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Origin", "https://m365.cloud.microsoft")
+	req.Header.Set("Referer", "https://m365.cloud.microsoft/chat")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+	return req, nil
+}
+
+// readConversationBody reads the response under a byte cap and refuses a status
+// or content type that cannot carry a conversation answer.
+func readConversationBody(response *http.Response) ([]byte, error) {
+	responseBody, err := io.ReadAll(io.LimitReader(response.Body, conversationResponseMax+1))
+	if err != nil {
+		return nil, fmt.Errorf("read M365 conversation response: %w", err)
+	}
+	if len(responseBody) > conversationResponseMax {
+		return nil, fmt.Errorf("M365 conversation response exceeds %d bytes", conversationResponseMax)
+	}
+	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
+		return nil, fmt.Errorf("%w: status %d", ErrConversationAuthentication, response.StatusCode)
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("M365 conversation request returned status %d", response.StatusCode)
+	}
+	if !strings.Contains(strings.ToLower(response.Header.Get("Content-Type")), "json") {
+		return nil, fmt.Errorf("M365 conversation response is not JSON")
+	}
+	return responseBody, nil
+}
+
+// conversationErrorField reports the error the dispatcher answered with. It
+// answers 200 for an action it does not know, so the body is the only place a
+// failure appears when the caller wanted no result of its own.
+func conversationErrorField(responseBody []byte) error {
+	var result map[string]any
+	if err := json.Unmarshal(responseBody, &result); err != nil {
+		return fmt.Errorf("parse M365 conversation response: %w", err)
+	}
+	if message, ok := result["error"].(string); ok && message != "" {
+		return fmt.Errorf("M365 conversation request failed: %s", message)
 	}
 	return nil
 }

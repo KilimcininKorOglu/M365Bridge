@@ -91,21 +91,31 @@ func (c *ConversationClient) FetchHistory(ctx context.Context, conversationID st
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	page, err := readConversationPage(resp)
+	if err != nil {
+		return nil, err
+	}
+	return parseConversationPage(page)
+}
+
+// readConversationPage reads the rendered page under a byte cap, and refuses a
+// status that carries no conversation.
+func readConversationPage(resp *http.Response) (string, error) {
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return nil, fmt.Errorf("%w: status %d", ErrConversationAuthentication, resp.StatusCode)
+		return "", fmt.Errorf("%w: status %d", ErrConversationAuthentication, resp.StatusCode)
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return nil, fmt.Errorf("M365 conversation page returned status %d", resp.StatusCode)
+		return "", fmt.Errorf("M365 conversation page returned status %d", resp.StatusCode)
 	}
 
 	page, err := io.ReadAll(io.LimitReader(resp.Body, conversationPageMax+1))
 	if err != nil {
-		return nil, fmt.Errorf("read M365 conversation page: %w", err)
+		return "", fmt.Errorf("read M365 conversation page: %w", err)
 	}
 	if len(page) > conversationPageMax {
-		return nil, fmt.Errorf("M365 conversation page exceeds %d bytes", conversationPageMax)
+		return "", fmt.Errorf("M365 conversation page exceeds %d bytes", conversationPageMax)
 	}
-	return parseConversationPage(string(page))
+	return string(page), nil
 }
 
 // validateConversationID rejects anything that could leave the intended path.
