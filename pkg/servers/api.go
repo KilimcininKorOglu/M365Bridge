@@ -7738,17 +7738,20 @@ func hostAllowed(host string, allowlist []string) bool {
 // sit inside the deployment's own network, and 169.254.169.254 is the cloud
 // metadata endpoint.
 func ipDisallowed(ip net.IP) bool {
-	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
-		ip.IsInterfaceLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
-		return true
-	}
-	if ip4 := ip.To4(); ip4 != nil {
-		// 100.64.0.0/10 is carrier-grade NAT, which net.IP.IsPrivate misses.
-		if ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127 {
-			return true
-		}
-	}
-	return false
+	return ipInternal(ip) || ipCarrierGradeNAT(ip)
+}
+
+// ipInternal reports the ranges net.IP names itself.
+func ipInternal(ip net.IP) bool {
+	return ip.IsLoopback() || ip.IsPrivate() ||
+		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+		ip.IsInterfaceLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified()
+}
+
+// ipCarrierGradeNAT reports 100.64.0.0/10, which net.IP.IsPrivate misses.
+func ipCarrierGradeNAT(ip net.IP) bool {
+	ip4 := ip.To4()
+	return ip4 != nil && ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127
 }
 
 // validateImageDownloadURL decides whether a generated-image URL may be
@@ -7799,15 +7802,37 @@ func (api *APIServer) downloadAndBase64(imageURL string) (string, error) {
 // access token (acquired via SSO cookies with the M365 web app client_id) and
 // the fileToken query parameter sent as a header.
 func (api *APIServer) downloadImage(imageURL string) ([]byte, string, error) {
+	req, err := api.designerImageRequest(imageURL)
+	if err != nil {
+		return nil, "", err
+	}
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	// validateImageDownloadURL ran inside designerImageRequest: it requires
+	// https, an allowlisted host, a name that resolves, and no resolved address
+	// outside public space. The taint analysis cannot follow that validator.
+	// #nosec G704
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("download failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	return readDownloadedImage(resp)
+}
+
+// designerImageRequest builds the download, moving the fileToken query
+// parameter into the header the backend expects it in.
+func (api *APIServer) designerImageRequest(imageURL string) (*http.Request, error) {
 	if err := api.validateImageDownloadURL(imageURL); err != nil {
 		logging.Errorf("downloadImage: refusing download: %v", err)
-		return nil, "", err
+		return nil, err
 	}
 	logging.Infof("downloadImage: downloading image from %s", imageURL[:min(100, len(imageURL))])
 	parsedURL, err := neturl.Parse(imageURL)
 	if err != nil {
 		logging.Errorf("downloadImage: invalid URL: %v", err)
-		return nil, "", fmt.Errorf("invalid image URL: %w", err)
+		return nil, fmt.Errorf("invalid image URL: %w", err)
 	}
 
 	// Extract fileToken from query params and remove it from the URL
@@ -7815,24 +7840,23 @@ func (api *APIServer) downloadImage(imageURL string) ([]byte, string, error) {
 	fileToken := query.Get("fileToken")
 	if fileToken == "" {
 		logging.Errorf("downloadImage: no fileToken in URL")
-		return nil, "", fmt.Errorf("no fileToken in image URL")
+		return nil, fmt.Errorf("no fileToken in image URL")
 	}
 	query.Del("fileToken")
 	parsedURL.RawQuery = query.Encode()
-	cleanURL := parsedURL.String()
 
 	// Acquire designerapp access token via SSO cookies
 	token, err := api.tokenManager.GetDesignerToken()
 	if err != nil {
-		return nil, "", fmt.Errorf("failed to acquire designer token: %w", err)
+		return nil, fmt.Errorf("failed to acquire designer token: %w", err)
 	}
 
-	// cleanURL comes from the URL validateImageDownloadURL already cleared at
-	// the top of this function, minus its fileToken parameter.
+	// The address is the one validateImageDownloadURL already cleared above,
+	// minus its fileToken parameter.
 	// #nosec G704
-	req, err := http.NewRequest("GET", cleanURL, nil)
+	req, err := http.NewRequest("GET", parsedURL.String(), nil)
 	if err != nil {
-		return nil, "", fmt.Errorf("failed to create image request: %w", err)
+		return nil, fmt.Errorf("failed to create image request: %w", err)
 	}
 	req.Header.Set("Authorization", token)
 	req.Header.Set("filetoken", fileToken)
@@ -7844,27 +7868,14 @@ func (api *APIServer) downloadImage(imageURL string) ([]byte, string, error) {
 	req.Header.Set("Sec-Fetch-Mode", "cors")
 	req.Header.Set("Sec-Fetch-Site", "cross-site")
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36")
+	return req, nil
+}
 
-	client := &http.Client{Timeout: 30 * time.Second}
-	// validateImageDownloadURL ran at the top of this function: it requires
-	// https, an allowlisted host, a name that resolves, and no resolved address
-	// outside public space. The taint analysis cannot follow that validator.
-	// #nosec G704
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, "", fmt.Errorf("download failed: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
+// readDownloadedImage reads the image under a byte cap and reports the type the
+// server declared.
+func readDownloadedImage(resp *http.Response) ([]byte, string, error) {
 	if resp.StatusCode != http.StatusOK {
-		// Only an excerpt of this body is logged, so a truncated read is
-		// enough and the whole error page never has to be held in memory.
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, errorBodyExcerptMax))
-		errCode := resp.Header.Get("X-Errorcode")
-		failReason := resp.Header.Get("X-Failurereason")
-		logging.Errorf("Image download failed: status=%d, x-errorcode=%s, x-failurereason=%s, body=%s",
-			resp.StatusCode, errCode, failReason, string(body)[:min(200, len(body))])
-		return nil, "", fmt.Errorf("download returned status %d: x-errorcode=%s, x-failurereason=%s", resp.StatusCode, errCode, failReason)
+		return nil, "", downloadImageFailure(resp)
 	}
 
 	// One extra byte distinguishes "exactly at the limit" from "truncated".
@@ -7886,6 +7897,20 @@ func (api *APIServer) downloadImage(imageURL string) ([]byte, string, error) {
 
 	logging.Infof("downloadImage: success, size=%d bytes type=%s", len(body), contentType)
 	return body, contentType, nil
+}
+
+// downloadImageFailure reports why the backend refused, from the headers it
+// answers with.
+//
+// Only an excerpt of the body is logged, so a truncated read is enough and the
+// whole error page never has to be held in memory.
+func downloadImageFailure(resp *http.Response) error {
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, errorBodyExcerptMax))
+	errCode := resp.Header.Get("X-Errorcode")
+	failReason := resp.Header.Get("X-Failurereason")
+	logging.Errorf("Image download failed: status=%d, x-errorcode=%s, x-failurereason=%s, body=%s",
+		resp.StatusCode, errCode, failReason, string(body)[:min(200, len(body))])
+	return fmt.Errorf("download returned status %d: x-errorcode=%s, x-failurereason=%s", resp.StatusCode, errCode, failReason)
 }
 
 // fmtAtoi parses an int from a string without importing strconv.
