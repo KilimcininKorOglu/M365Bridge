@@ -1591,45 +1591,88 @@ func repairNote(sim toolcalling.SimulatedResult, tools []toolcalling.ToolDef, co
 }
 
 // handleChatCompletions handles OpenAI chat completion requests.
-func (api *APIServer) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
+// chatCompletionsRequest is the wire shape of a /v1/chat/completions request.
+type chatCompletionsRequest struct {
+	Model          string                `json:"model"`
+	Messages       []payload.Message     `json:"messages"`
+	Stream         bool                  `json:"stream"`
+	MaxTokens      int                   `json:"max_tokens"`
+	ResponseFormat map[string]any        `json:"response_format"`
+	SessionID      string                `json:"session_id"`
+	User           string                `json:"user"`
+	Tools          []toolcalling.ToolDef `json:"tools"`
+	ToolChoice     any                   `json:"tool_choice"`
+	// A pointer, because an absent parallel_tool_calls means the OpenAI
+	// default of true rather than false.
+	ParallelToolCalls *bool          `json:"parallel_tool_calls"`
+	StreamOptions     *streamOptions `json:"stream_options"`
+	// Either a single string or an array of them, so it arrives untyped.
+	Stop any `json:"stop"`
+}
+
+// readJSONRequest answers the method gate and decodes the body into dst. It
+// returns the raw bytes, because a tool-enabled request re-serializes them into
+// the simulation prompt. ok is false when the request has already been answered.
+func (api *APIServer) readJSONRequest(w http.ResponseWriter, r *http.Request, dst any, op string) (bodyBytes []byte, ok bool) {
 	if r.Method == http.MethodOptions {
 		api.handleCORS(w, r)
-		return
+		return nil, false
 	}
 	if r.Method != http.MethodPost {
 		api.sendError(w, http.StatusMethodNotAllowed, "Method not allowed")
-		return
+		return nil, false
 	}
 
 	limitRequestBody(w, r, requestBodyMax)
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
 		api.sendRequestBodyError(w, err)
-		return
+		return nil, false
 	}
 	_ = r.Body.Close()
 
-	var req struct {
-		Model          string                `json:"model"`
-		Messages       []payload.Message     `json:"messages"`
-		Stream         bool                  `json:"stream"`
-		MaxTokens      int                   `json:"max_tokens"`
-		ResponseFormat map[string]any        `json:"response_format"`
-		SessionID      string                `json:"session_id"`
-		User           string                `json:"user"`
-		Tools          []toolcalling.ToolDef `json:"tools"`
-		ToolChoice     any                   `json:"tool_choice"`
-		// A pointer, because an absent parallel_tool_calls means the OpenAI
-		// default of true rather than false.
-		ParallelToolCalls *bool          `json:"parallel_tool_calls"`
-		StreamOptions     *streamOptions `json:"stream_options"`
-		// Either a single string or an array of them, so it arrives untyped.
-		Stop any `json:"stop"`
-	}
-
-	if err := json.Unmarshal(bodyBytes, &req); err != nil {
-		logging.Errorf("handleChatCompletions: invalid JSON: %v", err)
+	if err := json.Unmarshal(bodyBytes, dst); err != nil {
+		logging.Errorf("%s: invalid JSON: %v", op, err)
 		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Invalid JSON: %v", err))
+		return nil, false
+	}
+	return bodyBytes, true
+}
+
+// prepareToolLedger rebuilds the evidence of a client-driven tool loop and
+// refuses a request whose tool results do not line up with its calls. ok is
+// false when the request has already been answered.
+func (api *APIServer) prepareToolLedger(w http.ResponseWriter, messages []payload.Message, op string) (toolcalling.Ledger, bool) {
+	if err := validateToolResultMessages(messages); err != nil {
+		logging.Errorf("%s: %v", op, err)
+		api.sendError(w, http.StatusBadRequest, err.Error())
+		return toolcalling.Ledger{}, false
+	}
+	ledger := buildToolLedger(messages)
+	if api.exceededToolRoundLimit(ledger) {
+		api.sendToolRoundLimitError(w, ledger)
+		return toolcalling.Ledger{}, false
+	}
+	return ledger, true
+}
+
+// sessionAndConversation resolves the session this request belongs to and the
+// conversation that session is bound to.
+func (api *APIServer) sessionAndConversation(r *http.Request, sources sessionSources, messages []payload.Message) (sid, convID string) {
+	sid = resolveSessionID(r, sources)
+	if sid == "" {
+		sid = api.hashSessionIDFromMessages(r, messages)
+	}
+	if sid == "" {
+		return "", ""
+	}
+	return sid, api.ctxCache.Get(sessionKeyPrefix + sid)
+}
+
+func (api *APIServer) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
+	var req chatCompletionsRequest
+	bodyBytes, ok := api.readJSONRequest(w, r, &req, "handleChatCompletions")
+	if !ok {
 		return
 	}
 
@@ -1641,14 +1684,8 @@ func (api *APIServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 	}
 	logging.Infof("handleChatCompletions: model=%s stream=%v tools=%d sid=%s", modelKey, req.Stream, len(req.Tools), modelSessionID)
 
-	if err := validateToolResultMessages(req.Messages); err != nil {
-		logging.Errorf("handleChatCompletions: %v", err)
-		api.sendError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	ledger := buildToolLedger(req.Messages)
-	if api.exceededToolRoundLimit(ledger) {
-		api.sendToolRoundLimitError(w, ledger)
+	ledger, ok := api.prepareToolLedger(w, req.Messages, "handleChatCompletions")
+	if !ok {
 		return
 	}
 
@@ -1663,30 +1700,19 @@ func (api *APIServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 	// The declaration list stays whole in requestJSON so the model sees every
 	// capability, but simulation only runs when something is left for the
 	// client to execute.
-	if len(toolcalling.RouteableTools(req.Tools)) > 0 {
+	hasTools := len(toolcalling.RouteableTools(req.Tools)) > 0
+	if hasTools {
 		injectSimulatedPrompt(&req.Messages, requestJSON, toolChoiceString(req.ToolChoice), ledger.EvidenceNote())
 	}
 
-	// Resolve session ID and conversation ID
-	sid := resolveSessionID(r, sessionSources{
+	sid, convID := api.sessionAndConversation(r, sessionSources{
 		ModelSuffix:   modelSessionID,
 		BodySessionID: req.SessionID,
 		BodyUser:      req.User,
-	})
-	if sid == "" {
-		sid = api.hashSessionIDFromMessages(r, req.Messages)
-	}
-
-	var convID string
-	if sid != "" {
-		convID = api.ctxCache.Get(sessionKeyPrefix + sid)
-	}
+	}, req.Messages)
 
 	// Upload any images found in multimodal content and attach annotations
 	api.uploadImagesAndAnnotate(&req.Messages, convID)
-
-	// Determine if client-defined tools are present (for optionsSets stripping)
-	hasTools := len(toolcalling.RouteableTools(req.Tools)) > 0
 
 	// Recorded before the turn runs, so a turn that fails still shows the
 	// message the caller sent rather than losing it.
@@ -1696,19 +1722,25 @@ func (api *APIServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 	stopSequences := openAIStopSequences(req.Stop)
 
 	if len(localTools) > 0 {
-		result, err := api.runToolLoop(r, toolLoopOpenAI, req.Messages, cfg, sid, convID, req.Tools, noParallel, localTools)
-		if err != nil {
-			api.sendUpstreamError(w, "chat", err)
-			return
-		}
-		api.respondBufferedChat(w, result, req.Messages, cfg, sid, req.MaxTokens, req.Stream, req.Tools, toolChoiceString(req.ToolChoice), stopSequences)
+		api.runChatToolLoop(w, r, req, cfg, sid, convID, localTools, noParallel, stopSequences)
 		return
 	}
 	if req.Stream {
 		api.streamChatCompletions(r.Context(), w, req.Messages, cfg, sid, convID, req.MaxTokens, hasTools, req.Tools, toolChoiceString(req.ToolChoice), stopSequences, noParallel, includeStreamUsage(req.StreamOptions))
-	} else {
-		api.nonStreamChatCompletions(w, req.Messages, cfg, sid, convID, req.MaxTokens, hasTools, req.Tools, toolChoiceString(req.ToolChoice), stopSequences, noParallel)
+		return
 	}
+	api.nonStreamChatCompletions(w, req.Messages, cfg, sid, convID, req.MaxTokens, hasTools, req.Tools, toolChoiceString(req.ToolChoice), stopSequences, noParallel)
+}
+
+// runChatToolLoop runs the built-in coding tool loop for a chat request, which
+// answers whole rather than streaming because the loop takes several turns.
+func (api *APIServer) runChatToolLoop(w http.ResponseWriter, r *http.Request, req chatCompletionsRequest, cfg models.ModelConfig, sid, convID string, localTools map[string]bool, noParallel bool, stopSequences []string) {
+	result, err := api.runToolLoop(r, toolLoopOpenAI, req.Messages, cfg, sid, convID, req.Tools, noParallel, localTools)
+	if err != nil {
+		api.sendUpstreamError(w, "chat", err)
+		return
+	}
+	api.respondBufferedChat(w, result, req.Messages, cfg, sid, req.MaxTokens, req.Stream, req.Tools, toolChoiceString(req.ToolChoice), stopSequences)
 }
 
 // handleCompletions handles OpenAI text completion requests.
@@ -1863,43 +1895,27 @@ func (api *APIServer) handleAnthropicCountTokens(w http.ResponseWriter, r *http.
 }
 
 // handleAnthropicMessages handles Anthropic messages API requests.
+// anthropicMessagesRequest is the wire shape of a /v1/messages request.
+type anthropicMessagesRequest struct {
+	Model       string                `json:"model"`
+	Messages    []payload.Message     `json:"messages"`
+	System      json.RawMessage       `json:"system"`
+	MaxTokens   int                   `json:"max_tokens"`
+	Stream      bool                  `json:"stream"`
+	Temperature float64               `json:"temperature"`
+	Tools       []toolcalling.ToolDef `json:"tools"`
+	ToolChoice  map[string]any        `json:"tool_choice"`
+	// Anthropic declares stop_sequences as an array of strings, unlike
+	// OpenAI's stop, which is also a bare string.
+	StopSequences []string `json:"stop_sequences"`
+	SessionID     string   `json:"session_id"`
+	User          string   `json:"user"`
+}
+
 func (api *APIServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodOptions {
-		api.handleCORS(w, r)
-		return
-	}
-	if r.Method != http.MethodPost {
-		api.sendError(w, http.StatusMethodNotAllowed, "Method not allowed")
-		return
-	}
-
-	limitRequestBody(w, r, requestBodyMax)
-	bodyBytes, err := io.ReadAll(r.Body)
-	if err != nil {
-		api.sendRequestBodyError(w, err)
-		return
-	}
-	_ = r.Body.Close()
-
-	var req struct {
-		Model       string                `json:"model"`
-		Messages    []payload.Message     `json:"messages"`
-		System      json.RawMessage       `json:"system"`
-		MaxTokens   int                   `json:"max_tokens"`
-		Stream      bool                  `json:"stream"`
-		Temperature float64               `json:"temperature"`
-		Tools       []toolcalling.ToolDef `json:"tools"`
-		ToolChoice  map[string]any        `json:"tool_choice"`
-		// Anthropic declares stop_sequences as an array of strings, unlike
-		// OpenAI's stop, which is also a bare string.
-		StopSequences []string `json:"stop_sequences"`
-		SessionID     string   `json:"session_id"`
-		User          string   `json:"user"`
-	}
-
-	if err := json.Unmarshal(bodyBytes, &req); err != nil {
-		logging.Errorf("handleAnthropicMessages: invalid JSON: %v", err)
-		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Invalid JSON: %v", err))
+	var req anthropicMessagesRequest
+	bodyBytes, ok := api.readJSONRequest(w, r, &req, "handleAnthropicMessages")
+	if !ok {
 		return
 	}
 
@@ -1912,75 +1928,73 @@ func (api *APIServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Req
 	}
 	logging.Infof("handleAnthropicMessages: model=%s stream=%v tools=%d sid=%s", modelKey, req.Stream, len(req.Tools), modelSessionID)
 
-	if err := validateToolResultMessages(req.Messages); err != nil {
-		logging.Errorf("handleAnthropicMessages: %v", err)
-		api.sendError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	ledger := buildToolLedger(req.Messages)
-	if api.exceededToolRoundLimit(ledger) {
-		api.sendToolRoundLimitError(w, ledger)
+	ledger, ok := api.prepareToolLedger(w, req.Messages, "handleAnthropicMessages")
+	if !ok {
 		return
 	}
 
-	// Build chat messages with system prompt prepended. Claude Code can send
-	// Anthropic system as either a string or an array of text content blocks.
+	chatMessages, ok := api.anthropicChatMessages(w, req)
+	if !ok {
+		return
+	}
+
+	preparedTools, localTools := api.prepareCodingTools(req.Tools, true)
+	req.Tools = preparedTools
+	requestJSON := replaceRequestTools(bodyBytes, req.Tools)
+	hasTools := len(toolcalling.RouteableTools(req.Tools)) > 0
+	if hasTools {
+		injectSimulatedPromptAnthropic(&chatMessages, requestJSON, anthropicToolChoiceString(req.ToolChoice), ledger.EvidenceNote())
+	}
+
+	sid, convID := api.sessionAndConversation(r, sessionSources{
+		ModelSuffix:   modelSessionID,
+		BodySessionID: req.SessionID,
+		BodyUser:      req.User,
+	}, chatMessages)
+
+	// Upload any images found in multimodal content and attach annotations
+	api.uploadImagesAndAnnotate(&chatMessages, convID)
+
+	noParallel := anthropicRefusesParallelToolCalls(req.ToolChoice)
+
+	if len(localTools) > 0 {
+		api.runAnthropicToolLoop(w, r, req, chatMessages, cfg, sid, convID, localTools, noParallel)
+		return
+	}
+	if req.Stream {
+		api.streamAnthropicMessages(r.Context(), w, chatMessages, cfg, req.Model, req.MaxTokens, sid, convID, hasTools, req.Tools, anthropicToolChoiceEnforcement(req.ToolChoice), req.StopSequences, noParallel)
+		return
+	}
+	api.nonStreamAnthropicMessages(w, chatMessages, cfg, req.Model, req.MaxTokens, sid, convID, hasTools, req.Tools, anthropicToolChoiceEnforcement(req.ToolChoice), req.StopSequences, noParallel)
+}
+
+// anthropicChatMessages prepends the system prompt to the turn. Claude Code can
+// send Anthropic system as either a string or an array of text content blocks.
+// ok is false when the request has already been answered.
+func (api *APIServer) anthropicChatMessages(w http.ResponseWriter, req anthropicMessagesRequest) ([]payload.Message, bool) {
 	systemPrompt, err := normalizeAnthropicSystem(req.System)
 	if err != nil {
 		logging.Errorf("handleAnthropicMessages: invalid system field: %v", err)
 		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Invalid system field: %v", err))
-		return
+		return nil, false
 	}
 
 	chatMessages := []payload.Message{}
 	if systemPrompt != "" {
 		chatMessages = append(chatMessages, payload.Message{Role: "system", Content: systemPrompt})
 	}
-	chatMessages = append(chatMessages, req.Messages...)
+	return append(chatMessages, req.Messages...), true
+}
 
-	preparedTools, localTools := api.prepareCodingTools(req.Tools, true)
-	req.Tools = preparedTools
-	requestJSON := replaceRequestTools(bodyBytes, req.Tools)
-	if len(toolcalling.RouteableTools(req.Tools)) > 0 {
-		injectSimulatedPromptAnthropic(&chatMessages, requestJSON, anthropicToolChoiceString(req.ToolChoice), ledger.EvidenceNote())
-	}
-
-	// Resolve session ID and conversation ID
-	sid := resolveSessionID(r, sessionSources{
-		ModelSuffix:   modelSessionID,
-		BodySessionID: req.SessionID,
-		BodyUser:      req.User,
-	})
-	if sid == "" {
-		sid = api.hashSessionIDFromMessages(r, chatMessages)
-	}
-	var convID string
-	if sid != "" {
-		convID = api.ctxCache.Get(sessionKeyPrefix + sid)
-	}
-
-	// Upload any images found in multimodal content and attach annotations
-	api.uploadImagesAndAnnotate(&chatMessages, convID)
-
-	// Determine if client-defined tools are present (for optionsSets stripping)
-	hasTools := len(toolcalling.RouteableTools(req.Tools)) > 0
-
-	noParallel := anthropicRefusesParallelToolCalls(req.ToolChoice)
-
-	if len(localTools) > 0 {
-		result, err := api.runToolLoop(r, toolLoopAnthropic, chatMessages, cfg, sid, convID, req.Tools, noParallel, localTools)
-		if err != nil {
-			api.sendUpstreamError(w, "chat", err)
-			return
-		}
-		api.respondBufferedAnthropic(w, result, chatMessages, req.Model, sid, req.MaxTokens, req.Stream, req.Tools, anthropicToolChoiceEnforcement(req.ToolChoice), req.StopSequences)
+// runAnthropicToolLoop runs the built-in coding tool loop for an Anthropic
+// request, which answers whole because the loop takes several turns.
+func (api *APIServer) runAnthropicToolLoop(w http.ResponseWriter, r *http.Request, req anthropicMessagesRequest, chatMessages []payload.Message, cfg models.ModelConfig, sid, convID string, localTools map[string]bool, noParallel bool) {
+	result, err := api.runToolLoop(r, toolLoopAnthropic, chatMessages, cfg, sid, convID, req.Tools, noParallel, localTools)
+	if err != nil {
+		api.sendUpstreamError(w, "chat", err)
 		return
 	}
-	if req.Stream {
-		api.streamAnthropicMessages(r.Context(), w, chatMessages, cfg, req.Model, req.MaxTokens, sid, convID, hasTools, req.Tools, anthropicToolChoiceEnforcement(req.ToolChoice), req.StopSequences, noParallel)
-	} else {
-		api.nonStreamAnthropicMessages(w, chatMessages, cfg, req.Model, req.MaxTokens, sid, convID, hasTools, req.Tools, anthropicToolChoiceEnforcement(req.ToolChoice), req.StopSequences, noParallel)
-	}
+	api.respondBufferedAnthropic(w, result, chatMessages, req.Model, sid, req.MaxTokens, req.Stream, req.Tools, anthropicToolChoiceEnforcement(req.ToolChoice), req.StopSequences)
 }
 
 // handleAnthropicComplete handles Anthropic complete (FIM) requests.
