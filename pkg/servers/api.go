@@ -6505,166 +6505,157 @@ func (api *APIServer) nonStreamResponses(
 		cfg,
 		convID,
 		toolPolicy.simulate,
-		func() {
-			if sid != "" {
-				api.ctxCache.Delete(sessionKeyPrefix + sid)
-			}
-		},
+		func() { api.forgetSession(sid) },
 	)
 	if err != nil {
-		if sid != "" {
-			api.ctxCache.Delete(sessionKeyPrefix + sid)
-		}
+		api.forgetSession(sid)
 		if api.responsesRequestCanceled(ctx, sid) {
 			return
 		}
 		api.sendUpstreamError(w, "chat", err)
 		return
 	}
-	respText := api.routeGeneratedImages(result.text)
-	thinking := result.thinking
-	toolCalls := result.toolCalls
-	finishReason := result.finishReason
-	finalConvID := result.conversationID
 
-	toolCalls, finishReason = withoutBackendToolCalls(toolCalls, finishReason)
+	turn := responsesTurn{
+		text:         api.routeGeneratedImages(result.text),
+		thinking:     result.thinking,
+		toolCalls:    result.toolCalls,
+		finishReason: result.finishReason,
+		convID:       result.conversationID,
+	}
+	turn.toolCalls, turn.finishReason = withoutBackendToolCalls(turn.toolCalls, turn.finishReason)
 
 	// Parse simulated tool calls from response text
-	if toolPolicy.simulate {
-		simulated, parseErr := parseResponsesSimulationWithRetry(
-			respText,
-			toolPolicy,
-			func() (string, error) {
-				if sid != "" {
-					api.ctxCache.Delete(sessionKeyPrefix + sid)
-				}
-				retryResult, retryErr := api.responsesConversationOnce(
-					ctx,
-					responsesSimulationRetryMessages(messages, toolPolicy),
-					cfg,
-					"",
-					true,
-				)
-				if retryErr != nil {
-					return "", retryErr
-				}
-				respText = retryResult.text
-				thinking = retryResult.thinking
-				toolCalls = retryResult.toolCalls
-				finishReason = retryResult.finishReason
-				finalConvID = retryResult.conversationID
-				return retryResult.text, nil
-			},
-			func() (string, error) {
-				if sid != "" {
-					api.ctxCache.Delete(sessionKeyPrefix + sid)
-				}
-				retryResult, retryErr := api.responsesConversationOnce(
-					ctx,
-					messages,
-					cfg,
-					"",
-					true,
-				)
-				if retryErr != nil {
-					return "", retryErr
-				}
-				respText = retryResult.text
-				thinking = retryResult.thinking
-				toolCalls = nil
-				finishReason = retryResult.finishReason
-				finalConvID = retryResult.conversationID
-				return retryResult.text, nil
-			},
-		)
-		if parseErr != nil {
-			if sid != "" {
-				api.ctxCache.Delete(sessionKeyPrefix + sid)
-			}
-			if api.responsesRequestCanceled(ctx, sid) {
-				return
-			}
-			if errors.Is(parseErr, errSimulatedToolCallRequired) {
-				writeResponsesSimulationError(
-					w,
-					false,
-					"",
-					0,
-					cfg.OpenAIID,
-					parseErr,
-				)
-			} else {
-				writeResponsesServerError(
-					w,
-					false,
-					"",
-					0,
-					cfg.OpenAIID,
-					"upstream_error",
-					parseErr.Error(),
-				)
-			}
-			return
-		}
-		respText = simulated.content
-		toolCalls = simulated.toolCalls
-		finishReason = simulated.finishReason
+	if toolPolicy.simulate && !api.applyResponsesSimulation(ctx, w, &turn, messages, cfg, sid, toolPolicy) {
+		return
 	}
-	thinking = responsesReasoningForOutput(thinking, toolPolicy.simulate)
-	if blockedByContentPolicy(respText, toolCalls) {
-		if sid != "" {
-			api.ctxCache.Delete(sessionKeyPrefix + sid)
-		}
-		api.sendContentBlockedError(w, respText)
+
+	turn.thinking = responsesReasoningForOutput(turn.thinking, toolPolicy.simulate)
+	if blockedByContentPolicy(turn.text, turn.toolCalls) {
+		api.forgetSession(sid)
+		api.sendContentBlockedError(w, turn.text)
 		return
 	}
 	// The Responses input is collapsed into one prompt message, so the
 	// evidence comes from the policy rather than from the messages here.
-	respText = withoutUnverifiedCompletionClaim(respText, toolPolicy.simulate, toolPolicy.ledger, toolCalls)
-	if responsesResultEmpty(respText, toolCalls) {
-		if sid != "" {
-			api.ctxCache.Delete(sessionKeyPrefix + sid)
-		}
-		// An exhausted conversation quota is the one empty-response cause the
-		// client can act on, so report it as 429 rather than a generic empty.
-		if api.quotaExhausted() {
-			api.sendThrottledError(w)
-			return
-		}
-		writeResponsesUpstreamEmptyError(
-			w,
-			false,
-			"",
-			0,
-			cfg.OpenAIID,
-		)
+	turn.text = withoutUnverifiedCompletionClaim(turn.text, toolPolicy.simulate, toolPolicy.ledger, turn.toolCalls)
+	if responsesResultEmpty(turn.text, turn.toolCalls) {
+		api.forgetSession(sid)
+		api.answerResponsesEmpty(w, cfg)
 		return
 	}
 
 	// Enforce max_output_tokens
 	if maxTokens > 0 {
-		if truncated, ok := truncateToTokens(respText, maxTokens); ok {
-			respText = truncated
-			finishReason = "length"
+		if truncated, ok := truncateToTokens(turn.text, maxTokens); ok {
+			turn.text = truncated
+			turn.finishReason = "length"
 		}
 	}
 
 	promptTok := countPromptTokens(messages, toolPolicy.tools, toolPolicy.promptChoice)
-	completionTok := countTokens(respText) + outputProtocolTokens
-	reasoningTok := countTokens(thinking)
+	completionTok := countTokens(turn.text) + outputProtocolTokens
+	reasoningTok := countTokens(turn.thinking)
 
 	responseID, createdAt := newResponsesIdentity()
-	response := buildResponsesObject(responseID, createdAt, cfg.OpenAIID, respText, thinking, toolCalls, responsesToolTypes(toolPolicy.tools), goalOpen, finishReason, promptTok, completionTok, reasoningTok)
+	response := buildResponsesObject(responseID, createdAt, cfg.OpenAIID, turn.text, turn.thinking, turn.toolCalls, responsesToolTypes(toolPolicy.tools), goalOpen, turn.finishReason, promptTok, completionTok, reasoningTok)
 
-	if sid != "" {
-		if shouldResetResponsesSession(respText, toolCalls, nil) {
-			api.ctxCache.Delete(sessionKeyPrefix + sid)
-		} else {
-			api.storeSessionMapping(sid, finalConvID)
-		}
-	}
-
+	api.storeResponsesSession(sid, turn)
 	api.sendJSON(w, http.StatusOK, response)
+}
+
+// responsesTurn carries the answer of one Responses turn, which a retry can
+// replace wholesale.
+type responsesTurn struct {
+	text         string
+	thinking     string
+	toolCalls    []client.ToolCall
+	finishReason string
+	convID       string
+}
+
+// retryResponsesTurn runs a fresh turn on a new conversation and adopts its
+// answer. dropToolCalls covers the empty-answer retry, where the calls of the
+// turn being replaced must not survive it.
+func (api *APIServer) retryResponsesTurn(ctx context.Context, turn *responsesTurn, messages []payload.Message, cfg models.ModelConfig, sid string, dropToolCalls bool) (string, error) {
+	api.forgetSession(sid)
+	retryResult, retryErr := api.responsesConversationOnce(ctx, messages, cfg, "", true)
+	if retryErr != nil {
+		return "", retryErr
+	}
+	turn.text = retryResult.text
+	turn.thinking = retryResult.thinking
+	turn.toolCalls = retryResult.toolCalls
+	if dropToolCalls {
+		turn.toolCalls = nil
+	}
+	turn.finishReason = retryResult.finishReason
+	turn.convID = retryResult.conversationID
+	return retryResult.text, nil
+}
+
+// applyResponsesSimulation parses the simulated tool calls, re-asking the
+// backend when the model owed a call it did not make or answered with nothing.
+// ok is false when the request has already been answered.
+func (api *APIServer) applyResponsesSimulation(ctx context.Context, w http.ResponseWriter, turn *responsesTurn, messages []payload.Message, cfg models.ModelConfig, sid string, toolPolicy responsesToolPolicy) bool {
+	simulated, parseErr := parseResponsesSimulationWithRetry(
+		turn.text,
+		toolPolicy,
+		func() (string, error) {
+			return api.retryResponsesTurn(ctx, turn, responsesSimulationRetryMessages(messages, toolPolicy), cfg, sid, false)
+		},
+		func() (string, error) {
+			return api.retryResponsesTurn(ctx, turn, messages, cfg, sid, true)
+		},
+	)
+	if parseErr != nil {
+		api.forgetSession(sid)
+		if api.responsesRequestCanceled(ctx, sid) {
+			return false
+		}
+		writeResponsesParseError(w, cfg.OpenAIID, parseErr)
+		return false
+	}
+	turn.text = simulated.content
+	turn.toolCalls = simulated.toolCalls
+	turn.finishReason = simulated.finishReason
+	return true
+}
+
+// writeResponsesParseError reports a simulation that could not be parsed. A
+// required call the model never made has its own code, because a client can
+// act on that one.
+func writeResponsesParseError(w http.ResponseWriter, model string, parseErr error) {
+	if errors.Is(parseErr, errSimulatedToolCallRequired) {
+		writeResponsesSimulationError(w, false, "", 0, model, parseErr)
+		return
+	}
+	writeResponsesServerError(w, false, "", 0, model, "upstream_error", parseErr.Error())
+}
+
+// answerResponsesEmpty reports a turn that produced nothing.
+//
+// An exhausted conversation quota is the one empty-response cause the client
+// can act on, so it is reported as 429 rather than as a generic empty answer.
+func (api *APIServer) answerResponsesEmpty(w http.ResponseWriter, cfg models.ModelConfig) {
+	if api.quotaExhausted() {
+		api.sendThrottledError(w)
+		return
+	}
+	writeResponsesUpstreamEmptyError(w, false, "", 0, cfg.OpenAIID)
+}
+
+// storeResponsesSession binds the session to the conversation this turn ran on,
+// or drops the binding when the turn produced nothing worth continuing.
+func (api *APIServer) storeResponsesSession(sid string, turn responsesTurn) {
+	if sid == "" {
+		return
+	}
+	if shouldResetResponsesSession(turn.text, turn.toolCalls, nil) {
+		api.ctxCache.Delete(sessionKeyPrefix + sid)
+		return
+	}
+	api.storeSessionMapping(sid, turn.convID)
 }
 
 // streamResponses handles streaming Responses API requests.
@@ -7501,18 +7492,41 @@ func (api *APIServer) nonStreamResponsesCompact(w http.ResponseWriter, messages 
 	}
 }
 
+// failResponsesStream reports a failed turn on an open Responses stream, which
+// cannot be turned into an HTTP error because the headers are already out.
+func (api *APIServer) failResponsesStream(w http.ResponseWriter, flusher http.Flusher, sendEvent func(string, map[string]any), responseID, openaiModel string, createdAt int64, err error) {
+	failed := responsesStatusObject(responseID, openaiModel, "failed", createdAt)
+	failed["error"] = map[string]any{"message": err.Error()}
+	sendEvent("response.failed", map[string]any{"response": failed})
+	_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
+	flusher.Flush()
+}
+
+// compactionSummaryText extracts the summary from a turn that ran in simulated
+// mode, where the answer travels inside the transport envelope.
+func compactionSummaryText(fullText string, hasTools bool, tools []toolcalling.ToolDef) string {
+	if !hasTools {
+		return fullText
+	}
+	sim := toolcalling.ParseSimulatedResponse(fullText, toolNamesFromDefs(tools), toolcalling.ContractsFor(tools))
+	if sim.HasPayload {
+		return sim.Content
+	}
+	fullText = toolcalling.WithholdTransportEnvelope(fullText)
+	if toolcalling.IsContentPolicyBlock(fullText) {
+		// The stream is already open, so the refusal cannot be turned into an
+		// HTTP error the way the non-streaming paths do.
+		logging.Warn("upstream content refusal on a streaming turn: M365 declined the request instead of answering")
+	}
+	return fullText
+}
+
 // streamResponsesCompact handles streaming compact requests.
 // It emits a standard Responses SSE stream but replaces the output item
 // with a single compaction item containing the summary.
 func (api *APIServer) streamResponsesCompact(ctx context.Context, w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, sid, convID string, maxTokens int, hasTools bool, tools []toolcalling.ToolDef) {
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "close")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-
-	flusher, ok := w.(http.Flusher)
+	flusher, ok := api.beginSSE(w)
 	if !ok {
-		api.sendError(w, http.StatusInternalServerError, "Streaming not supported")
 		return
 	}
 
@@ -7541,7 +7555,6 @@ func (api *APIServer) streamResponsesCompact(ctx context.Context, w http.Respons
 
 	var fullTextBuilder strings.Builder
 
-	var finalToolCalls []client.ToolCall
 	keepalive := time.NewTicker(sseKeepaliveInterval)
 	defer keepalive.Stop()
 	for {
@@ -7551,37 +7564,16 @@ func (api *APIServer) streamResponsesCompact(ctx context.Context, w http.Respons
 		}
 		if chunk.Error != nil {
 			logging.Errorf("streamResponsesCompact: stream error: %v", chunk.Error)
-			if sid != "" {
-				api.ctxCache.Delete(sessionKeyPrefix + sid)
-			}
-			failed := responsesStatusObject(responseID, openaiModel, "failed", createdAt)
-			failed["error"] = map[string]any{"message": chunk.Error.Error()}
-			sendEvent("response.failed", map[string]any{"response": failed})
-			_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
-			flusher.Flush()
+			api.forgetSession(sid)
+			api.failResponsesStream(w, flusher, sendEvent, responseID, openaiModel, createdAt, chunk.Error)
 			return
 		}
 		if chunk.Text != "" {
 			fullTextBuilder.WriteString(chunk.Text)
 		}
 	}
-	_ = finalToolCalls
-	fullText := fullTextBuilder.String()
 
-	// In simulated mode, extract plain content
-	if hasTools {
-		sim := toolcalling.ParseSimulatedResponse(fullText, toolNamesFromDefs(tools), toolcalling.ContractsFor(tools))
-		if sim.HasPayload {
-			fullText = sim.Content
-		} else {
-			fullText = toolcalling.WithholdTransportEnvelope(fullText)
-			if toolcalling.IsContentPolicyBlock(fullText) {
-				// The stream is already open, so the refusal cannot be turned
-				// into an HTTP error the way the non-streaming paths do.
-				logging.Warn("upstream content refusal on a streaming turn: M365 declined the request instead of answering")
-			}
-		}
-	}
+	fullText := compactionSummaryText(fullTextBuilder.String(), hasTools, tools)
 
 	// Enforce max_output_tokens
 	if maxTokens > 0 {
