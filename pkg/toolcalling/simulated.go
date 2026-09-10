@@ -602,13 +602,31 @@ func scoreAnthropicCandidate(candidate map[string]any) int {
 // not in `allowed` (when non-empty) are dropped — this strips M365-invented
 // tools like "code_interpreter" that the client never declared.
 func parseChatCompletionPayload(payload map[string]any, result *SimulatedResult, allowed map[string]bool, contracts ToolContracts, preserveToolContent bool) {
+	message, ok := chatCompletionMessage(payload, result)
+	if !ok {
+		return
+	}
+
+	if toolCallsNode, ok := message["tool_calls"].([]any); ok && len(toolCallsNode) > 0 {
+		collectChatToolCalls(toolCallsNode, result, allowed, contracts)
+		if finishChatToolCalls(result, message, preserveToolContent) {
+			return
+		}
+	}
+
+	result.Content = normalizeMessageContent(message["content"])
+}
+
+// chatCompletionMessage reads the first choice's message and records its finish
+// reason. A payload carrying no usable choice reports false.
+func chatCompletionMessage(payload map[string]any, result *SimulatedResult) (map[string]any, bool) {
 	choices, ok := payload["choices"].([]any)
 	if !ok || len(choices) == 0 {
-		return
+		return nil, false
 	}
 	first, ok := choices[0].(map[string]any)
 	if !ok {
-		return
+		return nil, false
 	}
 
 	if fr, ok := first["finish_reason"].(string); ok && fr != "" {
@@ -617,59 +635,69 @@ func parseChatCompletionPayload(payload map[string]any, result *SimulatedResult,
 
 	message, ok := first["message"].(map[string]any)
 	if !ok {
+		return nil, false
+	}
+	return message, true
+}
+
+// collectChatToolCalls reads every entry of the tool_calls array.
+func collectChatToolCalls(nodes []any, result *SimulatedResult, allowed map[string]bool, contracts ToolContracts) {
+	for _, tcNode := range nodes {
+		tc, ok := tcNode.(map[string]any)
+		if !ok {
+			continue
+		}
+		appendChatToolCall(tc, result, allowed, contracts)
+	}
+}
+
+// appendChatToolCall records one tool_calls entry, or records why it was
+// dropped.
+func appendChatToolCall(tc map[string]any, result *SimulatedResult, allowed map[string]bool, contracts ToolContracts) {
+	name, namespace, id, args := extractToolCallFields(tc)
+	if name == "" {
 		return
 	}
+	// Filter out tool calls whose name the client never declared
+	// (e.g. M365-injected "code_interpreter"). When allowed is empty,
+	// filtering is skipped (back-compat / non-tool requests).
+	if len(allowed) > 0 && !allowed[name] {
+		return
+	}
+	// Drop tool calls that violate the tool's schema so a malformed call is
+	// never forwarded to the client (which would reject it and retry in an
+	// endless loop).
+	validated, reason, repairable := contracts.validate(name, json.RawMessage(args))
+	if reason != "" {
+		logging.Warnf("parseChatCompletionPayload: dropping %q tool call: %s", name, reason)
+		if repairable {
+			result.DroppedCalls = append(result.DroppedCalls, DroppedCall{Name: name, Reason: reason})
+		}
+		return
+	}
+	result.ToolCalls = append(result.ToolCalls, ToolCall{
+		ID:        id,
+		Name:      name,
+		Namespace: namespace,
+		Arguments: json.RawMessage(validated),
+	})
+}
 
-	if toolCallsNode, ok := message["tool_calls"].([]any); ok && len(toolCallsNode) > 0 {
-		for _, tcNode := range toolCallsNode {
-			tc, ok := tcNode.(map[string]any)
-			if !ok {
-				continue
-			}
-			name, namespace, id, args := extractToolCallFields(tc)
-			if name == "" {
-				continue
-			}
-			// Filter out tool calls whose name the client never declared
-			// (e.g. M365-injected "code_interpreter"). When allowed is empty,
-			// filtering is skipped (back-compat / non-tool requests).
-			if len(allowed) > 0 && !allowed[name] {
-				continue
-			}
-			// Drop tool calls that violate the tool's schema so a malformed call
-			// is never forwarded to the client (which would reject it and retry
-			// in an endless loop).
-			validated, reason, repairable := contracts.validate(name, json.RawMessage(args))
-			if reason != "" {
-				logging.Warnf("parseChatCompletionPayload: dropping %q tool call: %s", name, reason)
-				if repairable {
-					result.DroppedCalls = append(result.DroppedCalls, DroppedCall{Name: name, Reason: reason})
-				}
-				continue
-			}
-			args = string(validated)
-			result.ToolCalls = append(result.ToolCalls, ToolCall{
-				ID:        id,
-				Name:      name,
-				Namespace: namespace,
-				Arguments: json.RawMessage(args),
-			})
-		}
-		if len(result.ToolCalls) > 0 {
-			if preserveToolContent {
-				result.Content = normalizeMessageContent(message["content"])
-			} else {
-				result.Content = ""
-			}
-			result.FinishReason = "tool_calls"
-			return
-		}
+// finishChatToolCalls settles the result when the message carried tool calls,
+// and reports whether it did.
+func finishChatToolCalls(result *SimulatedResult, message map[string]any, preserveToolContent bool) bool {
+	if len(result.ToolCalls) == 0 {
 		if result.FinishReason == "tool_calls" {
 			result.FinishReason = "stop"
 		}
+		return false
 	}
-
-	result.Content = normalizeMessageContent(message["content"])
+	result.Content = ""
+	if preserveToolContent {
+		result.Content = normalizeMessageContent(message["content"])
+	}
+	result.FinishReason = "tool_calls"
+	return true
 }
 
 // extractToolCallFields pulls name/namespace/arguments from a tool_calls entry,
@@ -677,23 +705,15 @@ func parseChatCompletionPayload(payload map[string]any, result *SimulatedResult,
 // and a flat shape ({name,arguments}).
 func extractToolCallFields(tc map[string]any) (name, namespace, id, args string) {
 	if fn, ok := tc["function"].(map[string]any); ok {
-		if n, ok := fn["name"].(string); ok && n != "" {
-			name = n
-		}
-		if ns, ok := fn["namespace"].(string); ok && ns != "" {
-			namespace = ns
-		}
+		name = stringField(fn, "name")
+		namespace = stringField(fn, "namespace")
 		args = normalizeArgumentsJSON(fn["arguments"])
 	}
 	if name == "" {
-		if n, ok := tc["name"].(string); ok && n != "" {
-			name = n
-		}
+		name = stringField(tc, "name")
 	}
 	if namespace == "" {
-		if ns, ok := tc["namespace"].(string); ok && ns != "" {
-			namespace = ns
-		}
+		namespace = stringField(tc, "namespace")
 	}
 	if args == "" {
 		args = normalizeArgumentsJSON(tc["arguments"])
@@ -702,6 +722,13 @@ func extractToolCallFields(tc map[string]any) (name, namespace, id, args string)
 	// clients reject as a duplicate tool call id.
 	id = nextToolCallID()
 	return
+}
+
+// stringField reads a string field, treating an absent value, a wrongly typed
+// one and an empty one alike.
+func stringField(node map[string]any, key string) string {
+	value, _ := node[key].(string)
+	return value
 }
 
 // normalizeArgumentsJSON ensures arguments is a JSON string value. If the node
