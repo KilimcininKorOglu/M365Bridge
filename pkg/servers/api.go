@@ -2802,31 +2802,113 @@ func openAIAssistantMessage(respText, thinking string, toolCalls []client.ToolCa
 
 // streamAnthropicMessages streams messages in Anthropic SSE format.
 func (api *APIServer) streamAnthropicMessages(ctx context.Context, w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, anthropicModel string, maxTokens int, sid, convID string, hasTools bool, tools []toolcalling.ToolDef, toolChoice string, stopSequences []string, noParallel bool) {
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "close")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-
-	flusher, ok := w.(http.Flusher)
+	flusher, ok := api.beginSSE(w)
 	if !ok {
-		api.sendError(w, http.StatusInternalServerError, "Streaming not supported")
 		return
 	}
 
-	msgID := fmt.Sprintf("msg_%s", uuid.New().String())
+	stream := &anthropicStream{
+		api:     api,
+		w:       w,
+		flusher: flusher,
+		msgID:   fmt.Sprintf("msg_%s", uuid.New().String()),
+		model:   anthropicModel,
+	}
+
 	// The Anthropic wire format splits usage across message_start and
 	// message_delta, so the input side is counted once here and not repeated.
-	promptTok := countPromptTokens(messages, tools, toolChoice)
+	stream.start(countPromptTokens(messages, tools, toolChoice))
 
-	// Send message_start event
-	header := map[string]any{
+	// A stop sequence can straddle two chunks, so the deltas of a directly
+	// streamed answer pass through a writer that holds back the tail which
+	// could still complete one. A tool-enabled turn is buffered whole, so it
+	// takes the trailing cut below instead.
+	stopWriter := newStopSequenceWriter(stopSequences)
+
+	ch := api.m365Client.ChatConversationStreamGenContext(ctx, messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
+
+	keepalive := time.NewTicker(sseKeepaliveInterval)
+	defer keepalive.Stop()
+	for {
+		chunk, more := nextStreamChunk(ctx, ch, keepalive, w, flusher, func() error { return writeAnthropicKeepalive(w, flusher) })
+		if !more {
+			break
+		}
+		step := stream.chunk(chunk, ch, maxTokens, hasTools, stopWriter, sid)
+		if step == streamLoopFailed {
+			return
+		}
+		if step == streamLoopStop {
+			break
+		}
+	}
+	if !hasTools {
+		// Whatever the writer held back belongs to the answer when no stop
+		// sequence ever arrived.
+		stream.textDelta(stopWriter.flush())
+	}
+
+	// stopWriter.matched() is empty on the tool-enabled path, where the writer
+	// never ran and the cut inside anthropicToolCalls sets it instead.
+	fullText, simToolCalls, matchedStop := api.anthropicToolCalls(
+		stream, messages, cfg, tools, toolChoice, stopSequences, hasTools, noParallel, stopWriter.matched(),
+	)
+
+	stream.closeThinkingOnlyTurn(hasTools)
+	// If tool calling buffered text, send it now as a text block
+	if hasTools && fullText != "" {
+		stream.sendTextBlock(fullText)
+	}
+	stream.closeOpenBlocks()
+
+	// Send tool_use content blocks if any (server-side tools from M365 backend
+	// or simulated)
+	toolCalls, _ := withoutBackendToolCalls(stream.backendCalls, "")
+	toolCalls = appendSimulatedCalls(toolCalls, simToolCalls)
+	stream.emitToolUseBlocks(toolCalls)
+
+	api.storeSessionMapping(sid, stream.convID)
+	stream.finish(fullText, toolCalls, matchedStop)
+}
+
+// anthropicStream carries what one Anthropic messages turn streams.
+//
+// The wire format is a sequence of indexed content blocks, so which block is
+// open and which index it carries have to survive between chunks.
+type anthropicStream struct {
+	api     *APIServer
+	w       http.ResponseWriter
+	flusher http.Flusher
+	msgID   string
+	model   string
+
+	fullText       strings.Builder
+	thinking       strings.Builder
+	thinkingFilter toolcalling.ThinkingStreamFilter
+	thinkingClosed bool
+	thinkingOpen   bool
+	textOpen       bool
+	blockIndex     int
+	truncated      bool
+	convID         string
+	backendCalls   []client.ToolCall
+}
+
+// event writes one event of the stream.
+func (s *anthropicStream) event(name string, data map[string]any) {
+	s.api.sendAnthropicSSE(s.w, name, data)
+}
+
+// start writes message_start, which carries the input side of the usage.
+func (s *anthropicStream) start(promptTok int) {
+	s.event("message_start", map[string]any{
 		"type": "message_start",
 		"message": map[string]any{
-			"id":            msgID,
+			"id":            s.msgID,
 			"type":          "message",
 			"role":          "assistant",
 			"content":       []any{},
-			"model":         anthropicModel,
+			"model":         s.model,
 			"stop_reason":   nil,
 			"stop_sequence": nil,
 			"usage": map[string]any{
@@ -2835,269 +2917,163 @@ func (api *APIServer) streamAnthropicMessages(ctx context.Context, w http.Respon
 				"usage_source":  usageSource(),
 			},
 		},
+	})
+	s.flusher.Flush()
+}
+
+// fail reports a failed turn as an error event.
+func (s *anthropicStream) fail(err error) {
+	_, code, message := streamErrorFields("message", err)
+	s.event("error", map[string]any{
+		"type": "error",
+		"error": map[string]any{
+			"type":    code,
+			"message": message,
+		},
+	})
+	s.flusher.Flush()
+}
+
+// openThinking starts the reasoning block unless it is open already.
+func (s *anthropicStream) openThinking() {
+	if s.thinkingOpen {
+		return
 	}
-	api.sendAnthropicSSE(w, "message_start", header)
-	flusher.Flush()
+	s.event("content_block_start", map[string]any{
+		"type":          "content_block_start",
+		"index":         s.blockIndex,
+		"content_block": map[string]any{"type": "thinking", "thinking": "", "signature": ""},
+	})
+	s.thinkingOpen = true
+}
 
-	// Stream content with optional thinking block
-	var fullTextBuilder strings.Builder
-	var thinkingText strings.Builder
-	var thinkingFilter toolcalling.ThinkingStreamFilter
-	thinkingClosed := false
-	truncated := false
-	thinkingBlockOpen := false
-	textBlockOpen := false
-	blockIndex := 0
-	toolCallingEnabled := hasTools
-
-	// A stop sequence can straddle two chunks, so the deltas of a directly
-	// streamed answer pass through a writer that holds back the tail which
-	// could still complete one. A tool-enabled turn is buffered whole, so it
-	// takes the trailing cut below instead.
-	stopWriter := newStopSequenceWriter(stopSequences)
-	sendTextDelta := func(text string) {
-		if text == "" {
-			return
-		}
-		fullTextBuilder.WriteString(text)
-		api.sendAnthropicSSE(w, "content_block_delta", map[string]any{
-			"type":  "content_block_delta",
-			"index": blockIndex,
-			"delta": map[string]any{"type": "text_delta", "text": text},
-		})
-		flusher.Flush()
+// thinkingDelta writes one reasoning fragment, opening the block first.
+func (s *anthropicStream) thinkingDelta(text string) {
+	if text == "" {
+		return
 	}
+	s.openThinking()
+	s.event("content_block_delta", map[string]any{
+		"type":  "content_block_delta",
+		"index": s.blockIndex,
+		"delta": map[string]any{"type": "thinking_delta", "thinking": text},
+	})
+	s.flusher.Flush()
+}
 
-	ch := api.m365Client.ChatConversationStreamGenContext(ctx, messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
-
-	var finalConvID string
-	var finalToolCalls []client.ToolCall
-	keepalive := time.NewTicker(sseKeepaliveInterval)
-	defer keepalive.Stop()
-	for {
-		chunk, more := nextStreamChunk(ctx, ch, keepalive, w, flusher, func() error { return writeAnthropicKeepalive(w, flusher) })
-		if !more {
-			break
-		}
-		if chunk.Error != nil {
-			if sid != "" {
-				api.ctxCache.Delete(sessionKeyPrefix + sid)
-			}
-			_, code, message := streamErrorFields("message", chunk.Error)
-			errEvent := map[string]any{
-				"type": "error",
-				"error": map[string]any{
-					"type":    code,
-					"message": message,
-				},
-			}
-			api.sendAnthropicSSE(w, "error", errEvent)
-			flusher.Flush()
-			return
-		}
-
-		if chunk.IsFinal {
-			finalConvID = chunk.ConversationID
-			finalToolCalls = chunk.ToolCalls
-			break
-		}
-
-		chunk.Text = api.routeGeneratedImages(chunk.Text)
-
-		// Handle thinking content
-		if chunk.Thinking != "" {
-			thinkingText.WriteString(chunk.Thinking)
-			if toolCallingEnabled {
-				// Live-stream thinking through a stateful filter that strips the
-				// simulated transport envelope (fenced blocks + meta-prose) so
-				// the model's reasoning is visible without exposing the mechanism.
-				if emit := thinkingFilter.Feed(chunk.Thinking); emit != "" {
-					if !thinkingBlockOpen {
-						api.sendAnthropicSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": blockIndex, "content_block": map[string]any{"type": "thinking", "thinking": "", "signature": ""}})
-						thinkingBlockOpen = true
-					}
-					api.sendAnthropicSSE(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": blockIndex, "delta": map[string]any{"type": "thinking_delta", "thinking": emit}})
-					flusher.Flush()
-				}
-				continue
-			}
-			if !thinkingBlockOpen {
-				cbStart := map[string]any{
-					"type":          "content_block_start",
-					"index":         blockIndex,
-					"content_block": map[string]any{"type": "thinking", "thinking": "", "signature": ""},
-				}
-				api.sendAnthropicSSE(w, "content_block_start", cbStart)
-				thinkingBlockOpen = true
-			}
-			delta := map[string]any{
-				"type":  "content_block_delta",
-				"index": blockIndex,
-				"delta": map[string]any{"type": "thinking_delta", "thinking": chunk.Thinking},
-			}
-			api.sendAnthropicSSE(w, "content_block_delta", delta)
-			flusher.Flush()
-			continue
-		}
-
-		// Transition from thinking to text: flush the filter remainder (tool
-		// path) then close any open thinking block before content follows.
-		if toolCallingEnabled && !thinkingClosed {
-			if rem := thinkingFilter.Flush(); rem != "" {
-				if !thinkingBlockOpen {
-					api.sendAnthropicSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": blockIndex, "content_block": map[string]any{"type": "thinking", "thinking": "", "signature": ""}})
-					thinkingBlockOpen = true
-				}
-				api.sendAnthropicSSE(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": blockIndex, "delta": map[string]any{"type": "thinking_delta", "thinking": rem}})
-			}
-			thinkingClosed = true
-		}
-		if thinkingBlockOpen && !textBlockOpen {
-			api.sendAnthropicSSE(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": blockIndex})
-			blockIndex++
-			thinkingBlockOpen = false
-		}
-
-		// Open text block on first text chunk (only if not buffering for tool calling)
-		if !textBlockOpen && !toolCallingEnabled {
-			cbStart := map[string]any{
-				"type":          "content_block_start",
-				"index":         blockIndex,
-				"content_block": map[string]any{"type": "text", "text": ""},
-			}
-			api.sendAnthropicSSE(w, "content_block_start", cbStart)
-			textBlockOpen = true
-		}
-
-		// Check max_tokens limit before sending more content
-		if maxTokens > 0 && countTokens(fullTextBuilder.String()) >= maxTokens {
-			truncated = true
-			for range ch {
-			}
-			break
-		}
-
-		// If tool calling is not enabled, stream text deltas directly. The
-		// writer decides what is safe to release, and it also feeds the
-		// accumulator, so the reported usage matches what the client received.
-		if !toolCallingEnabled {
-			emit, _ := stopWriter.next(chunk.Text)
-			sendTextDelta(emit)
-			continue
-		}
-		fullTextBuilder.WriteString(chunk.Text)
+// closeThinking ends the reasoning block and moves to the next block index.
+func (s *anthropicStream) closeThinking() {
+	if !s.thinkingOpen {
+		return
 	}
-	if !toolCallingEnabled {
-		// Whatever the writer held back belongs to the answer when no stop
-		// sequence ever arrived.
-		sendTextDelta(stopWriter.flush())
-	}
-	fullText := fullTextBuilder.String()
-	// Empty on the tool-enabled path, where the writer never ran and the cut
-	// below sets it instead.
-	matchedStop := stopWriter.matched()
+	s.event("content_block_stop", map[string]any{"type": "content_block_stop", "index": s.blockIndex})
+	s.blockIndex++
+	s.thinkingOpen = false
+}
 
-	// Parse simulated tool calls from full text if tool calling is enabled
-	var simToolCalls []toolcalling.ToolCall
-	if toolCallingEnabled {
-		contracts := toolcalling.ContractsFor(tools).WithChoice(toolChoice).WithoutParallel(noParallel)
-		sim := toolcalling.ParseSimulatedResponseAnthropic(fullText, toolNamesFromDefs(tools), contracts)
-		sim = api.repairSimulatedToolCalls(toolLoopAnthropic, messages, cfg, tools, contracts, fullText, sim)
-		sim = dropSettledToolCalls(buildToolLedger(messages), toolChoice, sim)
-		if sim.HasPayload {
-			if len(sim.ToolCalls) > 0 {
-				simToolCalls = sim.ToolCalls
-				fullText = ""
-			} else {
-				fullText = sim.Content
-			}
-		} else {
-			fullText = toolcalling.WithholdTransportEnvelope(fullText)
-			if toolcalling.IsContentPolicyBlock(fullText) {
-				// The stream is already open, so the refusal cannot be turned
-				// into an HTTP error the way the non-streaming paths do.
-				logging.Warn("upstream content refusal on a streaming turn: M365 declined the request instead of answering")
-			}
-		}
-		fullText = replaceUnverifiedCompletionClaim(fullText, hasTools, buildToolLedger(messages), len(simToolCalls))
-		// A tool-enabled turn is buffered whole and emitted below, so its stop
-		// sequence is applied here rather than through the writer.
-		if cut, matched := cutAtStopSequence(fullText, stopSequences); matched != "" {
-			fullText = cut
-			matchedStop = matched
-		}
+// openText starts the answer block unless it is open already.
+func (s *anthropicStream) openText() {
+	if s.textOpen {
+		return
 	}
+	s.event("content_block_start", map[string]any{
+		"type":          "content_block_start",
+		"index":         s.blockIndex,
+		"content_block": map[string]any{"type": "text", "text": ""},
+	})
+	s.textOpen = true
+}
 
-	// Flush any remaining filtered thinking when the response was thinking-only
-	// (no content chunk triggered the in-loop transition) and close its block.
-	if toolCallingEnabled && !thinkingClosed {
-		if rem := thinkingFilter.Flush(); rem != "" {
-			if !thinkingBlockOpen {
-				api.sendAnthropicSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": blockIndex, "content_block": map[string]any{"type": "thinking", "thinking": "", "signature": ""}})
-				thinkingBlockOpen = true
-			}
-			api.sendAnthropicSSE(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": blockIndex, "delta": map[string]any{"type": "thinking_delta", "thinking": rem}})
-		}
-		if thinkingBlockOpen {
-			api.sendAnthropicSSE(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": blockIndex})
-			blockIndex++
-			thinkingBlockOpen = false
-		}
+// writeTextDelta writes one answer fragment into the open block.
+func (s *anthropicStream) writeTextDelta(text string) {
+	s.event("content_block_delta", map[string]any{
+		"type":  "content_block_delta",
+		"index": s.blockIndex,
+		"delta": map[string]any{"type": "text_delta", "text": text},
+	})
+	s.flusher.Flush()
+}
+
+// textDelta writes one streamed answer fragment and records it.
+func (s *anthropicStream) textDelta(text string) {
+	if text == "" {
+		return
 	}
+	s.fullText.WriteString(text)
+	s.writeTextDelta(text)
+}
 
-	// If tool calling buffered text, send it now as a text block
-	if toolCallingEnabled && fullText != "" {
-		cbStart := map[string]any{
-			"type":          "content_block_start",
-			"index":         blockIndex,
-			"content_block": map[string]any{"type": "text", "text": ""},
-		}
-		api.sendAnthropicSSE(w, "content_block_start", cbStart)
-		textBlockOpen = true
-		delta := map[string]any{
-			"type":  "content_block_delta",
-			"index": blockIndex,
-			"delta": map[string]any{"type": "text_delta", "text": fullText},
-		}
-		api.sendAnthropicSSE(w, "content_block_delta", delta)
-		flusher.Flush()
+// sendTextBlock writes a buffered answer as its own block. The text was
+// accumulated as it arrived, so it is not recorded again.
+func (s *anthropicStream) sendTextBlock(text string) {
+	s.openText()
+	s.writeTextDelta(text)
+}
+
+// streamThinking emits the reasoning summary as it arrives. A tool-enabled turn
+// filters it, because the simulated transport envelope travels in the same
+// channel.
+func (s *anthropicStream) streamThinking(text string, hasTools bool) {
+	s.thinking.WriteString(text)
+	if !hasTools {
+		s.thinkingDelta(text)
+		return
 	}
+	// Live-stream thinking through a stateful filter that strips the simulated
+	// transport envelope (fenced blocks + meta-prose) so the model's reasoning
+	// is visible without exposing the mechanism.
+	s.thinkingDelta(s.thinkingFilter.Feed(text))
+}
 
-	// Close any open blocks
-	if thinkingBlockOpen {
-		api.sendAnthropicSSE(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": blockIndex})
-		blockIndex++
+// closeThinkingForText ends the reasoning block before answer content follows.
+// A tool-enabled turn first releases whatever its filter still holds.
+func (s *anthropicStream) closeThinkingForText(hasTools bool) {
+	if hasTools && !s.thinkingClosed {
+		s.thinkingDelta(s.thinkingFilter.Flush())
+		s.thinkingClosed = true
 	}
-	if textBlockOpen {
-		api.sendAnthropicSSE(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": blockIndex})
-		blockIndex++
+	if s.thinkingOpen && !s.textOpen {
+		s.closeThinking()
 	}
+}
 
-	// Send tool_use content blocks if any (server-side tools from M365 backend or simulated)
-	toolCalls, _ := withoutBackendToolCalls(finalToolCalls, "")
-
-	// Append simulated tool calls
-	for _, stc := range simToolCalls {
-		toolCalls = append(toolCalls, client.ToolCall{
-			ID:       stc.ID,
-			Type:     "function",
-			Function: client.ToolCallFunction{Name: stc.Name, Namespace: stc.Namespace, Arguments: string(stc.Arguments)},
-		})
+// closeThinkingOnlyTurn releases the filtered reasoning of a turn that produced
+// nothing else, because no content chunk triggered the in-loop transition.
+func (s *anthropicStream) closeThinkingOnlyTurn(hasTools bool) {
+	if !hasTools || s.thinkingClosed {
+		return
 	}
+	s.thinkingDelta(s.thinkingFilter.Flush())
+	s.closeThinking()
+}
 
+// closeOpenBlocks ends whatever content block is still open.
+func (s *anthropicStream) closeOpenBlocks() {
+	if s.thinkingOpen {
+		s.event("content_block_stop", map[string]any{"type": "content_block_stop", "index": s.blockIndex})
+		s.blockIndex++
+	}
+	if s.textOpen {
+		s.event("content_block_stop", map[string]any{"type": "content_block_stop", "index": s.blockIndex})
+		s.blockIndex++
+	}
+}
+
+// emitToolUseBlocks writes each call as its own content block.
+//
+// Anthropic streaming delivers tool_use input as input_json_delta fragments,
+// not inside content_block_start. SDK clients (e.g. Claude Code) accumulate
+// partial_json and ignore any input in the start event, so the full arguments
+// must be sent as a delta or the client sees an empty input and loops.
+func (s *anthropicStream) emitToolUseBlocks(toolCalls []client.ToolCall) {
 	for _, tc := range toolCalls {
-		// Anthropic streaming delivers tool_use input as input_json_delta
-		// fragments, not inside content_block_start. SDK clients (e.g. Claude
-		// Code) accumulate partial_json and ignore any input in the start
-		// event, so the full arguments must be sent as a delta or the client
-		// sees an empty input and loops.
 		partialJSON := strings.TrimSpace(tc.Function.Arguments)
 		if partialJSON == "" {
 			partialJSON = "{}"
 		}
-		api.sendAnthropicSSE(w, "content_block_start", map[string]any{
+		s.event("content_block_start", map[string]any{
 			"type":  "content_block_start",
-			"index": blockIndex,
+			"index": s.blockIndex,
 			"content_block": map[string]any{
 				"type":  "tool_use",
 				"id":    tc.ID,
@@ -3105,28 +3081,79 @@ func (api *APIServer) streamAnthropicMessages(ctx context.Context, w http.Respon
 				"input": map[string]any{},
 			},
 		})
-		api.sendAnthropicSSE(w, "content_block_delta", map[string]any{
+		s.event("content_block_delta", map[string]any{
 			"type":  "content_block_delta",
-			"index": blockIndex,
+			"index": s.blockIndex,
 			"delta": map[string]any{
 				"type":         "input_json_delta",
 				"partial_json": partialJSON,
 			},
 		})
-		api.sendAnthropicSSE(w, "content_block_stop", map[string]any{
+		s.event("content_block_stop", map[string]any{
 			"type":  "content_block_stop",
-			"index": blockIndex,
+			"index": s.blockIndex,
 		})
-		blockIndex++
+		s.blockIndex++
 	}
-	flusher.Flush()
+	s.flusher.Flush()
+}
 
-	// Send message_delta event
+// chunk reads one upstream chunk of an Anthropic messages turn.
+func (s *anthropicStream) chunk(chunk client.StreamChunk, ch <-chan client.StreamChunk, maxTokens int, hasTools bool, stopWriter *stopSequenceWriter, sid string) streamLoopStep {
+	if chunk.Error != nil {
+		s.api.forgetSession(sid)
+		s.fail(chunk.Error)
+		return streamLoopFailed
+	}
+	if chunk.IsFinal {
+		s.convID = chunk.ConversationID
+		s.backendCalls = chunk.ToolCalls
+		return streamLoopStop
+	}
+
+	chunk.Text = s.api.routeGeneratedImages(chunk.Text)
+
+	// Handle thinking content
+	if chunk.Thinking != "" {
+		s.streamThinking(chunk.Thinking, hasTools)
+		return streamLoopContinue
+	}
+
+	// Transition from thinking to text before any content follows
+	s.closeThinkingForText(hasTools)
+
+	// Open text block on first text chunk (only if not buffering for tool calling)
+	if !hasTools {
+		s.openText()
+	}
+
+	// Check max_tokens limit before sending more content
+	if maxTokens > 0 && countTokens(s.fullText.String()) >= maxTokens {
+		s.truncated = true
+		drainStream(ch)
+		return streamLoopStop
+	}
+
+	// If tool calling is not enabled, stream text deltas directly. The writer
+	// decides what is safe to release, and it also feeds the accumulator, so
+	// the reported usage matches what the client received.
+	if !hasTools {
+		emit, _ := stopWriter.next(chunk.Text)
+		s.textDelta(emit)
+		return streamLoopContinue
+	}
+	s.fullText.WriteString(chunk.Text)
+	return streamLoopContinue
+}
+
+// finish writes message_delta with the stop reason and the output usage, then
+// message_stop.
+func (s *anthropicStream) finish(fullText string, toolCalls []client.ToolCall, matchedStop string) {
 	stopReason := "end_turn"
 	if matchedStop != "" {
 		stopReason = "stop_sequence"
 	}
-	if truncated {
+	if s.truncated {
 		stopReason = "max_tokens"
 		matchedStop = ""
 	}
@@ -3134,7 +3161,7 @@ func (api *APIServer) streamAnthropicMessages(ctx context.Context, w http.Respon
 		stopReason = "tool_use"
 		matchedStop = ""
 	}
-	msgDelta := map[string]any{
+	s.event("message_delta", map[string]any{
 		"type": "message_delta",
 		"delta": map[string]any{
 			"stop_reason":   stopReason,
@@ -3142,19 +3169,53 @@ func (api *APIServer) streamAnthropicMessages(ctx context.Context, w http.Respon
 		},
 		"usage": map[string]any{
 			"output_tokens":    countTokens(fullText) + outputProtocolTokens,
-			"reasoning_tokens": countTokens(thinkingText.String()),
+			"reasoning_tokens": countTokens(s.thinking.String()),
 			"usage_source":     usageSource(),
 		},
+	})
+	s.flusher.Flush()
+
+	s.event("message_stop", map[string]any{"type": "message_stop"})
+	s.flusher.Flush()
+}
+
+// anthropicToolCalls parses the simulated tool calls out of a buffered
+// tool-enabled turn. A turn with no tools streamed its text already and passes
+// through untouched, keeping the stop sequence its writer matched.
+func (api *APIServer) anthropicToolCalls(stream *anthropicStream, messages []payload.Message, cfg models.ModelConfig, tools []toolcalling.ToolDef, toolChoice string, stopSequences []string, hasTools, noParallel bool, matchedStop string) (string, []toolcalling.ToolCall, string) {
+	fullText := stream.fullText.String()
+	if !hasTools {
+		return fullText, nil, matchedStop
 	}
-	api.sendAnthropicSSE(w, "message_delta", msgDelta)
-	flusher.Flush()
 
-	api.storeSessionMapping(sid, finalConvID)
+	var simToolCalls []toolcalling.ToolCall
+	contracts := toolcalling.ContractsFor(tools).WithChoice(toolChoice).WithoutParallel(noParallel)
+	sim := toolcalling.ParseSimulatedResponseAnthropic(fullText, toolNamesFromDefs(tools), contracts)
+	sim = api.repairSimulatedToolCalls(toolLoopAnthropic, messages, cfg, tools, contracts, fullText, sim)
+	sim = dropSettledToolCalls(buildToolLedger(messages), toolChoice, sim)
+	switch {
+	case !sim.HasPayload:
+		fullText = toolcalling.WithholdTransportEnvelope(fullText)
+		if toolcalling.IsContentPolicyBlock(fullText) {
+			// The stream is already open, so the refusal cannot be turned into
+			// an HTTP error the way the non-streaming paths do.
+			logging.Warn("upstream content refusal on a streaming turn: M365 declined the request instead of answering")
+		}
+	case len(sim.ToolCalls) > 0:
+		simToolCalls = sim.ToolCalls
+		fullText = ""
+	default:
+		fullText = sim.Content
+	}
 
-	// Send message_stop event
-	msgStop := map[string]any{"type": "message_stop"}
-	api.sendAnthropicSSE(w, "message_stop", msgStop)
-	flusher.Flush()
+	fullText = replaceUnverifiedCompletionClaim(fullText, hasTools, buildToolLedger(messages), len(simToolCalls))
+	// A tool-enabled turn is buffered whole and emitted by the caller, so its
+	// stop sequence is applied here rather than through the writer.
+	if cut, matched := cutAtStopSequence(fullText, stopSequences); matched != "" {
+		fullText = cut
+		matchedStop = matched
+	}
+	return fullText, simToolCalls, matchedStop
 }
 
 // The session's conversation is already stored by runToolLoop, so this
