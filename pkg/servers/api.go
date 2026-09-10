@@ -5225,66 +5225,97 @@ func responsesStreamWithEmptyRetry(
 		}
 
 		for attempt := 0; ; attempt++ {
-			stream := call(ctx, conversationID)
-			sawVisibleChunk := false
-			sawFinal := false
-
-			for chunk := range stream {
-				if chunk.Error != nil {
-					emit(chunk)
-					return
-				}
-				if chunk.IsFinal {
-					sawFinal = true
-					if sawVisibleChunk || attempt >= len(retryDelays) {
-						emit(chunk)
-						return
-					}
-					break
-				}
-				if simulatedTransport {
-					// Simulated prompts can put the transport envelope in the
-					// upstream thinking channel. The Responses handler only
-					// needs raw text for its safe content extractor.
-					chunk.Thinking = ""
-				}
-				if chunk.Text == "" && chunk.Thinking == "" {
-					continue
-				}
-				sawVisibleChunk = true
-				if !emit(chunk) {
-					return
-				}
+			result := forwardResponsesAttempt(
+				call(ctx, conversationID),
+				emit,
+				simulatedTransport,
+				attempt >= len(retryDelays),
+			)
+			if result.stop {
+				return
 			}
-
-			if !sawFinal {
+			if !result.sawFinal {
 				if ctx.Err() == nil {
 					emit(client.StreamChunk{Error: client.ErrConnectionClosed})
 				}
 				return
 			}
-			if attempt >= len(retryDelays) {
-				return
-			}
-
-			logging.Warnf(
-				"Responses upstream stream completed empty; retrying attempt=%d/%d",
-				attempt+2,
-				len(retryDelays)+1,
-			)
-			if onRetry != nil {
-				onRetry()
-			}
-			if err := waitForResponsesEmptyRetry(
-				ctx,
-				retryDelays[attempt],
-			); err != nil {
+			if !prepareResponsesRetry(ctx, attempt, retryDelays, onRetry) {
 				return
 			}
 			conversationID = ""
 		}
 	}()
 	return output
+}
+
+// responsesAttempt is what one upstream attempt produced.
+type responsesAttempt struct {
+	// sawVisibleChunk records that the caller received answer content.
+	sawVisibleChunk bool
+	// sawFinal records that the upstream turn ended rather than the connection.
+	sawFinal bool
+	// stop means nothing further is owed to the caller.
+	stop bool
+}
+
+// visibleChunk reports whether a chunk carries anything the caller can show.
+func visibleChunk(chunk client.StreamChunk) bool {
+	return chunk.Text != "" || chunk.Thinking != ""
+}
+
+// forwardResponsesAttempt forwards one upstream attempt to the caller.
+//
+// lastAttempt makes an empty turn terminal rather than a reason to retry.
+func forwardResponsesAttempt(stream <-chan client.StreamChunk, emit func(client.StreamChunk) bool, simulatedTransport, lastAttempt bool) responsesAttempt {
+	var result responsesAttempt
+	for chunk := range stream {
+		if chunk.Error != nil {
+			emit(chunk)
+			result.stop = true
+			return result
+		}
+		if chunk.IsFinal {
+			result.sawFinal = true
+			if result.sawVisibleChunk || lastAttempt {
+				emit(chunk)
+				result.stop = true
+			}
+			return result
+		}
+		if simulatedTransport {
+			// Simulated prompts can put the transport envelope in the upstream
+			// thinking channel. The Responses handler only needs raw text for
+			// its safe content extractor.
+			chunk.Thinking = ""
+		}
+		if !visibleChunk(chunk) {
+			continue
+		}
+		result.sawVisibleChunk = true
+		if !emit(chunk) {
+			result.stop = true
+			return result
+		}
+	}
+	return result
+}
+
+// prepareResponsesRetry logs the retry, tells the caller it is happening and
+// waits out the backoff. It reports false when the turn must end instead.
+func prepareResponsesRetry(ctx context.Context, attempt int, retryDelays []time.Duration, onRetry func()) bool {
+	if attempt >= len(retryDelays) {
+		return false
+	}
+	logging.Warnf(
+		"Responses upstream stream completed empty; retrying attempt=%d/%d",
+		attempt+2,
+		len(retryDelays)+1,
+	)
+	if onRetry != nil {
+		onRetry()
+	}
+	return waitForResponsesEmptyRetry(ctx, retryDelays[attempt]) == nil
 }
 
 // newResponsesIdentity mints the id and the creation time of one Responses
@@ -6053,8 +6084,20 @@ func responsesGoalContinuationOpen(input any) bool {
 		return false
 	}
 
-	// Only the latest user item counts. A later user item without the marker
-	// is a new request, and its turn is not part of the earlier goal.
+	goalItem := latestGoalMarkerItem(items)
+	if goalItem < 0 {
+		return false
+	}
+
+	rest := items[goalItem+1:]
+	return !goalClosedAfter(rest, updateGoalCallIDs(rest))
+}
+
+// latestGoalMarkerItem reports the index of the user item that opened the goal.
+//
+// Only the latest user item counts. A later user item without the marker is a
+// new request, and its turn is not part of the earlier goal.
+func latestGoalMarkerItem(items []any) int {
 	goalItem := -1
 	for index, item := range items {
 		record, ok := item.(map[string]any)
@@ -6067,13 +6110,14 @@ func responsesGoalContinuationOpen(input any) bool {
 			goalItem = -1
 		}
 	}
-	if goalItem < 0 {
-		return false
-	}
+	return goalItem
+}
 
-	rest := items[goalItem+1:]
+// updateGoalCallIDs collects the ids of the update_goal calls made since the
+// goal opened, so their outputs can be told apart from every other tool result.
+func updateGoalCallIDs(items []any) map[string]bool {
 	updateGoalCalls := map[string]bool{}
-	for _, item := range rest {
+	for _, item := range items {
 		record, ok := item.(map[string]any)
 		if !ok {
 			continue
@@ -6089,8 +6133,13 @@ func responsesGoalContinuationOpen(input any) bool {
 			updateGoalCalls[callID] = true
 		}
 	}
+	return updateGoalCalls
+}
 
-	for _, item := range rest {
+// goalClosedAfter reports whether one of the update_goal outputs closed the
+// goal, which it does with a status of complete or blocked.
+func goalClosedAfter(items []any, updateGoalCalls map[string]bool) bool {
+	for _, item := range items {
 		record, ok := item.(map[string]any)
 		if !ok {
 			continue
@@ -6104,20 +6153,25 @@ func responsesGoalContinuationOpen(input any) bool {
 		if !updateGoalCalls[callID] {
 			continue
 		}
-		output, _ := record["output"].(string)
-		var report struct {
-			Goal struct {
-				Status string `json:"status"`
-			} `json:"goal"`
-		}
-		if json.Unmarshal([]byte(output), &report) != nil {
-			continue
-		}
-		if report.Goal.Status == "complete" || report.Goal.Status == "blocked" {
-			return false
+		if goalReportCloses(record["output"]) {
+			return true
 		}
 	}
-	return true
+	return false
+}
+
+// goalReportCloses reads the status out of one update_goal output.
+func goalReportCloses(rawOutput any) bool {
+	output, _ := rawOutput.(string)
+	var report struct {
+		Goal struct {
+			Status string `json:"status"`
+		} `json:"goal"`
+	}
+	if json.Unmarshal([]byte(output), &report) != nil {
+		return false
+	}
+	return report.Goal.Status == "complete" || report.Goal.Status == "blocked"
 }
 
 // responsesMessagePhase names the phase of an assistant message item. A turn
