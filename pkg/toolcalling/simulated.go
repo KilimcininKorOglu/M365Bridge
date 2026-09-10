@@ -439,14 +439,7 @@ func ParseSimulatedResponseAnthropic(text string, allowedToolNames []string, con
 // Anthropic message-shaped JSON object. Tool calls whose name is not in
 // `allowed` (when non-empty) are dropped.
 func parseAnthropicPayload(payload map[string]any, result *SimulatedResult, allowed map[string]bool, contracts ToolContracts) {
-	// stop_reason
-	if sr, ok := payload["stop_reason"].(string); ok && sr != "" {
-		if sr == "tool_use" {
-			result.FinishReason = "tool_calls"
-		} else {
-			result.FinishReason = "stop"
-		}
-	}
+	applyAnthropicStopReason(payload, result)
 
 	content, ok := payload["content"].([]any)
 	if !ok || len(content) == 0 {
@@ -457,6 +450,27 @@ func parseAnthropicPayload(payload map[string]any, result *SimulatedResult, allo
 		return
 	}
 
+	textParts := collectAnthropicBlocks(content, result, allowed, contracts)
+	finishAnthropicResult(result, textParts)
+}
+
+// applyAnthropicStopReason maps the Anthropic stop_reason onto the finish
+// reason this package reports.
+func applyAnthropicStopReason(payload map[string]any, result *SimulatedResult) {
+	sr, ok := payload["stop_reason"].(string)
+	if !ok || sr == "" {
+		return
+	}
+	if sr == "tool_use" {
+		result.FinishReason = "tool_calls"
+		return
+	}
+	result.FinishReason = "stop"
+}
+
+// collectAnthropicBlocks reads the content blocks, recording every accepted
+// tool_use on the result and returning the text blocks.
+func collectAnthropicBlocks(content []any, result *SimulatedResult, allowed map[string]bool, contracts ToolContracts) []string {
 	var textParts []string
 	for _, block := range content {
 		bm, ok := block.(map[string]any)
@@ -470,43 +484,58 @@ func parseAnthropicPayload(payload map[string]any, result *SimulatedResult, allo
 				textParts = append(textParts, t)
 			}
 		case "tool_use":
-			name, _ := bm["name"].(string)
-			if name == "" {
-				continue
-			}
-			if len(allowed) > 0 && !allowed[name] {
-				continue
-			}
-			// The model's own id is discarded. It tends to be a deterministic
-			// label such as call_istanbul_weather_001, which repeats across
-			// turns and makes clients reject a duplicate tool call id.
-			id := nextToolCallID()
-			// input is a JSON object in Anthropic format
-			var argsBytes []byte
-			if input, ok := bm["input"]; ok && input != nil {
-				argsBytes, _ = json.Marshal(input)
-			} else {
-				argsBytes = []byte("{}")
-			}
-			// Drop tool_use blocks that violate the tool's schema so the client
-			// never receives an unexecutable tool call to retry forever.
-			validated, reason, repairable := contracts.validate(name, json.RawMessage(argsBytes))
-			if reason != "" {
-				logging.Warnf("parseAnthropicPayload: dropping %q tool_use: %s", name, reason)
-				if repairable {
-					result.DroppedCalls = append(result.DroppedCalls, DroppedCall{Name: name, Reason: reason})
-				}
-				continue
-			}
-			argsBytes = validated
-			result.ToolCalls = append(result.ToolCalls, ToolCall{
-				ID:        id,
-				Name:      name,
-				Arguments: json.RawMessage(argsBytes),
-			})
+			appendAnthropicToolUse(bm, result, allowed, contracts)
 		}
 	}
+	return textParts
+}
 
+// anthropicToolInput renders a tool_use block's input, which is a JSON object
+// in Anthropic format, as call arguments.
+func anthropicToolInput(block map[string]any) []byte {
+	input, ok := block["input"]
+	if !ok || input == nil {
+		return []byte("{}")
+	}
+	argsBytes, _ := json.Marshal(input)
+	return argsBytes
+}
+
+// appendAnthropicToolUse records one tool_use block, or records why it was
+// dropped.
+func appendAnthropicToolUse(block map[string]any, result *SimulatedResult, allowed map[string]bool, contracts ToolContracts) {
+	name, _ := block["name"].(string)
+	if name == "" {
+		return
+	}
+	if len(allowed) > 0 && !allowed[name] {
+		return
+	}
+	// The model's own id is discarded. It tends to be a deterministic label
+	// such as call_istanbul_weather_001, which repeats across turns and makes
+	// clients reject a duplicate tool call id.
+	id := nextToolCallID()
+
+	// Drop tool_use blocks that violate the tool's schema so the client never
+	// receives an unexecutable tool call to retry forever.
+	validated, reason, repairable := contracts.validate(name, json.RawMessage(anthropicToolInput(block)))
+	if reason != "" {
+		logging.Warnf("parseAnthropicPayload: dropping %q tool_use: %s", name, reason)
+		if repairable {
+			result.DroppedCalls = append(result.DroppedCalls, DroppedCall{Name: name, Reason: reason})
+		}
+		return
+	}
+	result.ToolCalls = append(result.ToolCalls, ToolCall{
+		ID:        id,
+		Name:      name,
+		Arguments: json.RawMessage(validated),
+	})
+}
+
+// finishAnthropicResult settles the content and the finish reason once every
+// block has been read. A turn that produced a tool call carries no text.
+func finishAnthropicResult(result *SimulatedResult, textParts []string) {
 	if len(result.ToolCalls) > 0 {
 		result.Content = ""
 		result.FinishReason = "tool_calls"
