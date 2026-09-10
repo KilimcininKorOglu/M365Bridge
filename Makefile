@@ -7,7 +7,7 @@ DOCKER_GO   = docker run --rm -v "$(CURDIR)":/src -w /src -v $(CACHE):/gocache \
               -e GOCACHE=/gocache/build -e GOMODCACHE=/gocache/mod \
               -e GOTMPDIR=/gocache/tmp -e GOBIN=/gocache/bin
 
-.PHONY: help ui build check fmt test lint up down logs clean
+.PHONY: help ui build check fmt test lint up down logs clean cache
 
 help:
 	@echo "ui     Build the browser interface and embed it"
@@ -19,8 +19,11 @@ help:
 	@echo "down   Stop the container"
 
 # The cache directories must exist before they are mounted: go refuses to start
-# when GOTMPDIR points at a missing path.
-$(CACHE):
+# when GOTMPDIR points at a missing path. This is phony rather than a directory
+# target because the parent outlives its children: the system empties /tmp and
+# removes the empty tmp and bin subdirectories while build and mod keep content,
+# and a directory target would then see the parent and skip the recipe.
+cache:
 	@mkdir -p $(CACHE)/build $(CACHE)/mod $(CACHE)/tmp $(CACHE)/bin
 
 # go:embed cannot reach outside its own package directory, so the Vite output is
@@ -31,17 +34,17 @@ ui:
 	rm -rf pkg/webui/dist
 	cp -R web/dist pkg/webui/dist
 
-build: $(CACHE)
+build: cache
 	$(DOCKER_GO) -e CGO_ENABLED=0 $(GO_IMAGE) go build -o bin/m365-bridge ./cmd/cli
 
-fmt: $(CACHE)
+fmt: cache
 	$(DOCKER_GO) $(GO_IMAGE) gofmt -w cmd pkg
 
-test: $(CACHE)
+test: cache
 	$(DOCKER_GO) -e CGO_ENABLED=1 $(GO_IMAGE) sh -c \
 		'apk add --no-cache gcc musl-dev >/dev/null && go test ./... -count=1 -race'
 
-check: $(CACHE)
+check: cache
 	$(DOCKER_GO) -e CGO_ENABLED=1 $(GO_IMAGE) sh -c '\
 		apk add --no-cache gcc musl-dev git >/dev/null; \
 		echo "--- gofmt ---"; test -z "$$(gofmt -l cmd pkg)" || { gofmt -l cmd pkg; exit 1; }; \
