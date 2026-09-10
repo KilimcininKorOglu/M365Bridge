@@ -192,7 +192,9 @@ func (m *Manager) runTestsTool(ctx context.Context, name string, arguments map[s
 	return m.command(ctx, name, command, nil)
 }
 
-func (m *Manager) resolve(path string, create bool) (string, error) {
+// cleanRelativePath refuses an absolute path and a traversal, and normalizes
+// what is left. An empty path names the workspace root.
+func cleanRelativePath(path string) (string, error) {
 	if path == "" {
 		path = "."
 	}
@@ -203,22 +205,44 @@ func (m *Manager) resolve(path string, create bool) (string, error) {
 	if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
 		return "", errors.New("path traversal is not allowed")
 	}
+	return clean, nil
+}
+
+// existingAncestor walks up from a path that does not exist yet and returns the
+// nearest ancestor that does, because only an existing path can be resolved
+// through its symlinks.
+func existingAncestor(path string) (string, error) {
+	for {
+		if _, err := os.Lstat(path); err == nil {
+			return path, nil
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return "", err
+		}
+		parent := filepath.Dir(path)
+		if parent == path {
+			return "", errors.New("no existing parent")
+		}
+		path = parent
+	}
+}
+
+// resolve turns a caller-supplied path into a workspace path, and refuses one
+// that leaves the workspace or names a protected credential file. With create
+// set the path itself need not exist yet.
+func (m *Manager) resolve(path string, create bool) (string, error) {
+	clean, err := cleanRelativePath(path)
+	if err != nil {
+		return "", err
+	}
 	candidate := filepath.Join(m.workspace, clean)
+
 	check := candidate
 	if create {
-		for {
-			if _, err := os.Lstat(check); err == nil {
-				break
-			} else if !errors.Is(err, fs.ErrNotExist) {
-				return "", err
-			}
-			parent := filepath.Dir(check)
-			if parent == check {
-				return "", errors.New("no existing parent")
-			}
-			check = parent
+		if check, err = existingAncestor(candidate); err != nil {
+			return "", err
 		}
 	}
+
 	canonical, err := filepath.EvalSymlinks(check)
 	if err != nil {
 		return "", err
