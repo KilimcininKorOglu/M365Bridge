@@ -1995,7 +1995,7 @@ func (api *APIServer) runAnthropicToolLoop(w http.ResponseWriter, r *http.Reques
 		api.sendUpstreamError(w, "chat", err)
 		return
 	}
-	api.respondBufferedAnthropic(w, result, chatMessages, req.Model, sid, req.MaxTokens, req.Stream, req.Tools, anthropicToolChoiceEnforcement(req.ToolChoice), req.StopSequences)
+	api.respondBufferedAnthropic(w, result, chatMessages, req.Model, req.MaxTokens, req.Stream, req.Tools, anthropicToolChoiceEnforcement(req.ToolChoice), req.StopSequences)
 }
 
 // handleAnthropicComplete handles Anthropic complete (FIM) requests.
@@ -3133,7 +3133,9 @@ func (api *APIServer) streamAnthropicMessages(ctx context.Context, w http.Respon
 	flusher.Flush()
 }
 
-func (api *APIServer) respondBufferedAnthropic(w http.ResponseWriter, result toolLoopResult, messages []payload.Message, model, sid string, maxTokens int, stream bool, tools []toolcalling.ToolDef, toolChoice string, stopSequences []string) {
+// The session's conversation is already stored by runToolLoop, so this
+// responder takes no session id.
+func (api *APIServer) respondBufferedAnthropic(w http.ResponseWriter, result toolLoopResult, messages []payload.Message, model string, maxTokens int, stream bool, tools []toolcalling.ToolDef, toolChoice string, stopSequences []string) {
 	stopReason := "end_turn"
 	if len(result.toolCalls) > 0 {
 		stopReason = "tool_use"
@@ -5870,7 +5872,6 @@ func (api *APIServer) runResponsesToolLoop(w http.ResponseWriter, r *http.Reques
 		result,
 		messages,
 		cfg,
-		sid,
 		req.MaxOutputTokens,
 		req.Stream,
 		responsesToolTypes(toolPolicy.tools),
@@ -6392,7 +6393,9 @@ func buildResponsesObject(responseID string, createdAt int64, model, text, think
 	return resp
 }
 
-func (api *APIServer) respondBufferedResponses(w http.ResponseWriter, result toolLoopResult, messages []payload.Message, cfg models.ModelConfig, sid string, maxTokens int, stream bool, toolTypes map[string]string, goalOpen bool, tools []toolcalling.ToolDef, toolChoice string) {
+// The session's conversation is already stored by runToolLoop, so this
+// responder takes no session id.
+func (api *APIServer) respondBufferedResponses(w http.ResponseWriter, result toolLoopResult, messages []payload.Message, cfg models.ModelConfig, maxTokens int, stream bool, toolTypes map[string]string, goalOpen bool, tools []toolcalling.ToolDef, toolChoice string) {
 	if maxTokens > 0 {
 		if truncated, ok := truncateToTokens(result.text, maxTokens); ok {
 			result.text, result.finishReason = truncated, "length"

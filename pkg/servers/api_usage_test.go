@@ -160,7 +160,7 @@ func TestBufferedAnthropicMatchesTheChatPromptCount(t *testing.T) {
 	messages := usageProbeMessages()
 
 	rec := httptest.NewRecorder()
-	api.respondBufferedAnthropic(rec, bufferedProbeResult(), messages, "claude-sonnet-4", "", 0, false, nil, "", nil)
+	api.respondBufferedAnthropic(rec, bufferedProbeResult(), messages, "claude-sonnet-4", 0, false, nil, "", nil)
 
 	usage := decodeUsage(t, rec.Body.Bytes())
 	requireUsageSource(t, usage)
@@ -185,7 +185,7 @@ func TestBufferedResponsesMatchesTheChatPromptCount(t *testing.T) {
 	messages := usageProbeMessages()
 
 	rec := httptest.NewRecorder()
-	api.respondBufferedResponses(rec, bufferedProbeResult(), messages, models.ModelConfig{OpenAIID: "gpt-5.5"}, "", 0, false, nil, false, nil, "")
+	api.respondBufferedResponses(rec, bufferedProbeResult(), messages, models.ModelConfig{OpenAIID: "gpt-5.5"}, 0, false, nil, false, nil, "")
 
 	usage := decodeUsage(t, rec.Body.Bytes())
 	requireUsageSource(t, usage)
