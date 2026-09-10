@@ -3,6 +3,9 @@
 GO_IMAGE   := golang:1.26-alpine
 NODE_IMAGE := node:24-alpine
 CACHE      := /tmp/gocache-m365
+# Keep this on the version .github/workflows/ci.yml pins, or the local gate and
+# CI disagree over an idiom one of them does not know yet.
+MODERNIZE  := v0.23.0
 DOCKER_GO   = docker run --rm -v "$(CURDIR)":/src -w /src -v $(CACHE):/gocache \
               -e GOCACHE=/gocache/build -e GOMODCACHE=/gocache/mod \
               -e GOTMPDIR=/gocache/tmp -e GOBIN=/gocache/bin
@@ -55,7 +58,7 @@ check: cache
 		[ -x /gocache/bin/staticcheck ] || go install honnef.co/go/tools/cmd/staticcheck@v0.7.0; \
 		/gocache/bin/staticcheck ./...; \
 		echo "--- modernize ---"; \
-		go run golang.org/x/tools/gopls/internal/analysis/modernize/cmd/modernize@latest ./...'
+		go run golang.org/x/tools/gopls/internal/analysis/modernize/cmd/modernize@$(MODERNIZE) ./...'
 
 up:
 	docker compose up --build -d
