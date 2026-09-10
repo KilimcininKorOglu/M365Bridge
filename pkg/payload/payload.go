@@ -165,156 +165,138 @@ func (m *Message) appendImageURL(url string) {
 	}
 }
 
+// rawToolCall is one entry of the OpenAI tool_calls field as it arrives.
+type rawToolCall struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+}
+
+// rawMessage is the wire shape of a message before its content is decoded.
+// Content stays raw because it is a string on one request and an array of
+// content blocks on the next.
+type rawMessage struct {
+	Role       string          `json:"role"`
+	Content    json.RawMessage `json:"content"`
+	Name       string          `json:"name,omitempty"`
+	ToolCallID string          `json:"tool_call_id,omitempty"`
+	ToolCalls  []rawToolCall   `json:"tool_calls,omitempty"`
+}
+
+// isToolRole reports whether a message answers a tool call the caller made.
+func isToolRole(role, toolCallID string) bool {
+	return role == "tool" && toolCallID != ""
+}
+
 // UnmarshalJSON implements custom JSON unmarshaling for Message to handle
 // both string content and multimodal content arrays (OpenAI/Anthropic format).
 // It also converts tool-related messages (tool role, tool_calls, tool_result,
 // tool_use blocks) into plain text so the M365 backend can process them.
 func (m *Message) UnmarshalJSON(data []byte) error {
-	var raw struct {
-		Role       string          `json:"role"`
-		Content    json.RawMessage `json:"content"`
-		Name       string          `json:"name,omitempty"`
-		ToolCallID string          `json:"tool_call_id,omitempty"`
-		ToolCalls  []struct {
-			ID       string `json:"id"`
-			Type     string `json:"type"`
-			Function struct {
-				Name      string `json:"name"`
-				Arguments string `json:"arguments"`
-			} `json:"function"`
-		} `json:"tool_calls,omitempty"`
-	}
+	var raw rawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
 	}
 	m.Role = raw.Role
 	m.Name = raw.Name
 	m.ToolCallID = raw.ToolCallID
-	isToolRole := raw.Role == "tool" && raw.ToolCallID != ""
+	m.applyToolCalls(raw.ToolCalls)
+	return m.applyContent(raw.Content, isToolRole(raw.Role, raw.ToolCallID))
+}
 
-	// Handle OpenAI assistant messages with tool_calls field
-	if len(raw.ToolCalls) > 0 {
-		var sb strings.Builder
-		for _, tc := range raw.ToolCalls {
-			fmt.Fprintf(&sb, "[Previous Tool Call: %s]\nArguments: %s\n\n", tc.Function.Name, tc.Function.Arguments)
-			m.ToolCalls = append(m.ToolCalls, ToolCallRecord{
-				ID:        tc.ID,
-				Name:      tc.Function.Name,
-				Arguments: tc.Function.Arguments,
-			})
-		}
-		m.Content = strings.TrimSpace(sb.String())
+// applyToolCalls records an OpenAI assistant message's tool_calls field and
+// flattens it into the content text the backend reads.
+func (m *Message) applyToolCalls(calls []rawToolCall) {
+	if len(calls) == 0 {
+		return
 	}
-
-	if len(raw.Content) == 0 {
-		if isToolRole {
-			m.ToolResults = append(m.ToolResults, ToolResultRecord{ID: raw.ToolCallID})
-		}
-		return nil
+	var sb strings.Builder
+	for _, tc := range calls {
+		fmt.Fprintf(&sb, "[Previous Tool Call: %s]\nArguments: %s\n\n", tc.Function.Name, tc.Function.Arguments)
+		m.ToolCalls = append(m.ToolCalls, ToolCallRecord{
+			ID:        tc.ID,
+			Name:      tc.Function.Name,
+			Arguments: tc.Function.Arguments,
+		})
 	}
+	m.Content = strings.TrimSpace(sb.String())
+}
 
-	// Handle null content (e.g. assistant message with tool_calls and content=null)
-	if string(raw.Content) == "null" {
-		if isToolRole {
-			m.ToolResults = append(m.ToolResults, ToolResultRecord{ID: raw.ToolCallID})
-		}
+// applyContent decodes the content field, which is a string on one request and
+// an array of content blocks on the next.
+func (m *Message) applyContent(content json.RawMessage, toolRole bool) error {
+	// An absent content field and the null an assistant message with tool_calls
+	// carries both name a message that has no text of its own.
+	if len(content) == 0 || string(content) == "null" {
+		m.recordEmptyToolResult(toolRole)
 		return nil
 	}
 
 	// Try string content first
 	var s string
-	if err := json.Unmarshal(raw.Content, &s); err == nil {
-		m.Content = s
-		// Convert tool role messages to formatted text
-		if isToolRole {
-			m.ToolResults = append(m.ToolResults, ToolResultRecord{ID: raw.ToolCallID, Content: s})
-			m.Content = fmt.Sprintf("[Tool Result (call_id: %s)]\n%s", m.ToolCallID, s)
-		}
+	if err := json.Unmarshal(content, &s); err == nil {
+		m.applyStringContent(s, toolRole)
 		return nil
 	}
 
 	// Try array of content blocks
 	var blocks []map[string]any
-	if err := json.Unmarshal(raw.Content, &blocks); err != nil {
+	if err := json.Unmarshal(content, &blocks); err != nil {
 		return fmt.Errorf("content must be string or array of content blocks")
 	}
+	m.applyContentBlocks(blocks)
+	m.recordBlockToolResult(toolRole)
+	return nil
+}
 
+// recordEmptyToolResult keeps a tool role message's result record even when the
+// message carries no content, so the server still sees which call it answers.
+func (m *Message) recordEmptyToolResult(toolRole bool) {
+	if toolRole {
+		m.ToolResults = append(m.ToolResults, ToolResultRecord{ID: m.ToolCallID})
+	}
+}
+
+// recordBlockToolResult covers a tool role message whose content is a block
+// array carrying its result as text blocks rather than a tool_result block, so
+// the record is built from the accumulated text instead.
+func (m *Message) recordBlockToolResult(toolRole bool) {
+	if toolRole && len(m.ToolResults) == 0 {
+		m.ToolResults = append(m.ToolResults, ToolResultRecord{ID: m.ToolCallID, Content: m.Content})
+	}
+}
+
+// applyStringContent stores plain string content and converts a tool role
+// message into the formatted text the backend reads.
+func (m *Message) applyStringContent(s string, toolRole bool) {
+	m.Content = s
+	if toolRole {
+		m.ToolResults = append(m.ToolResults, ToolResultRecord{ID: m.ToolCallID, Content: s})
+		m.Content = fmt.Sprintf("[Tool Result (call_id: %s)]\n%s", m.ToolCallID, s)
+	}
+}
+
+// applyContentBlocks routes each multimodal content block to the reader for its
+// type. A type with no case names nothing this gateway can forward.
+func (m *Message) applyContentBlocks(blocks []map[string]any) {
 	for _, block := range blocks {
 		blockType, _ := block["type"].(string)
 		switch blockType {
 		case "text", "input_text", "output_text":
-			// The Responses API names the same block input_text on the way in
-			// and output_text on the way back.
-			if txt, ok := block["text"].(string); ok {
-				m.Content += txt
-			}
+			m.appendTextBlock(block)
 		case "input_image":
-			// Responses format: {"type":"input_image","image_url":"data:image/png;base64,..."}
-			// The url is a bare string here, not the object Chat Completions
-			// wraps it in. A file_id reference is not supported, because this
-			// gateway serves no Files API to resolve it against.
-			if url, ok := block["image_url"].(string); ok {
-				m.appendImageURL(url)
-			}
+			m.appendResponsesImageBlock(block)
 		case "image_url":
-			// OpenAI format: {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}
-			// The url may also be a remote https address, which the server
-			// layer fetches later because this package does no network I/O.
-			//
-			// Clients also send the url bare under this type, the way the
-			// Responses input_image block carries it. Both shapes name the same
-			// image, so both are read rather than one being dropped.
-			switch imgURL := block["image_url"].(type) {
-			case string:
-				m.appendImageURL(imgURL)
-			case map[string]any:
-				if url, ok := imgURL["url"].(string); ok {
-					m.appendImageURL(url)
-				}
-			}
+			m.appendChatImageBlock(block)
 		case "image":
-			// Anthropic format: {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "..."}}
-			if src, ok := block["source"].(map[string]any); ok {
-				if srcType, ok := src["type"].(string); ok && srcType == "base64" {
-					mediaType, _ := src["media_type"].(string)
-					base64Data, _ := src["data"].(string)
-					if base64Data != "" {
-						m.Images = append(m.Images, ImageData{
-							Base64:    base64Data,
-							MediaType: mediaType,
-							FileName:  "upload." + extFromMediaType(mediaType),
-						})
-					}
-				}
-			}
+			m.appendAnthropicImageBlock(block)
 		case "tool_use":
-			// Anthropic assistant message: previous tool call
-			name, _ := block["name"].(string)
-			id, _ := block["id"].(string)
-			input := block["input"]
-			arguments := ""
-			if inputBytes, err := json.Marshal(input); err == nil {
-				arguments = string(inputBytes)
-				m.Content += fmt.Sprintf("\n[Previous Tool Call: %s]\nArguments: %s\n", name, arguments)
-			}
-			m.ToolCalls = append(m.ToolCalls, ToolCallRecord{ID: id, Name: name, Arguments: arguments})
+			m.appendToolUseBlock(block)
 		case "tool_result":
-			// Anthropic user message: tool result
-			toolUseID, _ := block["tool_use_id"].(string)
-			resultContent := ""
-			if c, ok := block["content"].(string); ok {
-				resultContent = c
-			} else if cArr, ok := block["content"].([]any); ok {
-				for _, cItem := range cArr {
-					if cMap, ok := cItem.(map[string]any); ok {
-						if txt, ok := cMap["text"].(string); ok {
-							resultContent += txt
-						}
-					}
-				}
-			}
-			m.ToolResults = append(m.ToolResults, ToolResultRecord{ID: toolUseID, Content: resultContent})
-			m.Content += fmt.Sprintf("\n[Tool Result (call_id: %s)]\n%s\n", toolUseID, resultContent)
+			m.appendToolResultBlock(block)
 		case "input_file", "file", "input_audio", "audio":
 			// The M365 backend accepts image attachments only, so these blocks
 			// cannot be forwarded. They were already skipped by falling through
@@ -323,15 +305,109 @@ func (m *Message) UnmarshalJSON(data []byte) error {
 			logging.Debugf("Message.UnmarshalJSON: dropping unsupported %q content block", blockType)
 		}
 	}
+}
 
-	// A tool role message whose content is a block array carries its result as
-	// text blocks rather than a tool_result block, so the record is built from
-	// the accumulated text instead.
-	if isToolRole && len(m.ToolResults) == 0 {
-		m.ToolResults = append(m.ToolResults, ToolResultRecord{ID: raw.ToolCallID, Content: m.Content})
+// appendTextBlock appends a text block's text. The Responses API names the same
+// block input_text on the way in and output_text on the way back.
+func (m *Message) appendTextBlock(block map[string]any) {
+	if txt, ok := block["text"].(string); ok {
+		m.Content += txt
 	}
+}
 
-	return nil
+// appendResponsesImageBlock reads the Responses format
+// {"type":"input_image","image_url":"data:image/png;base64,..."}. The url is a
+// bare string here, not the object Chat Completions wraps it in. A file_id
+// reference is not supported, because this gateway serves no Files API to
+// resolve it against.
+func (m *Message) appendResponsesImageBlock(block map[string]any) {
+	if url, ok := block["image_url"].(string); ok {
+		m.appendImageURL(url)
+	}
+}
+
+// appendChatImageBlock reads the OpenAI format
+// {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}. The
+// url may also be a remote https address, which the server layer fetches later
+// because this package does no network I/O.
+//
+// Clients also send the url bare under this type, the way the Responses
+// input_image block carries it. Both shapes name the same image, so both are
+// read rather than one being dropped.
+func (m *Message) appendChatImageBlock(block map[string]any) {
+	switch imgURL := block["image_url"].(type) {
+	case string:
+		m.appendImageURL(imgURL)
+	case map[string]any:
+		if url, ok := imgURL["url"].(string); ok {
+			m.appendImageURL(url)
+		}
+	}
+}
+
+// appendAnthropicImageBlock reads the Anthropic format
+// {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "..."}}.
+func (m *Message) appendAnthropicImageBlock(block map[string]any) {
+	src, ok := block["source"].(map[string]any)
+	if !ok {
+		return
+	}
+	if srcType, ok := src["type"].(string); !ok || srcType != "base64" {
+		return
+	}
+	mediaType, _ := src["media_type"].(string)
+	base64Data, _ := src["data"].(string)
+	if base64Data == "" {
+		return
+	}
+	m.Images = append(m.Images, ImageData{
+		Base64:    base64Data,
+		MediaType: mediaType,
+		FileName:  "upload." + extFromMediaType(mediaType),
+	})
+}
+
+// appendToolUseBlock records an Anthropic assistant message's previous tool call.
+func (m *Message) appendToolUseBlock(block map[string]any) {
+	name, _ := block["name"].(string)
+	id, _ := block["id"].(string)
+	arguments := ""
+	if inputBytes, err := json.Marshal(block["input"]); err == nil {
+		arguments = string(inputBytes)
+		m.Content += fmt.Sprintf("\n[Previous Tool Call: %s]\nArguments: %s\n", name, arguments)
+	}
+	m.ToolCalls = append(m.ToolCalls, ToolCallRecord{ID: id, Name: name, Arguments: arguments})
+}
+
+// appendToolResultBlock records an Anthropic user message's tool result.
+func (m *Message) appendToolResultBlock(block map[string]any) {
+	toolUseID, _ := block["tool_use_id"].(string)
+	resultContent := toolResultText(block["content"])
+	m.ToolResults = append(m.ToolResults, ToolResultRecord{ID: toolUseID, Content: resultContent})
+	m.Content += fmt.Sprintf("\n[Tool Result (call_id: %s)]\n%s\n", toolUseID, resultContent)
+}
+
+// toolResultText reads a tool_result block's content, which is a string on one
+// request and an array of text blocks on the next.
+func toolResultText(content any) string {
+	if c, ok := content.(string); ok {
+		return c
+	}
+	cArr, ok := content.([]any)
+	if !ok {
+		return ""
+	}
+	var text strings.Builder
+	for _, cItem := range cArr {
+		cMap, ok := cItem.(map[string]any)
+		if !ok {
+			continue
+		}
+		if txt, ok := cMap["text"].(string); ok {
+			text.WriteString(txt)
+		}
+	}
+	return text.String()
 }
 
 // parseDataURL parses a data URL (data:image/png;base64,...) and returns ImageData.
@@ -489,6 +565,60 @@ func IsSystemRole(role string) bool {
 	return false
 }
 
+// carriesConversationText reports whether a message contributes a turn to the
+// flattened history. A system message is merged in separately and an empty one
+// names no turn.
+func carriesConversationText(message Message) bool {
+	return !IsSystemRole(message.Role) && strings.TrimSpace(message.Content) != ""
+}
+
+// lastConversationTurn returns the index of the final contributing message and
+// how many of them there are.
+func lastConversationTurn(messages []Message) (int, int) {
+	lastIndex, count := -1, 0
+	for index, message := range messages {
+		if !carriesConversationText(message) {
+			continue
+		}
+		lastIndex = index
+		count++
+	}
+	return lastIndex, count
+}
+
+// historyLabel names a role in the flattened history.
+func historyLabel(role string) string {
+	if label := strings.ToUpper(role); label != "TOOL" {
+		return label
+	}
+	return "TOOL RESULT"
+}
+
+// flattenConversation writes the whole history as one block of text, with the
+// message at lastIndex marked as the turn the model must answer.
+func flattenConversation(messages []Message, lastIndex int) string {
+	var flattened strings.Builder
+	flattened.WriteString("CLIENT-PROVIDED CONVERSATION HISTORY\n")
+	for index, message := range messages {
+		if !carriesConversationText(message) {
+			continue
+		}
+		if index == lastIndex {
+			flattened.WriteString("\nCURRENT USER MESSAGE\n")
+			flattened.WriteString(message.Content)
+			continue
+		}
+		flattened.WriteString(historyLabel(message.Role))
+		flattened.WriteString(": ")
+		flattened.WriteString(message.Content)
+		flattened.WriteString("\n")
+	}
+	return flattened.String()
+}
+
+// conversationTextForM365 renders the turn text the backend receives. Without
+// history that is the last message alone, because the backend tracks the rest
+// by conversation ID.
 func conversationTextForM365(messages []Message, includeHistory bool) string {
 	if len(messages) == 0 {
 		return ""
@@ -499,40 +629,11 @@ func conversationTextForM365(messages []Message, includeHistory bool) string {
 		return lastText
 	}
 
-	lastConversationIndex := -1
-	conversationCount := 0
-	for index, message := range messages {
-		if IsSystemRole(message.Role) || strings.TrimSpace(message.Content) == "" {
-			continue
-		}
-		lastConversationIndex = index
-		conversationCount++
-	}
+	lastConversationIndex, conversationCount := lastConversationTurn(messages)
 	if conversationCount <= 1 {
 		return lastText
 	}
-
-	var flattened strings.Builder
-	flattened.WriteString("CLIENT-PROVIDED CONVERSATION HISTORY\n")
-	for index, message := range messages {
-		if IsSystemRole(message.Role) || strings.TrimSpace(message.Content) == "" {
-			continue
-		}
-		if index == lastConversationIndex {
-			flattened.WriteString("\nCURRENT USER MESSAGE\n")
-			flattened.WriteString(message.Content)
-			continue
-		}
-		label := strings.ToUpper(message.Role)
-		if label == "TOOL" {
-			label = "TOOL RESULT"
-		}
-		flattened.WriteString(label)
-		flattened.WriteString(": ")
-		flattened.WriteString(message.Content)
-		flattened.WriteString("\n")
-	}
-	return flattened.String()
+	return flattenConversation(messages, lastConversationIndex)
 }
 
 // BuildConversationPayload constructs a chat request payload with conversation history.
