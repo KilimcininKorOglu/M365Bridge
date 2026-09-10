@@ -5753,162 +5753,167 @@ func responsesInputToMessages(input any) []payload.Message {
 		if !ok {
 			continue
 		}
-
-		itemType, _ := m["type"].(string)
-		if itemType == "compaction_trigger" {
-			continue
+		if message, ok := responsesInputItem(m); ok {
+			messages = append(messages, message)
 		}
-
-		// Handle function_call_output items (tool results). A custom tool
-		// reports its result the same way, only under its own item type and
-		// with the free-form field name.
-		if itemType == "custom_tool_call_output" {
-			callID, _ := m["call_id"].(string)
-			output, _ := m["output"].(string)
-			messages = append(messages, payload.Message{
-				Role: "tool",
-				Content: fmt.Sprintf(
-					"Authoritative tool result (call_id: %s):\n%s",
-					callID,
-					output,
-				),
-				ToolCallID:  callID,
-				ToolResults: []payload.ToolResultRecord{{ID: callID, Content: output}},
-			})
-			continue
-		}
-
-		if itemType == "custom_tool_call" {
-			name, _ := m["name"].(string)
-			input, _ := m["input"].(string)
-			callID, _ := m["call_id"].(string)
-			messages = append(messages, payload.Message{
-				Role:      "assistant",
-				Content:   fmt.Sprintf("Tool call: %s(%s)", name, input),
-				ToolCalls: []payload.ToolCallRecord{{ID: callID, Name: name, Arguments: input}},
-			})
-			continue
-		}
-
-		// A long-running client tool can report intermediate progress before it
-		// has a result. The item is transport metadata: it must reach the model
-		// as context but must never satisfy the pending call, or the loop would
-		// continue on an unfinished tool.
-		if itemType == "function_call_progress" {
-			callID, _ := m["call_id"].(string)
-			message, _ := m["message"].(string)
-			if strings.TrimSpace(callID) == "" || strings.TrimSpace(message) == "" {
-				logging.Debugf("responsesInputToMessages: dropping a function_call_progress item without call_id or message")
-				continue
-			}
-			phase, _ := m["phase"].(string)
-			if phase == "" {
-				phase = "running"
-			}
-			text := fmt.Sprintf("[Tool Progress (call_id: %s, phase: %s)]\n%s", callID, phase, message)
-			if output, _ := m["output"].(string); output != "" {
-				text += "\n" + output
-			}
-			// The role stays "user": a "tool" role would be flattened and
-			// counted as a result by the history and the evidence ledger.
-			messages = append(messages, payload.Message{Role: "user", Content: text, ToolProgress: true})
-			continue
-		}
-
-		if itemType == "function_call_output" {
-			callID, _ := m["call_id"].(string)
-			output, _ := m["output"].(string)
-			if output == "" && m["output"] != nil {
-				encoded, _ := json.Marshal(m["output"])
-				output = string(encoded)
-			}
-			messages = append(messages, payload.Message{
-				Role: "tool",
-				Content: fmt.Sprintf(
-					"Authoritative tool result (call_id: %s):\n%s",
-					callID,
-					output,
-				),
-				ToolCallID:  callID,
-				ToolResults: []payload.ToolResultRecord{{ID: callID, Content: output}},
-			})
-			continue
-		}
-
-		// Handle function_call items (assistant tool calls in input history)
-		if itemType == "function_call" {
-			name, _ := m["name"].(string)
-			namespace, _ := m["namespace"].(string)
-			args, _ := m["arguments"].(string)
-			callID, _ := m["call_id"].(string)
-			qualifiedName := name
-			if namespace != "" {
-				qualifiedName = namespace + "/" + name
-			}
-			messages = append(messages, payload.Message{
-				Role:      "assistant",
-				Content:   fmt.Sprintf("Tool call: %s(%s)", qualifiedName, args),
-				ToolCalls: []payload.ToolCallRecord{{ID: callID, Name: qualifiedName, Arguments: args}},
-			})
-			continue
-		}
-
-		// Handle reasoning items (skip, M365 generates its own)
-		if itemType == "reasoning" {
-			continue
-		}
-
-		if itemType == "tool_search_call" {
-			arguments, _ := json.Marshal(m["arguments"])
-			messages = append(messages, payload.Message{
-				Role:    "assistant",
-				Content: fmt.Sprintf("Tool search call: tool_search(%s)", string(arguments)),
-			})
-			continue
-		}
-
-		if itemType == "tool_search_output" {
-			toolsJSON, _ := json.Marshal(m["tools"])
-			messages = append(messages, payload.Message{
-				Role:    "tool",
-				Content: "tool_search_output: preserve these loaded tools with their exact namespace, name, and schema: " + string(toolsJSON),
-			})
-			continue
-		}
-
-		if itemType == "additional_tools" {
-			toolsJSON, _ := json.Marshal(m["tools"])
-			messages = append(messages, payload.Message{
-				Role:    "tool",
-				Content: "additional_tools: preserve these callable tools with their exact namespace, name, and schema: " + string(toolsJSON),
-			})
-			continue
-		}
-
-		if itemType == "compaction" {
-			summary, _ := m["encrypted_content"].(string)
-			if strings.TrimSpace(summary) != "" {
-				messages = append(messages, payload.Message{
-					Role:    "user",
-					Content: "Summary of the earlier conversation:\n" + summary,
-				})
-			}
-			continue
-		}
-
-		// Message items (type "message" or items with role)
-		role, _ := m["role"].(string)
-		if role == "" {
-			role = "user"
-		}
-
-		messages = append(messages, responsesContentMessage(role, m["content"]))
 	}
 
 	if len(messages) == 0 {
 		return []payload.Message{{Role: "user", Content: ""}}
 	}
 	return messages
+}
+
+// responsesInputItem converts one input item. An item type that contributes
+// nothing to the turn reports false.
+func responsesInputItem(m map[string]any) (payload.Message, bool) {
+	itemType, _ := m["type"].(string)
+	switch itemType {
+	case "compaction_trigger", "reasoning":
+		// A compaction trigger is a request rather than history, and M365
+		// generates its own reasoning.
+		return payload.Message{}, false
+	case "custom_tool_call_output", "function_call_output":
+		// A custom tool reports its result the same way as a function, only
+		// under its own item type.
+		return responsesToolResultMessage(m, itemType == "function_call_output"), true
+	case "custom_tool_call":
+		return responsesCustomToolCallMessage(m), true
+	case "function_call_progress":
+		return responsesToolProgressMessage(m)
+	case "function_call":
+		return responsesFunctionCallMessage(m), true
+	case "tool_search_call":
+		return responsesToolSearchCallMessage(m), true
+	case "tool_search_output", "additional_tools":
+		return responsesLoadedToolsMessage(itemType, m), true
+	case "compaction":
+		return responsesCompactionMessage(m)
+	}
+	return responsesPlainMessage(m), true
+}
+
+// responsesToolResultMessage reads a tool result item. encodeNonString covers
+// function_call_output, whose output may arrive as a structure rather than a
+// string; a custom tool always reports its result as text.
+func responsesToolResultMessage(m map[string]any, encodeNonString bool) payload.Message {
+	callID, _ := m["call_id"].(string)
+	output, _ := m["output"].(string)
+	if encodeNonString && output == "" && m["output"] != nil {
+		encoded, _ := json.Marshal(m["output"])
+		output = string(encoded)
+	}
+	return payload.Message{
+		Role: "tool",
+		Content: fmt.Sprintf(
+			"Authoritative tool result (call_id: %s):\n%s",
+			callID,
+			output,
+		),
+		ToolCallID:  callID,
+		ToolResults: []payload.ToolResultRecord{{ID: callID, Content: output}},
+	}
+}
+
+// responsesCustomToolCallMessage reads a custom tool call out of the history.
+func responsesCustomToolCallMessage(m map[string]any) payload.Message {
+	name, _ := m["name"].(string)
+	input, _ := m["input"].(string)
+	callID, _ := m["call_id"].(string)
+	return payload.Message{
+		Role:      "assistant",
+		Content:   fmt.Sprintf("Tool call: %s(%s)", name, input),
+		ToolCalls: []payload.ToolCallRecord{{ID: callID, Name: name, Arguments: input}},
+	}
+}
+
+// responsesToolProgressMessage reads an intermediate progress report.
+//
+// A long-running client tool can report progress before it has a result. The
+// item is transport metadata: it must reach the model as context but must never
+// satisfy the pending call, or the loop would continue on an unfinished tool.
+func responsesToolProgressMessage(m map[string]any) (payload.Message, bool) {
+	callID, _ := m["call_id"].(string)
+	message, _ := m["message"].(string)
+	if strings.TrimSpace(callID) == "" || strings.TrimSpace(message) == "" {
+		logging.Debugf("responsesInputToMessages: dropping a function_call_progress item without call_id or message")
+		return payload.Message{}, false
+	}
+	phase, _ := m["phase"].(string)
+	if phase == "" {
+		phase = "running"
+	}
+	text := fmt.Sprintf("[Tool Progress (call_id: %s, phase: %s)]\n%s", callID, phase, message)
+	if output, _ := m["output"].(string); output != "" {
+		text += "\n" + output
+	}
+	// The role stays "user": a "tool" role would be flattened and counted as a
+	// result by the history and the evidence ledger.
+	return payload.Message{Role: "user", Content: text, ToolProgress: true}, true
+}
+
+// responsesFunctionCallMessage reads an assistant tool call out of the history.
+func responsesFunctionCallMessage(m map[string]any) payload.Message {
+	name, _ := m["name"].(string)
+	namespace, _ := m["namespace"].(string)
+	args, _ := m["arguments"].(string)
+	callID, _ := m["call_id"].(string)
+	qualifiedName := name
+	if namespace != "" {
+		qualifiedName = namespace + "/" + name
+	}
+	return payload.Message{
+		Role:      "assistant",
+		Content:   fmt.Sprintf("Tool call: %s(%s)", qualifiedName, args),
+		ToolCalls: []payload.ToolCallRecord{{ID: callID, Name: qualifiedName, Arguments: args}},
+	}
+}
+
+// responsesToolSearchCallMessage reads a tool_search call out of the history.
+func responsesToolSearchCallMessage(m map[string]any) payload.Message {
+	arguments, _ := json.Marshal(m["arguments"])
+	return payload.Message{
+		Role:    "assistant",
+		Content: fmt.Sprintf("Tool search call: tool_search(%s)", string(arguments)),
+	}
+}
+
+// responsesLoadedToolsMessage preserves the tools a search or an explicit list
+// loaded, with the namespace and schema the client declared.
+func responsesLoadedToolsMessage(itemType string, m map[string]any) payload.Message {
+	toolsJSON, _ := json.Marshal(m["tools"])
+	if itemType == "additional_tools" {
+		return payload.Message{
+			Role:    "tool",
+			Content: "additional_tools: preserve these callable tools with their exact namespace, name, and schema: " + string(toolsJSON),
+		}
+	}
+	return payload.Message{
+		Role:    "tool",
+		Content: "tool_search_output: preserve these loaded tools with their exact namespace, name, and schema: " + string(toolsJSON),
+	}
+}
+
+// responsesCompactionMessage reads a compaction summary of the earlier turns.
+func responsesCompactionMessage(m map[string]any) (payload.Message, bool) {
+	summary, _ := m["encrypted_content"].(string)
+	if strings.TrimSpace(summary) == "" {
+		return payload.Message{}, false
+	}
+	return payload.Message{
+		Role:    "user",
+		Content: "Summary of the earlier conversation:\n" + summary,
+	}, true
+}
+
+// responsesPlainMessage reads a message item, which is any item that carries a
+// role rather than one of the tool item types.
+func responsesPlainMessage(m map[string]any) payload.Message {
+	role, _ := m["role"].(string)
+	if role == "" {
+		role = "user"
+	}
+	return responsesContentMessage(role, m["content"])
 }
 
 func responsesInputHasCompactionTrigger(input any) bool {
