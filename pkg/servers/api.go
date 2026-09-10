@@ -4419,55 +4419,8 @@ func newResponsesToolPolicy(tools []toolcalling.ToolDef, toolChoice any) (respon
 		tools:            tools,
 	}
 
-	switch choice := toolChoice.(type) {
-	case nil:
-		// Responses defaults to auto when tools are present.
-	case string:
-		normalized := strings.ToLower(strings.TrimSpace(choice))
-		switch normalized {
-		case "", "auto":
-		case "none":
-			policy.simulate = false
-			policy.promptChoice = "none"
-			policy.allowedToolNames = nil
-		case "required":
-			policy.required = true
-			policy.promptChoice = "required"
-		default:
-			if strings.EqualFold(choice, toolcalling.WebSearchToolName) {
-				// The backend performs the search itself, so the pin is
-				// satisfied by the answer rather than by a call.
-				break
-			}
-			if !knownNames[choice] {
-				return responsesToolPolicy{}, fmt.Errorf("invalid Responses tool_choice %q", choice)
-			}
-			policy.required = true
-			policy.requiredName = choice
-			policy.promptChoice = choice
-			policy.allowedToolNames = []string{choice}
-		}
-	case map[string]any:
-		name, _ := choice["name"].(string)
-		choiceType, _ := choice["type"].(string)
-		if name == "" {
-			if function, ok := choice["function"].(map[string]any); ok {
-				name, _ = function["name"].(string)
-			}
-		}
-		if name == "" && choiceType != "" && choiceType != "function" && choiceType != "custom" {
-			name = choiceType
-		}
-		name = strings.TrimSpace(name)
-		if name == "" || !knownNames[name] {
-			return responsesToolPolicy{}, fmt.Errorf("invalid Responses named tool_choice %q", name)
-		}
-		policy.required = true
-		policy.requiredName = name
-		policy.promptChoice = name
-		policy.allowedToolNames = []string{name}
-	default:
-		return responsesToolPolicy{}, fmt.Errorf("invalid Responses tool_choice type %T", toolChoice)
+	if err := policy.applyToolChoice(toolChoice, knownNames); err != nil {
+		return responsesToolPolicy{}, err
 	}
 
 	if policy.simulate && len(policy.allowedToolNames) == 0 {
@@ -4477,6 +4430,83 @@ func newResponsesToolPolicy(tools []toolcalling.ToolDef, toolChoice any) (respon
 		return responsesToolPolicy{}, errors.New("responses tool_choice requires at least one tool")
 	}
 	return policy, nil
+}
+
+// applyToolChoice narrows the policy to what tool_choice asked for. Responses
+// defaults to auto when tools are present, which is what a nil choice means.
+func (p *responsesToolPolicy) applyToolChoice(toolChoice any, knownNames map[string]bool) error {
+	switch choice := toolChoice.(type) {
+	case nil:
+		return nil
+	case string:
+		return p.applyStringChoice(choice, knownNames)
+	case map[string]any:
+		return p.applyNamedChoice(choice, knownNames)
+	}
+	return fmt.Errorf("invalid Responses tool_choice type %T", toolChoice)
+}
+
+// applyStringChoice reads the string form of tool_choice, which is either a
+// mode or the name of one tool.
+func (p *responsesToolPolicy) applyStringChoice(choice string, knownNames map[string]bool) error {
+	switch strings.ToLower(strings.TrimSpace(choice)) {
+	case "", "auto":
+		return nil
+	case "none":
+		p.simulate = false
+		p.promptChoice = "none"
+		p.allowedToolNames = nil
+		return nil
+	case "required":
+		p.required = true
+		p.promptChoice = "required"
+		return nil
+	}
+
+	if strings.EqualFold(choice, toolcalling.WebSearchToolName) {
+		// The backend performs the search itself, so the pin is satisfied by
+		// the answer rather than by a call.
+		return nil
+	}
+	if !knownNames[choice] {
+		return fmt.Errorf("invalid Responses tool_choice %q", choice)
+	}
+	p.pinTo(choice)
+	return nil
+}
+
+// applyNamedChoice reads the object form of tool_choice.
+func (p *responsesToolPolicy) applyNamedChoice(choice map[string]any, knownNames map[string]bool) error {
+	name := responsesChoiceName(choice)
+	if name == "" || !knownNames[name] {
+		return fmt.Errorf("invalid Responses named tool_choice %q", name)
+	}
+	p.pinTo(name)
+	return nil
+}
+
+// responsesChoiceName reads the tool name out of an object tool_choice, which
+// carries it under any of three keys depending on the client.
+func responsesChoiceName(choice map[string]any) string {
+	name, _ := choice["name"].(string)
+	choiceType, _ := choice["type"].(string)
+	if name == "" {
+		if function, ok := choice["function"].(map[string]any); ok {
+			name, _ = function["name"].(string)
+		}
+	}
+	if name == "" && choiceType != "" && choiceType != "function" && choiceType != "custom" {
+		name = choiceType
+	}
+	return strings.TrimSpace(name)
+}
+
+// pinTo requires the named tool and hides every other one from the prompt.
+func (p *responsesToolPolicy) pinTo(name string) {
+	p.required = true
+	p.requiredName = name
+	p.promptChoice = name
+	p.allowedToolNames = []string{name}
 }
 
 func responsesToolName(tool toolcalling.ToolDef) string {
@@ -4555,48 +4585,61 @@ func responsesToolDefsFromRawNamespace(raw any, inheritedNamespace string) []too
 		if !ok {
 			continue
 		}
-		toolType, _ := tool["type"].(string)
-		if toolType == "namespace" {
-			namespace, _ := tool["name"].(string)
-			if namespace == "" {
-				namespace = inheritedNamespace
-			}
-			definitions = append(
-				definitions,
-				responsesToolDefsFromRawNamespace(tool["tools"], namespace)...,
-			)
+		if toolType, _ := tool["type"].(string); toolType == "namespace" {
+			definitions = append(definitions, expandToolNamespace(tool, inheritedNamespace)...)
 			continue
 		}
-		name, _ := tool["name"].(string)
-		if name == "" && toolType != "" && toolType != "function" && toolType != "custom" {
-			name = toolType
-		}
-		if name == "" {
+		definition, ok := responsesToolDefFromRaw(tool, inheritedNamespace)
+		if !ok {
 			continue
-		}
-		namespace, _ := tool["namespace"].(string)
-		if namespace == "" {
-			namespace = inheritedNamespace
-		}
-		description, _ := tool["description"].(string)
-		definition := toolcalling.ToolDef{
-			Type:        toolType,
-			Name:        name,
-			Namespace:   namespace,
-			Description: description,
-		}
-		if parameters, ok := tool["parameters"].(map[string]any); ok {
-			definition.Parameters = parameters
-		}
-		if inputSchema, ok := tool["input_schema"].(map[string]any); ok {
-			definition.InputSchema = inputSchema
-		}
-		if nestedTools, ok := tool["tools"].([]any); ok {
-			definition.Tools = responsesToolDefsFromRawNamespace(nestedTools, namespace)
 		}
 		definitions = append(definitions, definition)
 	}
 	return definitions
+}
+
+// expandToolNamespace flattens a namespace entry, whose own name scopes every
+// tool it holds.
+func expandToolNamespace(tool map[string]any, inheritedNamespace string) []toolcalling.ToolDef {
+	namespace, _ := tool["name"].(string)
+	if namespace == "" {
+		namespace = inheritedNamespace
+	}
+	return responsesToolDefsFromRawNamespace(tool["tools"], namespace)
+}
+
+// responsesToolDefFromRaw reads one tool declaration. A declaration with no
+// usable name is not a tool this gateway can route a call to.
+func responsesToolDefFromRaw(tool map[string]any, inheritedNamespace string) (toolcalling.ToolDef, bool) {
+	toolType, _ := tool["type"].(string)
+	name, _ := tool["name"].(string)
+	if name == "" && toolType != "" && toolType != "function" && toolType != "custom" {
+		name = toolType
+	}
+	if name == "" {
+		return toolcalling.ToolDef{}, false
+	}
+	namespace, _ := tool["namespace"].(string)
+	if namespace == "" {
+		namespace = inheritedNamespace
+	}
+	description, _ := tool["description"].(string)
+	definition := toolcalling.ToolDef{
+		Type:        toolType,
+		Name:        name,
+		Namespace:   namespace,
+		Description: description,
+	}
+	if parameters, ok := tool["parameters"].(map[string]any); ok {
+		definition.Parameters = parameters
+	}
+	if inputSchema, ok := tool["input_schema"].(map[string]any); ok {
+		definition.InputSchema = inputSchema
+	}
+	if nestedTools, ok := tool["tools"].([]any); ok {
+		definition.Tools = responsesToolDefsFromRawNamespace(nestedTools, namespace)
+	}
+	return definition, true
 }
 
 func mergeLoadedResponsesTools(input any, tools []toolcalling.ToolDef) []toolcalling.ToolDef {
@@ -4620,15 +4663,23 @@ func mergeLoadedResponsesTools(input any, tools []toolcalling.ToolDef) []toolcal
 		if itemType != "tool_search_output" && itemType != "additional_tools" {
 			continue
 		}
-		for _, tool := range responsesToolDefsFromRaw(record["tools"]) {
-			name := responsesToolName(tool)
-			key := responsesToolKey(tool.Namespace, name)
-			if name == "" || seen[key] {
-				continue
-			}
-			seen[key] = true
-			tools = append(tools, tool)
+		tools = appendUnseenTools(tools, responsesToolDefsFromRaw(record["tools"]), seen)
+	}
+	return tools
+}
+
+// appendUnseenTools adds the declarations this request has not already seen,
+// keyed by namespace and name so two tools of the same name in different
+// namespaces both survive.
+func appendUnseenTools(tools, loaded []toolcalling.ToolDef, seen map[string]bool) []toolcalling.ToolDef {
+	for _, tool := range loaded {
+		name := responsesToolName(tool)
+		key := responsesToolKey(tool.Namespace, name)
+		if name == "" || seen[key] {
+			continue
 		}
+		seen[key] = true
+		tools = append(tools, tool)
 	}
 	return tools
 }
