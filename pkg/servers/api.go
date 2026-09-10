@@ -2105,55 +2105,32 @@ func (api *APIServer) nonStreamAnthropicComplete(w http.ResponseWriter, messages
 // data containing {"type":"completion","completion":"<delta>","stop_reason":null}.
 // The final event has stop_reason set and completion empty.
 func (api *APIServer) streamAnthropicComplete(ctx context.Context, w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, model string, maxTokens int, stopSequences []string, sid, convID string) {
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "close")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-
-	flusher, ok := w.(http.Flusher)
+	flusher, ok := api.beginSSE(w)
 	if !ok {
-		api.sendError(w, http.StatusInternalServerError, "Streaming not supported")
 		return
 	}
 
-	logID := fmt.Sprintf("cmpl_%s", uuid.New().String())
+	stream := &completeStream{
+		api:     api,
+		w:       w,
+		flusher: flusher,
+		model:   model,
+		logID:   fmt.Sprintf("cmpl_%s", uuid.New().String()),
+	}
 
 	// Send ping event (Anthropic streaming starts with ping)
-	pingData := map[string]any{"type": "ping"}
-	pingJSON, _ := json.Marshal(pingData)
+	pingJSON, _ := json.Marshal(map[string]any{"type": "ping"})
 	_, _ = fmt.Fprintf(w, "event: ping\ndata: %s\n\n", pingJSON)
 	flusher.Flush()
 
 	ch := api.m365Client.ChatConversationStreamGenContext(ctx, messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, false)
-
-	var fullTextBuilder strings.Builder
-	var thinkingText strings.Builder
-	truncated := false
 
 	// A stop sequence can straddle two chunks, so the deltas pass through a
 	// writer that holds back the tail which could still complete one. Without
 	// it the first half of the sequence would already be on the wire by the
 	// time the completion is known to have ended.
 	stopWriter := newStopSequenceWriter(stopSequences)
-	sendCompletionDelta := func(text string) {
-		if text == "" {
-			return
-		}
-		fullTextBuilder.WriteString(text)
-		compData := map[string]any{
-			"type":        "completion",
-			"completion":  text,
-			"stop_reason": nil,
-			"model":       model,
-			"log_id":      logID,
-		}
-		compJSON, _ := json.Marshal(compData)
-		_, _ = fmt.Fprintf(w, "event: completion\ndata: %s\n\n", compJSON)
-		flusher.Flush()
-	}
 
-	var finalConvID string
-	var finalToolCalls []client.ToolCall
 	keepalive := time.NewTicker(sseKeepaliveInterval)
 	defer keepalive.Stop()
 	for {
@@ -2161,61 +2138,25 @@ func (api *APIServer) streamAnthropicComplete(ctx context.Context, w http.Respon
 		if !more {
 			break
 		}
-		if chunk.Error != nil {
-			// The classification rather than the transport error, which names
-			// request URLs and credential file paths.
-			_, code, message := streamErrorFields("complete", chunk.Error)
-			errData := map[string]any{
-				"type":  "error",
-				"error": map[string]any{"type": code, "message": message},
-			}
-			errJSON, _ := json.Marshal(errData)
-			_, _ = fmt.Fprintf(w, "event: error\ndata: %s\n\n", errJSON)
-			flusher.Flush()
+		step := stream.chunk(chunk, ch, maxTokens, stopWriter)
+		if step == completeFailed {
 			return
 		}
-
-		if chunk.IsFinal {
-			finalConvID = chunk.ConversationID
-			finalToolCalls = chunk.ToolCalls
+		if step == completeStop {
 			break
 		}
-
-		chunk.Text = api.routeGeneratedImages(chunk.Text)
-
-		// The Complete wire format carries no thinking block, so reasoning is
-		// counted for the usage object but never emitted.
-		if chunk.Thinking != "" {
-			thinkingText.WriteString(chunk.Thinking)
-			continue
-		}
-
-		// Check max_tokens limit
-		if maxTokens > 0 && countTokens(fullTextBuilder.String()) >= maxTokens {
-			truncated = true
-			for range ch {
-			}
-			break
-		}
-
-		// Once a stop sequence is reached the writer releases nothing more, but
-		// the loop keeps reading so the final frame still names the
-		// conversation this turn belongs to.
-		emit, _ := stopWriter.next(chunk.Text)
-		sendCompletionDelta(emit)
 	}
-	_ = finalToolCalls
+
 	// Whatever the writer held back belongs to the answer when no stop sequence
 	// ever arrived.
-	sendCompletionDelta(stopWriter.flush())
-	fullText := fullTextBuilder.String()
+	stream.delta(stopWriter.flush())
 
 	// Determine stop reason
 	stopReason := "end_turn"
 	if stopWriter.stoppedEarly() {
 		stopReason = "stop_sequence"
 	}
-	if truncated {
+	if stream.truncated {
 		stopReason = "max_tokens"
 	}
 
@@ -2226,17 +2167,128 @@ func (api *APIServer) streamAnthropicComplete(ctx context.Context, w http.Respon
 		"stop_reason": stopReason,
 		"model":       model,
 		"stop":        nullableString(stopWriter.matched()),
-		"log_id":      logID,
+		"log_id":      stream.logID,
 		// The intermediate events carry deltas, so usage belongs on the last
 		// one. The legacy Complete format defines no such field; it is reported
 		// so a caller reads the same counts here as on every other endpoint.
-		"usage": anthropicUsage(messages, nil, "", fullText, thinkingText.String()),
+		"usage": anthropicUsage(messages, nil, "", stream.fullText.String(), stream.thinking.String()),
 	}
-	api.storeSessionMapping(sid, finalConvID)
+	api.storeSessionMapping(sid, stream.convID)
 
 	finalJSON, _ := json.Marshal(finalData)
 	_, _ = fmt.Fprintf(w, "event: completion\ndata: %s\n\n", finalJSON)
 	flusher.Flush()
+}
+
+// beginSSE writes the event-stream headers and reports the flusher every
+// streaming responder needs. ok is false when the request has already been
+// answered, which happens when the writer cannot flush.
+func (api *APIServer) beginSSE(w http.ResponseWriter) (http.Flusher, bool) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "close")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		api.sendError(w, http.StatusInternalServerError, "Streaming not supported")
+		return nil, false
+	}
+	return flusher, true
+}
+
+// drainStream reads the rest of an upstream turn, so its goroutine finishes
+// rather than blocking on a channel nobody reads.
+func drainStream(ch <-chan client.StreamChunk) {
+	for range ch {
+	}
+}
+
+// completeStreamStep says what the Complete stream loop does next.
+type completeStreamStep int
+
+const (
+	// completeContinue keeps reading chunks.
+	completeContinue completeStreamStep = iota
+	// completeStop ends the turn and writes its final event.
+	completeStop
+	// completeFailed means the error event was already written.
+	completeFailed
+)
+
+// completeStream carries what one legacy Complete turn accumulates.
+type completeStream struct {
+	api     *APIServer
+	w       http.ResponseWriter
+	flusher http.Flusher
+	model   string
+	logID   string
+
+	fullText  strings.Builder
+	thinking  strings.Builder
+	truncated bool
+	convID    string
+}
+
+// delta writes one completion event and records the text it carried.
+func (s *completeStream) delta(text string) {
+	if text == "" {
+		return
+	}
+	s.fullText.WriteString(text)
+	compJSON, _ := json.Marshal(map[string]any{
+		"type":        "completion",
+		"completion":  text,
+		"stop_reason": nil,
+		"model":       s.model,
+		"log_id":      s.logID,
+	})
+	_, _ = fmt.Fprintf(s.w, "event: completion\ndata: %s\n\n", compJSON)
+	s.flusher.Flush()
+}
+
+// chunk reads one upstream chunk of a Complete turn.
+func (s *completeStream) chunk(chunk client.StreamChunk, ch <-chan client.StreamChunk, maxTokens int, stopWriter *stopSequenceWriter) completeStreamStep {
+	if chunk.Error != nil {
+		// The classification rather than the transport error, which names
+		// request URLs and credential file paths.
+		_, code, message := streamErrorFields("complete", chunk.Error)
+		errJSON, _ := json.Marshal(map[string]any{
+			"type":  "error",
+			"error": map[string]any{"type": code, "message": message},
+		})
+		_, _ = fmt.Fprintf(s.w, "event: error\ndata: %s\n\n", errJSON)
+		s.flusher.Flush()
+		return completeFailed
+	}
+
+	if chunk.IsFinal {
+		s.convID = chunk.ConversationID
+		return completeStop
+	}
+
+	chunk.Text = s.api.routeGeneratedImages(chunk.Text)
+
+	// The Complete wire format carries no thinking block, so reasoning is
+	// counted for the usage object but never emitted.
+	if chunk.Thinking != "" {
+		s.thinking.WriteString(chunk.Thinking)
+		return completeContinue
+	}
+
+	// Check max_tokens limit
+	if maxTokens > 0 && countTokens(s.fullText.String()) >= maxTokens {
+		s.truncated = true
+		drainStream(ch)
+		return completeStop
+	}
+
+	// Once a stop sequence is reached the writer releases nothing more, but the
+	// loop keeps reading so the final frame still names the conversation this
+	// turn belongs to.
+	emit, _ := stopWriter.next(chunk.Text)
+	s.delta(emit)
+	return completeContinue
 }
 
 // streamChatCompletions streams chat completion responses in OpenAI format.
@@ -3497,57 +3549,21 @@ func (api *APIServer) nonStreamCompletions(w http.ResponseWriter, messages []pay
 
 	toolCalls, finishReason = withoutBackendToolCalls(toolCalls, finishReason)
 
-	// Parse simulated tool calls from response text
+	// Parse simulated tool calls from response text. Completions declares no
+	// parallel_tool_calls field, so parallel calls stay allowed here.
 	if hasTools {
-		contracts := toolcalling.ContractsFor(tools).WithChoice(toolChoice)
-		sim := toolcalling.ParseSimulatedResponse(respText, toolNamesFromDefs(tools), contracts)
-		sim = api.repairSimulatedToolCalls(toolLoopOpenAI, messages, cfg, tools, contracts, respText, sim)
-		sim = dropSettledToolCalls(buildToolLedger(messages), toolChoice, sim)
-		if sim.HasPayload {
-			if len(sim.ToolCalls) > 0 {
-				finishReason = "tool_calls"
-				for _, pc := range sim.ToolCalls {
-					toolCalls = append(toolCalls, client.ToolCall{
-						ID:       pc.ID,
-						Type:     "function",
-						Function: client.ToolCallFunction{Name: pc.Name, Namespace: pc.Namespace, Arguments: string(pc.Arguments)},
-					})
-				}
-				respText = ""
-			} else {
-				respText = sim.Content
-				finishReason = "stop"
-			}
-		} else {
-			finishReason = "stop"
-			respText = toolcalling.WithholdTransportEnvelope(respText)
-		}
+		respText, toolCalls, finishReason = api.applySimulatedToolCalls(
+			toolLoopOpenAI, messages, cfg, tools, toolChoice, false, respText, toolCalls,
+		)
 	}
 
 	if blockedByContentPolicy(respText, toolCalls) {
-		if sid != "" {
-			api.ctxCache.Delete(sessionKeyPrefix + sid)
-		}
+		api.forgetSession(sid)
 		api.sendContentBlockedError(w, respText)
 		return
 	}
 	respText = withoutUnverifiedCompletionClaim(respText, hasTools, buildToolLedger(messages), toolCalls)
-
-	// A stop sequence ends the answer where the caller said it ends. OpenAI
-	// reports that as the ordinary "stop", the same as an answer that ended on
-	// its own, so only the text changes.
-	if cut, matched := cutAtStopSequence(respText, stopSequences); matched != "" {
-		respText = cut
-		finishReason = "stop"
-	}
-
-	// Enforce max_tokens on response text
-	if maxTokens > 0 {
-		if truncated, ok := truncateToTokens(respText, maxTokens); ok {
-			respText = truncated
-			finishReason = "length"
-		}
-	}
+	respText, finishReason = cutChatAnswer(respText, finishReason, stopSequences, maxTokens)
 
 	promptTok := countPromptTokens(messages, tools, toolChoice)
 	completionTok := countTokens(respText) + outputProtocolTokens
