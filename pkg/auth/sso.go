@@ -286,27 +286,63 @@ func nextLocation(resp *http.Response) (string, error) {
 		ErrRefreshFailed, resp.StatusCode, textcut.Truncate(bodyStr, 2000))
 }
 
-// authCodeFromRedirect reads the authorization code out of a redirect target.
-// response_mode=fragment puts the code in the fragment rather than the query,
-// and reports a refused sign-in there too. An empty code with no error means
-// this redirect is not the last one.
-func authCodeFromRedirect(location string) (string, error) {
+// redirectOutcome is what one sign-in redirect carried. An empty Code with
+// Failed unset means this redirect is not the last one.
+type redirectOutcome struct {
+	Code    string
+	Failed  bool
+	ErrCode string
+	ErrDesc string
+}
+
+// redirectOutcomeFrom reads a redirect target. response_mode=fragment puts the
+// authorization code in the fragment rather than the query, and reports a
+// refused sign-in there too.
+func redirectOutcomeFrom(location string) (redirectOutcome, error) {
 	locURL, err := url.Parse(location)
 	if err != nil {
-		return "", fmt.Errorf("%w: failed to parse redirect URL: %v", ErrRefreshFailed, err)
+		return redirectOutcome{}, err
 	}
 	if code := locURL.Query().Get("code"); code != "" {
-		return code, nil
+		return redirectOutcome{Code: code}, nil
 	}
 	if locURL.Fragment == "" {
-		return "", nil
+		return redirectOutcome{}, nil
 	}
 	fragParams, _ := url.ParseQuery(locURL.Fragment)
 	if code := fragParams.Get("code"); code != "" {
-		return code, nil
+		return redirectOutcome{Code: code}, nil
 	}
-	return "", fmt.Errorf("%w: authorize returned error: %s: %s", ErrRefreshFailed,
-		fragParams.Get("error"), fragParams.Get("error_description"))
+	return redirectOutcome{
+		Failed:  true,
+		ErrCode: fragParams.Get("error"),
+		ErrDesc: fragParams.Get("error_description"),
+	}, nil
+}
+
+// authCodeFromRedirect reads the authorization code of the SSO sign-in flow.
+func authCodeFromRedirect(location string) (string, error) {
+	outcome, err := redirectOutcomeFrom(location)
+	if err != nil {
+		return "", fmt.Errorf("%w: failed to parse redirect URL: %v", ErrRefreshFailed, err)
+	}
+	if outcome.Failed {
+		return "", fmt.Errorf("%w: authorize returned error: %s: %s", ErrRefreshFailed, outcome.ErrCode, outcome.ErrDesc)
+	}
+	return outcome.Code, nil
+}
+
+// brokerAuthCodeFromRedirect reads the authorization code of the broker sign-in
+// flow, which reports its failures on its own contract.
+func brokerAuthCodeFromRedirect(location string) (string, error) {
+	outcome, err := redirectOutcomeFrom(location)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse broker redirect URL: %w", err)
+	}
+	if outcome.Failed {
+		return "", fmt.Errorf("broker authorize error: %s: %s", outcome.ErrCode, outcome.ErrDesc)
+	}
+	return outcome.Code, nil
 }
 
 // followSSORedirects walks the sign-in redirects by hand until one carries the
@@ -809,40 +845,17 @@ func (tm *TokenManager) acquireBrokerRefreshTokenViaSSO() (string, error) {
 		logging.Errorf("acquireBrokerRefreshTokenViaSSO: no SSO cookies: %v", err)
 		return "", fmt.Errorf("no SSO cookies for broker authorize: %w", err)
 	}
-
-	var cookieParts []string
-	for _, c := range store.Cookies {
-		cookieParts = append(cookieParts, c.Name+"="+c.Value)
-	}
-	cookieHeader := strings.Join(cookieParts, "; ")
+	cookieHeader := cookieHeaderFrom(store.Cookies)
 
 	verifier, challenge, err := generatePKCE()
 	if err != nil {
 		return "", fmt.Errorf("PKCE failed: %w", err)
 	}
 
-	// Broker authorize URL with PKCE and brk_ params
-	params := url.Values{
-		"client_id":             {brokerClientID},
-		"response_type":         {"code"},
-		"redirect_uri":          {designerBrokerRedirectURI},
-		"scope":                 {designerBrokerScope},
-		"response_mode":         {"fragment"},
-		"code_challenge":        {challenge},
-		"code_challenge_method": {"S256"},
-		"brk_client_id":         {designerClientID},
-		"brk_redirect_uri":      {defaultRedirectURI},
-		"sso_reload":            {"True"},
-	}
-
-	authorizeURL := fmt.Sprintf(authorizeURLTemplate, tm.tenant)
-	authReq, err := http.NewRequest("GET", authorizeURL+"?"+params.Encode(), nil)
+	authReq, err := brokerBrowserRequest(tm.brokerAuthorizeTarget(challenge), "", cookieHeader)
 	if err != nil {
 		return "", fmt.Errorf("failed to create broker authorize request: %w", err)
 	}
-	authReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
-	authReq.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-	authReq.Header.Set("Cookie", cookieHeader)
 
 	httpClient := &http.Client{
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -857,73 +870,109 @@ func (tm *TokenManager) acquireBrokerRefreshTokenViaSSO() (string, error) {
 	}
 	defer func() { _ = currentResp.Body.Close() }()
 
-	// Follow redirects manually until we get the auth code or reach brk_redirect_uri.
-	// Microsoft AAD may return intermediate redirects (e.g. /jsdisabled, /kmsi)
-	// before the final redirect to spalanding#code=..., especially in headless/Docker
-	// environments where JS is not available.
-	const maxRedirects = 10
-	for i := range maxRedirects {
-		location := currentResp.Header.Get("Location")
-		if location == "" {
-			body, _ := io.ReadAll(io.LimitReader(currentResp.Body, authPageMax+1))
-			if len(body) > authPageMax {
-				logging.Warnf("sign-in page exceeds %d bytes; a meta refresh past the cap is not followed", authPageMax)
-				body = body[:authPageMax]
-			}
-			bodyStr := string(body)
-			// Check for meta refresh redirect in HTML (AAD sometimes uses this)
-			if metaURL := extractMetaRefreshURL(bodyStr); metaURL != "" {
-				location = metaURL
-			} else {
-				return "", fmt.Errorf("no redirect from broker authorize (status %d, hop %d): %s", currentResp.StatusCode, i, summarizeBrokerAuthorizeResponse(bodyStr))
-			}
-		}
+	authCode, err := followBrokerRedirects(httpClient, currentResp, cookieHeader)
+	if err != nil {
+		return "", err
+	}
 
+	logging.Info("acquireBrokerRefreshTokenViaSSO: obtained auth code, exchanging for broker tokens")
+	return tm.exchangeBrokerAuthCode(authCode, verifier)
+}
+
+// brokerAuthorizeTarget builds the broker authorize URL with PKCE and the brk_
+// parameters. The broker flow needs the brk-multihub:// redirect URI, which is
+// why the standard token cannot be reused for it.
+func (tm *TokenManager) brokerAuthorizeTarget(challenge string) string {
+	params := url.Values{
+		"client_id":             {brokerClientID},
+		"response_type":         {"code"},
+		"redirect_uri":          {designerBrokerRedirectURI},
+		"scope":                 {designerBrokerScope},
+		"response_mode":         {"fragment"},
+		"code_challenge":        {challenge},
+		"code_challenge_method": {"S256"},
+		"brk_client_id":         {designerClientID},
+		"brk_redirect_uri":      {defaultRedirectURI},
+		"sso_reload":            {"True"},
+	}
+	return fmt.Sprintf(authorizeURLTemplate, tm.tenant) + "?" + params.Encode()
+}
+
+// brokerBrowserRequest builds a GET the broker sign-in flow accepts. referer is
+// empty on the authorize request and names the sign-in host on each redirect,
+// which is what the flow itself sends.
+func brokerBrowserRequest(target, referer, cookieHeader string) (*http.Request, error) {
+	req, err := http.NewRequest("GET", target, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	if referer != "" {
+		req.Header.Set("Referer", referer)
+	}
+	req.Header.Set("Cookie", cookieHeader)
+	return req, nil
+}
+
+// brokerNextLocation reports where the broker sign-in flow goes next. AAD
+// sometimes redirects with a meta refresh in the page rather than a header.
+func brokerNextLocation(resp *http.Response, hop int) (string, error) {
+	if location := resp.Header.Get("Location"); location != "" {
+		return location, nil
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, authPageMax+1))
+	if len(body) > authPageMax {
+		logging.Warnf("sign-in page exceeds %d bytes; a meta refresh past the cap is not followed", authPageMax)
+		body = body[:authPageMax]
+	}
+	bodyStr := string(body)
+	if metaURL := extractMetaRefreshURL(bodyStr); metaURL != "" {
+		return metaURL, nil
+	}
+	return "", fmt.Errorf("no redirect from broker authorize (status %d, hop %d): %s",
+		resp.StatusCode, hop, summarizeBrokerAuthorizeResponse(bodyStr))
+}
+
+// followBrokerRedirects walks the broker sign-in redirects until one carries
+// the authorization code.
+//
+// Microsoft AAD may return intermediate redirects (e.g. /jsdisabled, /kmsi)
+// before the final redirect to spalanding#code=..., especially in
+// headless/Docker environments where JS is not available.
+func followBrokerRedirects(client *http.Client, resp *http.Response, cookieHeader string) (string, error) {
+	const maxRedirects = 10
+	current := resp
+	for i := range maxRedirects {
+		location, err := brokerNextLocation(current, i)
+		if err != nil {
+			return "", err
+		}
 		logging.Debugf("acquireBrokerRefreshTokenViaSSO: redirect hop %d -> %s", i, location[:min(120, len(location))])
 
-		// Check if this is the final redirect with auth code (brk_redirect_uri = spalanding)
+		// The final redirect is brk_redirect_uri, which is on the M365 host.
 		if strings.Contains(location, "m365.cloud.microsoft") {
-			locURL, err := url.Parse(location)
-			if err != nil {
-				return "", fmt.Errorf("failed to parse broker redirect URL: %w", err)
-			}
-
-			authCode := locURL.Query().Get("code")
-			if authCode == "" {
-				// Check for code in fragment (response_mode=fragment)
-				fragment := locURL.Fragment
-				if fragment != "" {
-					fragParams, _ := url.ParseQuery(fragment)
-					authCode = fragParams.Get("code")
-					if authCode == "" {
-						errCode := fragParams.Get("error")
-						errDesc := fragParams.Get("error_description")
-						return "", fmt.Errorf("broker authorize error: %s: %s", errCode, errDesc)
-					}
-				}
+			authCode, codeErr := brokerAuthCodeFromRedirect(location)
+			if codeErr != nil {
+				return "", codeErr
 			}
 			if authCode != "" {
-				logging.Info("acquireBrokerRefreshTokenViaSSO: obtained auth code, exchanging for broker tokens")
-				return tm.exchangeBrokerAuthCode(authCode, verifier)
+				return authCode, nil
 			}
 		}
 
 		// Follow the redirect, forwarding SSO cookies
-		redirectReq, err := http.NewRequest("GET", location, nil)
+		redirectReq, err := brokerBrowserRequest(location, "https://login.microsoftonline.com/", cookieHeader)
 		if err != nil {
 			return "", fmt.Errorf("failed to create broker redirect request (hop %d): %w", i, err)
 		}
-		redirectReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
-		redirectReq.Header.Set("Referer", "https://login.microsoftonline.com/")
-		redirectReq.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-		redirectReq.Header.Set("Cookie", cookieHeader)
 
-		_ = currentResp.Body.Close()
-		currentResp, err = httpClient.Do(redirectReq)
+		_ = current.Body.Close()
+		current, err = client.Do(redirectReq)
 		if err != nil && !strings.Contains(err.Error(), "ErrUseLastResponse") {
 			return "", fmt.Errorf("broker redirect request failed (hop %d): %w", i, err)
 		}
-		defer func() { _ = currentResp.Body.Close() }()
+		defer func() { _ = current.Body.Close() }()
 	}
 
 	return "", fmt.Errorf("broker authorize: max redirects (%d) reached without obtaining auth code", maxRedirects)
