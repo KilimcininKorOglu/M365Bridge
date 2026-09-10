@@ -170,66 +170,85 @@ func validateNode(value any, schema map[string]any, path string) error {
 		return err
 	}
 
-	switch schemaType(schema) {
+	declared := schemaType(schema)
+	switch declared {
 	case "object":
-		object, ok := value.(map[string]any)
-		if !ok {
-			return fmt.Errorf("%s must be an object", path)
-		}
-		return validateObject(object, schema, path)
+		return validateObjectNode(value, schema, path)
 	case "array":
-		items, ok := value.([]any)
-		if !ok {
-			return fmt.Errorf("%s must be an array", path)
-		}
-		itemSchema, _ := schema["items"].(map[string]any)
-		for i, item := range items {
-			if err := validateNode(item, itemSchema, fmt.Sprintf("%s[%d]", path, i)); err != nil {
-				return err
-			}
-		}
-	case "string":
-		if _, ok := value.(string); !ok {
-			return fmt.Errorf("%s must be a string", path)
-		}
-	case "boolean":
-		if _, ok := value.(bool); !ok {
-			return fmt.Errorf("%s must be a boolean", path)
-		}
-	case "number":
-		if _, ok := jsonNumber(value); !ok {
-			return fmt.Errorf("%s must be a number", path)
-		}
-	case "integer":
-		number, ok := jsonNumber(value)
-		if !ok || math.Trunc(number) != number {
-			return fmt.Errorf("%s must be an integer", path)
-		}
-	case "null":
-		if value != nil {
-			return fmt.Errorf("%s must be null", path)
+		return validateArrayNode(value, schema, path)
+	}
+	return validateScalar(value, declared, path)
+}
+
+// validateObjectNode checks that the value is an object before walking it.
+func validateObjectNode(value any, schema map[string]any, path string) error {
+	object, ok := value.(map[string]any)
+	if !ok {
+		return fmt.Errorf("%s must be an object", path)
+	}
+	return validateObject(object, schema, path)
+}
+
+// validateArrayNode checks that the value is an array before walking its items
+// against the item schema.
+func validateArrayNode(value any, schema map[string]any, path string) error {
+	items, ok := value.([]any)
+	if !ok {
+		return fmt.Errorf("%s must be an array", path)
+	}
+	itemSchema, _ := schema["items"].(map[string]any)
+	for i, item := range items {
+		if err := validateNode(item, itemSchema, fmt.Sprintf("%s[%d]", path, i)); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
+// isJSONInteger reports whether a number carries no fractional part.
+func isJSONInteger(value any) bool {
+	number, ok := jsonNumber(value)
+	return ok && math.Trunc(number) == number
+}
+
+// scalarCheckers maps a scalar schema type to the check that accepts it. A type
+// with no entry, which includes an absent type and a union type, accepts
+// anything.
+var scalarCheckers = map[string]func(any) bool{
+	"string":  func(value any) bool { _, ok := value.(string); return ok },
+	"boolean": func(value any) bool { _, ok := value.(bool); return ok },
+	"number":  func(value any) bool { _, ok := jsonNumber(value); return ok },
+	"integer": isJSONInteger,
+	"null":    func(value any) bool { return value == nil },
+}
+
+// scalarTypeNames names each scalar type the way its refusal message reads.
+var scalarTypeNames = map[string]string{
+	"string":  "a string",
+	"boolean": "a boolean",
+	"number":  "a number",
+	"integer": "an integer",
+	"null":    "null",
+}
+
+// validateScalar checks a value against a scalar schema type.
+func validateScalar(value any, declared, path string) error {
+	accepts, enforced := scalarCheckers[declared]
+	if !enforced || accepts(value) {
+		return nil
+	}
+	return fmt.Errorf("%s must be %s", path, scalarTypeNames[declared])
+}
+
 // validateObject enforces required keys, prunes undeclared keys when the schema
 // forbids them, and recurses into declared properties.
 func validateObject(object map[string]any, schema map[string]any, path string) error {
-	for _, name := range requiredFromSchema(schema) {
-		if _, ok := object[name]; !ok {
-			return fmt.Errorf("%s is missing required argument %q", path, name)
-		}
+	if err := requireDeclaredKeys(object, schema, path); err != nil {
+		return err
 	}
 
 	properties, _ := schema["properties"].(map[string]any)
-	if allowed, ok := schema["additionalProperties"].(bool); ok && !allowed && len(properties) > 0 {
-		for name := range object {
-			if _, declared := properties[name]; !declared {
-				delete(object, name)
-			}
-		}
-	}
+	pruneUndeclaredKeys(object, properties, schema)
 
 	for name, child := range object {
 		childSchema, ok := properties[name].(map[string]any)
@@ -241,6 +260,30 @@ func validateObject(object map[string]any, schema map[string]any, path string) e
 		}
 	}
 	return nil
+}
+
+// requireDeclaredKeys refuses an object that omits a required argument.
+func requireDeclaredKeys(object map[string]any, schema map[string]any, path string) error {
+	for _, name := range requiredFromSchema(schema) {
+		if _, ok := object[name]; !ok {
+			return fmt.Errorf("%s is missing required argument %q", path, name)
+		}
+	}
+	return nil
+}
+
+// pruneUndeclaredKeys drops the keys a closed schema does not declare, because
+// a model that invented an extra argument is corrected rather than refused.
+func pruneUndeclaredKeys(object map[string]any, properties map[string]any, schema map[string]any) {
+	allowed, declaredClosed := schema["additionalProperties"].(bool)
+	if !declaredClosed || allowed || len(properties) == 0 {
+		return
+	}
+	for name := range object {
+		if _, declared := properties[name]; !declared {
+			delete(object, name)
+		}
+	}
 }
 
 // validateEnum rejects a value the schema does not list. Comparison goes
