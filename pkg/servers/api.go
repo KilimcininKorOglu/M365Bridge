@@ -1378,80 +1378,128 @@ func (api *APIServer) runToolLoop(r *http.Request, provider toolLoopProvider, me
 		if err != nil {
 			return toolLoopResult{conversationID: currentConvID}, err
 		}
-		if finalConvID != "" {
-			currentConvID = finalConvID
-			if sid != "" {
-				api.ctxCache.Set(sessionKeyPrefix+sid, finalConvID)
-			}
-		}
+		currentConvID = api.rememberConversation(sid, currentConvID, finalConvID)
 		if len(tools) == 0 {
 			_, finishReason = withoutBackendToolCalls(backendCalls, finishReason)
 			return toolLoopResult{text: text, thinking: thinking, finishReason: finishReason, conversationID: currentConvID}, nil
 		}
+
 		contracts := toolcalling.ContractsFor(tools).WithoutParallel(noParallel)
-		var simulated toolcalling.SimulatedResult
-		if provider == toolLoopAnthropic {
-			simulated = toolcalling.ParseSimulatedResponseAnthropic(text, toolNamesFromDefs(tools), contracts)
-		} else {
-			simulated = toolcalling.ParseSimulatedResponse(text, toolNamesFromDefs(tools), contracts)
-		}
+		simulated := parseLoopSimulation(provider, text, tools, contracts)
 		simulated = api.repairSimulatedToolCalls(provider, messages, cfg, tools, contracts, text, simulated)
-		if !simulated.HasPayload || len(simulated.ToolCalls) == 0 {
-			if simulated.HasPayload {
-				text, finishReason = simulated.Content, "stop"
-			}
-			return toolLoopResult{text: text, thinking: thinking, finishReason: finishReason, conversationID: currentConvID}, nil
+		if answer, done := answerWithoutCalls(simulated, text, thinking, finishReason, currentConvID); done {
+			return answer, nil
 		}
-		var callerCalls []client.ToolCall
-		var localCalls []toolcalling.ToolCall
-		for _, call := range simulated.ToolCalls {
-			converted := clientToolCallFromSimulated(call)
-			if local[call.Name] {
-				localCalls = append(localCalls, call)
-			} else {
-				callerCalls = append(callerCalls, converted)
-			}
-		}
+
+		callerCalls, localCalls := splitToolCalls(simulated.ToolCalls, local)
 		if len(callerCalls) > 0 {
 			return toolLoopResult{thinking: thinking, toolCalls: callerCalls, finishReason: "tool_calls", conversationID: currentConvID}, nil
 		}
 		if iteration >= api.config.CodeToolMaxIterations-1 {
 			return toolLoopResult{conversationID: currentConvID}, errors.New("coding tool iteration limit reached")
 		}
-		var resultParts []string
-		for _, call := range localCalls {
-			// The arguments are normalized before they identify a call, because
-			// a model that re-emits the same call with its JSON keys in another
-			// order is repeating it, not asking something new.
-			key := toolcalling.CallSignature(call.Name, string(call.Arguments))
-			if seen[key] {
-				return toolLoopResult{conversationID: currentConvID}, fmt.Errorf("duplicate coding tool call %q", call.Name)
-			}
-			seen[key] = true
-			var arguments map[string]any
-			if err := json.Unmarshal(call.Arguments, &arguments); err != nil {
-				arguments = map[string]any{}
-			}
-			encoded, err := codingtools.MarshalResult(api.codeTools.Execute(r.Context(), call.Name, arguments))
-			if err != nil {
-				return toolLoopResult{conversationID: currentConvID}, fmt.Errorf("serialize coding tool result: %w", err)
-			}
-			resultParts = append(resultParts, toolcalling.FormatSimulatedToolResult(call.ID, call.Name, string(encoded)))
-		}
-		messages = append(messages, payload.Message{Role: "user", Content: strings.Join(resultParts, "\n\n")})
-		request := map[string]any{"model": cfg.OpenAIID, "messages": messages, "tools": tools, "stream": false}
-		requestJSON, err := json.Marshal(request)
+
+		resultParts, err := api.executeLocalCalls(r, localCalls, seen)
 		if err != nil {
-			return toolLoopResult{conversationID: currentConvID}, fmt.Errorf("serialize coding tool continuation: %w", err)
+			return toolLoopResult{conversationID: currentConvID}, err
 		}
-		if provider == toolLoopAnthropic {
-			// The synthetic messages of the built-in loop carry no client tool
-			// structure, so there is no ledger to pass here.
-			injectSimulatedPromptAnthropic(&messages, string(requestJSON), "auto", "")
-		} else {
-			injectSimulatedPrompt(&messages, string(requestJSON), "auto", "")
+		messages, err = appendToolLoopContinuation(messages, resultParts, cfg, tools, provider)
+		if err != nil {
+			return toolLoopResult{conversationID: currentConvID}, err
 		}
 	}
+}
+
+// rememberConversation stores the conversation the backend answered on, so the
+// next turn of this session continues it rather than starting a new one.
+func (api *APIServer) rememberConversation(sid, currentConvID, finalConvID string) string {
+	if finalConvID == "" {
+		return currentConvID
+	}
+	if sid != "" {
+		api.ctxCache.Set(sessionKeyPrefix+sid, finalConvID)
+	}
+	return finalConvID
+}
+
+// parseLoopSimulation parses the backend's answer in the provider's own shape.
+func parseLoopSimulation(provider toolLoopProvider, text string, tools []toolcalling.ToolDef, contracts toolcalling.ToolContracts) toolcalling.SimulatedResult {
+	if provider == toolLoopAnthropic {
+		return toolcalling.ParseSimulatedResponseAnthropic(text, toolNamesFromDefs(tools), contracts)
+	}
+	return toolcalling.ParseSimulatedResponse(text, toolNamesFromDefs(tools), contracts)
+}
+
+// answerWithoutCalls reports the turn's plain answer when the simulation
+// produced no tool call, which is a legitimate outcome rather than a failure.
+func answerWithoutCalls(sim toolcalling.SimulatedResult, text, thinking, finishReason, convID string) (toolLoopResult, bool) {
+	if sim.HasPayload && len(sim.ToolCalls) > 0 {
+		return toolLoopResult{}, false
+	}
+	if sim.HasPayload {
+		text, finishReason = sim.Content, "stop"
+	}
+	return toolLoopResult{text: text, thinking: thinking, finishReason: finishReason, conversationID: convID}, true
+}
+
+// splitToolCalls separates the calls this gateway runs itself from the ones
+// only the client can run.
+func splitToolCalls(calls []toolcalling.ToolCall, local map[string]bool) ([]client.ToolCall, []toolcalling.ToolCall) {
+	var callerCalls []client.ToolCall
+	var localCalls []toolcalling.ToolCall
+	for _, call := range calls {
+		if local[call.Name] {
+			localCalls = append(localCalls, call)
+			continue
+		}
+		callerCalls = append(callerCalls, clientToolCallFromSimulated(call))
+	}
+	return callerCalls, localCalls
+}
+
+// executeLocalCalls runs the built-in coding tools and renders their results.
+//
+// The arguments are normalized before they identify a call, because a model
+// that re-emits the same call with its JSON keys in another order is repeating
+// it, not asking something new.
+func (api *APIServer) executeLocalCalls(r *http.Request, localCalls []toolcalling.ToolCall, seen map[string]bool) ([]string, error) {
+	var resultParts []string
+	for _, call := range localCalls {
+		key := toolcalling.CallSignature(call.Name, string(call.Arguments))
+		if seen[key] {
+			return nil, fmt.Errorf("duplicate coding tool call %q", call.Name)
+		}
+		seen[key] = true
+		var arguments map[string]any
+		if err := json.Unmarshal(call.Arguments, &arguments); err != nil {
+			arguments = map[string]any{}
+		}
+		encoded, err := codingtools.MarshalResult(api.codeTools.Execute(r.Context(), call.Name, arguments))
+		if err != nil {
+			return nil, fmt.Errorf("serialize coding tool result: %w", err)
+		}
+		resultParts = append(resultParts, toolcalling.FormatSimulatedToolResult(call.ID, call.Name, string(encoded)))
+	}
+	return resultParts, nil
+}
+
+// appendToolLoopContinuation adds the tool results to the conversation and
+// re-injects the request envelope, so the next turn sees the same contract.
+func appendToolLoopContinuation(messages []payload.Message, resultParts []string, cfg models.ModelConfig, tools []toolcalling.ToolDef, provider toolLoopProvider) ([]payload.Message, error) {
+	messages = append(messages, payload.Message{Role: "user", Content: strings.Join(resultParts, "\n\n")})
+	request := map[string]any{"model": cfg.OpenAIID, "messages": messages, "tools": tools, "stream": false}
+	requestJSON, err := json.Marshal(request)
+	if err != nil {
+		return nil, fmt.Errorf("serialize coding tool continuation: %w", err)
+	}
+	// The synthetic messages of the built-in loop carry no client tool
+	// structure, so there is no ledger to pass here.
+	if provider == toolLoopAnthropic {
+		injectSimulatedPromptAnthropic(&messages, string(requestJSON), "auto", "")
+	} else {
+		injectSimulatedPrompt(&messages, string(requestJSON), "auto", "")
+	}
+	return messages, nil
 }
 
 // repairSimulatedToolCalls performs a single corrective re-ask when the initial
@@ -1465,33 +1513,9 @@ func (api *APIServer) repairSimulatedToolCalls(provider toolLoopProvider, messag
 		return sim
 	}
 
-	var note string
-	narrated := false
-	switch {
-	case len(sim.DroppedCalls) > 0:
-		note = toolcalling.BuildRepairNote(sim.DroppedCalls, contracts)
-		logging.Warnf("repairSimulatedToolCalls: re-asking backend, tool calls failed validation: %v", sim.DroppedCalls)
-	default:
-		// The backend produced no tool call at all. That is only worth a re-ask
-		// when the reply denies the tools exist, claims the work already ran
-		// elsewhere, or only announces which tool it means to use; an ordinary
-		// text answer is a legitimate outcome.
-		answer := sim.Content
-		if answer == "" {
-			answer = rawText
-		}
-		switch {
-		case toolcalling.IsToolRefusal(answer):
-			logging.Warn("repairSimulatedToolCalls: re-asking backend, reply denied the declared tools exist")
-		case toolcalling.IsSandboxHallucination(answer):
-			logging.Warn("repairSimulatedToolCalls: re-asking backend, reply claimed to have run the work itself")
-		case toolcalling.IsToolIntentNarration(answer, toolNamesFromDefs(tools)):
-			narrated = true
-			logging.Warn("repairSimulatedToolCalls: re-asking backend, reply only announced which tool it would use")
-		default:
-			return sim
-		}
-		note = toolcalling.BuildNativeToolBanNote()
+	note, narrated, worthRetrying := repairNote(sim, tools, contracts, rawText)
+	if !worthRetrying {
+		return sim
 	}
 
 	retry := make([]payload.Message, len(messages))
@@ -1506,12 +1530,7 @@ func (api *APIServer) repairSimulatedToolCalls(provider toolLoopProvider, messag
 		return sim
 	}
 
-	var retried toolcalling.SimulatedResult
-	if provider == toolLoopAnthropic {
-		retried = toolcalling.ParseSimulatedResponseAnthropic(text, toolNamesFromDefs(tools), contracts)
-	} else {
-		retried = toolcalling.ParseSimulatedResponse(text, toolNamesFromDefs(tools), contracts)
-	}
+	retried := parseLoopSimulation(provider, text, tools, contracts)
 	if len(retried.ToolCalls) > 0 {
 		logging.Infof("repairSimulatedToolCalls: recovered %d tool call(s) after re-ask", len(retried.ToolCalls))
 		return retried
@@ -1527,6 +1546,36 @@ func (api *APIServer) repairSimulatedToolCalls(provider toolLoopProvider, messag
 	}
 	logging.Warn("repairSimulatedToolCalls: re-ask did not yield valid tool calls; keeping original response")
 	return sim
+}
+
+// repairNote decides whether a re-ask is worth making, and what note to append.
+//
+// A dropped call is always worth re-asking. With no call at all it is only
+// worth it when the reply denies the tools exist, claims the work already ran
+// elsewhere, or only announces which tool it means to use; an ordinary text
+// answer is a legitimate outcome.
+func repairNote(sim toolcalling.SimulatedResult, tools []toolcalling.ToolDef, contracts toolcalling.ToolContracts, rawText string) (note string, narrated, worthRetrying bool) {
+	if len(sim.DroppedCalls) > 0 {
+		logging.Warnf("repairSimulatedToolCalls: re-asking backend, tool calls failed validation: %v", sim.DroppedCalls)
+		return toolcalling.BuildRepairNote(sim.DroppedCalls, contracts), false, true
+	}
+
+	answer := sim.Content
+	if answer == "" {
+		answer = rawText
+	}
+	switch {
+	case toolcalling.IsToolRefusal(answer):
+		logging.Warn("repairSimulatedToolCalls: re-asking backend, reply denied the declared tools exist")
+	case toolcalling.IsSandboxHallucination(answer):
+		logging.Warn("repairSimulatedToolCalls: re-asking backend, reply claimed to have run the work itself")
+	case toolcalling.IsToolIntentNarration(answer, toolNamesFromDefs(tools)):
+		narrated = true
+		logging.Warn("repairSimulatedToolCalls: re-asking backend, reply only announced which tool it would use")
+	default:
+		return "", false, false
+	}
+	return toolcalling.BuildNativeToolBanNote(), narrated, true
 }
 
 // handleChatCompletions handles OpenAI chat completion requests.
