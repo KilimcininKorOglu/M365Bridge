@@ -9,6 +9,7 @@ import (
 	// md5 is used only to derive cache file names and session ids, never as a
 	// security primitive.
 	"crypto/md5" // #nosec G501
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
@@ -653,7 +654,9 @@ func (api *APIServer) handleModels(w http.ResponseWriter, r *http.Request) {
 		"last_id":  lastOrNil(ids),
 	}
 
-	api.sendJSON(w, http.StatusOK, response)
+	// The catalog is built from the registry and from configuration fixed at
+	// startup, so it is the one JSON body here a caller may hold.
+	api.sendCachedJSON(w, r, response, "public, max-age=300")
 }
 
 // supportsReasoningRoute reports whether any registry key for one advertised
@@ -3741,6 +3744,39 @@ func (api *APIServer) sendJSON(w http.ResponseWriter, statusCode int, data any) 
 	w.WriteHeader(statusCode)
 
 	writeJSONBody(w, data)
+}
+
+// sendCachedJSON sends a JSON body a caller may hold, with a strong validator
+// so a repeat request costs a 304 rather than the whole body.
+//
+// The body is marshalled once and hashed, so the tag describes the bytes that
+// go out. Only a body with no volatile field belongs here: a timestamp or an id
+// minted per request would make every tag unique and defeat the cache the tag
+// exists to serve.
+func (api *APIServer) sendCachedJSON(w http.ResponseWriter, r *http.Request, data any, cacheControl string) {
+	body, err := json.Marshal(data)
+	if err != nil {
+		logging.Errorf("cached response encode failed: %v", err)
+		api.sendError(w, http.StatusInternalServerError, "Response could not be encoded")
+		return
+	}
+	sum := sha256.Sum256(body)
+	etag := `"` + hex.EncodeToString(sum[:]) + `"`
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Cache-Control", cacheControl)
+	w.Header().Set("ETag", etag)
+
+	if matchesETag(r.Header.Get("If-None-Match"), etag) {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write(append(body, '\n')); err != nil {
+		logging.Debugf("cached response write failed: %v", err)
+	}
 }
 
 // writeJSONBody encodes the body of a response whose status line has already

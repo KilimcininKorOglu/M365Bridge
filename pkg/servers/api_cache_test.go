@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/KilimcininKorOglu/M365Bridge/pkg/models"
 )
 
 // A JSON body from this gateway carries conversation content, a session mapping
@@ -63,6 +65,71 @@ func TestResponsesProbeRefusesStorageOnBothBranches(t *testing.T) {
 	api.respondResponsesProbe(buffered, "gpt5.5-reasoning", false)
 	if got := buffered.Header().Get("Cache-Control"); got != "no-store" {
 		t.Errorf("buffered Cache-Control = %q, want no-store", got)
+	}
+}
+
+// The catalog is built from the registry and from configuration fixed at
+// startup, so two identical requests must carry the same validator. A volatile
+// field anywhere in the body would move the tag on every request and defeat the
+// cache it exists to serve.
+func TestModelsCarriesAStableValidator(t *testing.T) {
+	api := &APIServer{config: &models.Config{}}
+
+	first := httptest.NewRecorder()
+	api.handleModels(first, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	if first.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", first.Code, first.Body.String())
+	}
+	etag := first.Header().Get("ETag")
+	if etag == "" {
+		t.Fatal("no ETag was sent, so a repeat request can never be answered with 304")
+	}
+	if got := first.Header().Get("Cache-Control"); got != "public, max-age=300" {
+		t.Errorf("Cache-Control = %q, want public, max-age=300", got)
+	}
+
+	second := httptest.NewRecorder()
+	api.handleModels(second, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	if got := second.Header().Get("ETag"); got != etag {
+		t.Fatalf("the validator moved between two identical requests: %q then %q", etag, got)
+	}
+}
+
+func TestModelsAnswersARevalidationWith304(t *testing.T) {
+	api := &APIServer{config: &models.Config{}}
+
+	first := httptest.NewRecorder()
+	api.handleModels(first, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	etag := first.Header().Get("ETag")
+	if etag == "" {
+		t.Fatal("no ETag to revalidate with")
+	}
+
+	for name, header := range map[string]string{
+		"exact":    etag,
+		"weak":     "W/" + etag,
+		"any":      "*",
+		"in a set": `"other", ` + etag,
+	} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		req.Header.Set("If-None-Match", header)
+		api.handleModels(rec, req)
+
+		if rec.Code != http.StatusNotModified {
+			t.Errorf("%s: status = %d, want 304", name, rec.Code)
+		}
+		if rec.Body.Len() != 0 {
+			t.Errorf("%s: a 304 carried a body of %d bytes", name, rec.Body.Len())
+		}
+	}
+
+	stale := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("If-None-Match", `"stale"`)
+	api.handleModels(stale, req)
+	if stale.Code != http.StatusOK {
+		t.Errorf("a stale validator got %d, want a fresh 200", stale.Code)
 	}
 }
 
