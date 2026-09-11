@@ -147,6 +147,40 @@ func TestWebUIRevalidatesTheDocumentButHoldsHashedAssets(t *testing.T) {
 	}
 }
 
+// aHashedAssetPath returns one embedded build output, whose file name carries
+// a content hash.
+func aHashedAssetPath(t *testing.T) string {
+	t.Helper()
+	lookupAsset("/")
+	for name := range assetsByID {
+		if strings.HasPrefix(name, "/assets/") {
+			return name
+		}
+	}
+	t.Fatal("the embedded interface carries no hashed asset")
+	return ""
+}
+
+// A hashed name changes whenever the bytes change, so a validator on one of
+// these files can only ever confirm the copy the client already holds.
+func TestWebUISendsNoValidatorForAnImmutableAsset(t *testing.T) {
+	api := webUIServer(true)
+	path := aHashedAssetPath(t)
+
+	rec := httptest.NewRecorder()
+	api.handleWebUI(rec, httptest.NewRequest(http.MethodGet, path, nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("%s: status = %d", path, rec.Code)
+	}
+	if got := rec.Header().Get("Cache-Control"); !strings.Contains(got, "immutable") {
+		t.Fatalf("%s: Cache-Control = %q, want immutable", path, got)
+	}
+	if got := rec.Header().Get("ETag"); got != "" {
+		t.Errorf("%s: an immutable asset carried a validator: %s", path, got)
+	}
+}
+
 func TestWebUIIsAbsentWhenDisabled(t *testing.T) {
 	api := webUIServer(false)
 	rec := httptest.NewRecorder()

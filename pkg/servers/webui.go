@@ -112,10 +112,17 @@ func isBrowserRoute(clean string) bool {
 // indefinitely; the document names them and must be revalidated every time or
 // a deploy would keep serving the previous build.
 func cacheControlFor(requestPath string) string {
-	if strings.HasPrefix(requestPath, "/assets/") {
+	if immutableAsset(requestPath) {
 		return "public, max-age=31536000, immutable"
 	}
 	return "no-cache"
+}
+
+// immutableAsset reports whether a path names a build output that may be held
+// indefinitely. Vite writes a content hash into each of these file names, so a
+// build that changes the bytes changes the name with them.
+func immutableAsset(requestPath string) bool {
+	return strings.HasPrefix(requestPath, "/assets/")
 }
 
 // servesWebUI reports whether this request belongs to the interface.
@@ -156,11 +163,16 @@ func (api *APIServer) handleWebUI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("ETag", asset.etag)
 	w.Header().Set("Cache-Control", cacheControlFor(r.URL.Path))
-	if matchesETag(r.Header.Get("If-None-Match"), asset.etag) {
-		w.WriteHeader(http.StatusNotModified)
-		return
+	// An immutable asset needs no validator. Its name carries the hash of its
+	// bytes, so a conditional request on it can only ever confirm the file the
+	// client already holds, and a tag invites that round-trip for nothing.
+	if !immutableAsset(r.URL.Path) {
+		w.Header().Set("ETag", asset.etag)
+		if matchesETag(r.Header.Get("If-None-Match"), asset.etag) {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
 	}
 
 	w.Header().Set("Content-Type", asset.contentType)
