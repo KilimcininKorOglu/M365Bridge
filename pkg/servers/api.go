@@ -3746,6 +3746,14 @@ func (api *APIServer) sendJSON(w http.ResponseWriter, statusCode int, data any) 
 	writeJSONBody(w, data)
 }
 
+// contentETag builds a strong validator from the bytes that go out. RFC 7232
+// requires the quotes, and a cache that parses the header properly ignores a
+// tag without them.
+func contentETag(body []byte) string {
+	sum := sha256.Sum256(body)
+	return `"` + hex.EncodeToString(sum[:]) + `"`
+}
+
 // sendCachedJSON sends a JSON body a caller may hold, with a strong validator
 // so a repeat request costs a 304 rather than the whole body.
 //
@@ -3760,8 +3768,7 @@ func (api *APIServer) sendCachedJSON(w http.ResponseWriter, r *http.Request, dat
 		api.sendError(w, http.StatusInternalServerError, "Response could not be encoded")
 		return
 	}
-	sum := sha256.Sum256(body)
-	etag := `"` + hex.EncodeToString(sum[:]) + `"`
+	etag := contentETag(body)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")

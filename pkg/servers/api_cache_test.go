@@ -3,6 +3,7 @@ package servers
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/models"
@@ -130,6 +131,23 @@ func TestModelsAnswersARevalidationWith304(t *testing.T) {
 	api.handleModels(stale, req)
 	if stale.Code != http.StatusOK {
 		t.Errorf("a stale validator got %d, want a fresh 200", stale.Code)
+	}
+}
+
+// Every validator this package sends comes from here, so the quoting and the
+// stability are pinned once.
+func TestContentETagIsAStableQuotedValidator(t *testing.T) {
+	body := []byte(`{"status":"ok"}`)
+
+	tag := contentETag(body)
+	if !strings.HasPrefix(tag, `"`) || !strings.HasSuffix(tag, `"`) {
+		t.Fatalf("tag = %s, want it wrapped in double quotes", tag)
+	}
+	if again := contentETag(body); again != tag {
+		t.Fatalf("the same bytes produced %s and then %s", tag, again)
+	}
+	if other := contentETag([]byte(`{"status":"down"}`)); other == tag {
+		t.Fatal("two different bodies produced the same tag")
 	}
 }
 

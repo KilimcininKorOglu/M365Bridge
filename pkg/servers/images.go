@@ -152,8 +152,18 @@ func (api *APIServer) handleGeneratedImage(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	w.Header().Set("Content-Type", contentType)
+	// The bytes are in hand by now, so the validator costs one hash and saves
+	// the whole body on a repeat request. It cannot save the download itself:
+	// the tag is not known until the image has been fetched.
+	etag := contentETag(body)
 	w.Header().Set("Cache-Control", "private, max-age=3600")
+	w.Header().Set("ETag", etag)
+	if matchesETag(r.Header.Get("If-None-Match"), etag) {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+
+	w.Header().Set("Content-Type", contentType)
 	w.WriteHeader(http.StatusOK)
 	if _, err := w.Write(body); err != nil {
 		logging.Errorf("handleGeneratedImage: write failed: %v", err)
