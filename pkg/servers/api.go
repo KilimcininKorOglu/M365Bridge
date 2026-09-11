@@ -2185,7 +2185,9 @@ func (api *APIServer) streamAnthropicComplete(ctx context.Context, w http.Respon
 // answered, which happens when the writer cannot flush.
 func (api *APIServer) beginSSE(w http.ResponseWriter) (http.Flusher, bool) {
 	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
+	// no-cache permits storage and only forces revalidation. A turn's answer
+	// exists once and cannot be revalidated, so storage is refused outright.
+	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Connection", "close")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
@@ -6396,17 +6398,13 @@ func (api *APIServer) respondResponsesProbe(w http.ResponseWriter, model string,
 
 	if !stream {
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
 		writeJSONBody(w, response)
 		return
 	}
 
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "close")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	flusher, ok := w.(http.Flusher)
+	flusher, ok := api.beginSSE(w)
 	if !ok {
-		api.sendError(w, http.StatusInternalServerError, "Streaming not supported")
 		return
 	}
 
