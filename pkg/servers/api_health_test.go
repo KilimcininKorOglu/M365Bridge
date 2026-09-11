@@ -40,4 +40,22 @@ func TestHealthStaysPlainText(t *testing.T) {
 	if recorder.Body.String() != "OK" {
 		t.Fatalf("body = %q, want OK", recorder.Body.String())
 	}
+	if got := recorder.Header().Get("Content-Type"); got != "text/plain; charset=utf-8" {
+		t.Errorf("content type = %q, want text/plain; charset=utf-8", got)
+	}
+	// A cached liveness answer would report a process that is no longer there.
+	if got := recorder.Header().Get("Cache-Control"); got != "no-store" {
+		t.Errorf("Cache-Control = %q, want no-store", got)
+	}
+}
+
+// The JSON probe inherits the refusal from the shared writer.
+func TestV1HealthRefusesStorage(t *testing.T) {
+	api := &APIServer{}
+	recorder := httptest.NewRecorder()
+	api.handleV1Health(recorder, httptest.NewRequest(http.MethodGet, "/v1/health", nil))
+
+	if got := recorder.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control = %q, want no-store", got)
+	}
 }
