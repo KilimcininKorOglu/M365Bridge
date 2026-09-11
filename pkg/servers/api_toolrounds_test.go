@@ -19,9 +19,12 @@ func openAIToolRounds(t *testing.T, rounds int) string {
 	sb.WriteString(`[{"role":"user","content":"fix the build"}`)
 	for i := range rounds {
 		id := fmt.Sprintf("call_%d", i)
-		sb.WriteString(`,{"role":"assistant","content":null,"tool_calls":[{"id":"` + id +
-			`","type":"function","function":{"name":"run_tests","arguments":"{}"}}]}`)
-		sb.WriteString(`,{"role":"tool","tool_call_id":"` + id + `","content":"ok"}`)
+		sb.WriteString(`,{"role":"assistant","content":null,"tool_calls":[{"id":"`)
+		sb.WriteString(id)
+		sb.WriteString(`","type":"function","function":{"name":"run_tests","arguments":"{}"}}]}`)
+		sb.WriteString(`,{"role":"tool","tool_call_id":"`)
+		sb.WriteString(id)
+		sb.WriteString(`","content":"ok"}`)
 	}
 	sb.WriteString("]")
 	return sb.String()

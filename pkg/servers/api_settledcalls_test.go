@@ -17,9 +17,12 @@ func settledLedger(t *testing.T, times int) toolcalling.Ledger {
 	sb.WriteString(`[{"role":"user","content":"fix the build"}`)
 	for i := range times {
 		id := "call_" + string(rune('0'+i))
-		sb.WriteString(`,{"role":"assistant","content":null,"tool_calls":[{"id":"` + id +
-			`","type":"function","function":{"name":"run_tests","arguments":"{\"pkg\":\"./...\"}"}}]}`)
-		sb.WriteString(`,{"role":"tool","tool_call_id":"` + id + `","content":"exit code 1"}`)
+		sb.WriteString(`,{"role":"assistant","content":null,"tool_calls":[{"id":"`)
+		sb.WriteString(id)
+		sb.WriteString(`","type":"function","function":{"name":"run_tests","arguments":"{\"pkg\":\"./...\"}"}}]}`)
+		sb.WriteString(`,{"role":"tool","tool_call_id":"`)
+		sb.WriteString(id)
+		sb.WriteString(`","content":"exit code 1"}`)
 	}
 	sb.WriteString("]")
 	return buildToolLedger(decodeMessages(t, sb.String()))
@@ -103,9 +106,14 @@ func TestParseResponsesSimulationDropsASettledRepeat(t *testing.T) {
 	sb.WriteString(`[{"role":"user","content":"go"}`)
 	for i := range 2 {
 		id := "call_" + string(rune('0'+i))
-		sb.WriteString(`,{"role":"assistant","content":null,"tool_calls":[{"id":"` + id +
-			`","type":"function","function":{"name":"` + name + `","arguments":"{}"}}]}`)
-		sb.WriteString(`,{"role":"tool","tool_call_id":"` + id + `","content":"done"}`)
+		sb.WriteString(`,{"role":"assistant","content":null,"tool_calls":[{"id":"`)
+		sb.WriteString(id)
+		sb.WriteString(`","type":"function","function":{"name":"`)
+		sb.WriteString(name)
+		sb.WriteString(`","arguments":"{}"}}]}`)
+		sb.WriteString(`,{"role":"tool","tool_call_id":"`)
+		sb.WriteString(id)
+		sb.WriteString(`","content":"done"}`)
 	}
 	sb.WriteString("]")
 	policy.ledger = buildToolLedger(decodeMessages(t, sb.String()))
