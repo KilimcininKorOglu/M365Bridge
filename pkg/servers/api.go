@@ -3719,9 +3719,19 @@ func (api *APIServer) nonStreamCompletions(w http.ResponseWriter, messages []pay
 }
 
 // sendJSON sends a JSON response.
+//
+// A body written here carries conversation content, a session-to-conversation
+// mapping or account data unless its own handler says otherwise, so storage is
+// refused by default. A response with no cache rule at all is worse than one
+// that refuses: RFC 9111 lets a cache assign its own freshness to a 200 that
+// declares no expiry. A handler serving cacheable data sets its rule before it
+// calls this, and that rule is kept.
 func (api *APIServer) sendJSON(w http.ResponseWriter, statusCode int, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
+	if w.Header().Get("Cache-Control") == "" {
+		w.Header().Set("Cache-Control", "no-store")
+	}
 	w.WriteHeader(statusCode)
 
 	writeJSONBody(w, data)
