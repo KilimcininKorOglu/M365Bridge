@@ -6,6 +6,7 @@ CACHE      := /tmp/gocache-m365
 # Keep this on the version .github/workflows/ci.yml pins, or the local gate and
 # CI disagree over an idiom one of them does not know yet.
 MODERNIZE  := v0.23.0
+GOCYCLO    := v0.6.0
 DOCKER_GO   = docker run --rm -v "$(CURDIR)":/src -w /src -v $(CACHE):/gocache \
               -e GOCACHE=/gocache/build -e GOMODCACHE=/gocache/mod \
               -e GOTMPDIR=/gocache/tmp -e GOBIN=/gocache/bin
@@ -15,7 +16,7 @@ DOCKER_GO   = docker run --rm -v "$(CURDIR)":/src -w /src -v $(CACHE):/gocache \
 help:
 	@echo "ui     Build the browser interface and embed it"
 	@echo "build  Build the binary into bin/"
-	@echo "check  Run every gate: gofmt, vet, tests, staticcheck, modernize"
+	@echo "check  Run every gate: gofmt, vet, tests, staticcheck, modernize, gocyclo"
 	@echo "fmt    Apply gofmt"
 	@echo "test   Run the test suite with the race detector"
 	@echo "up     Build and start the container"
@@ -58,7 +59,10 @@ check: cache
 		[ -x /gocache/bin/staticcheck ] || go install honnef.co/go/tools/cmd/staticcheck@v0.7.0; \
 		/gocache/bin/staticcheck ./...; \
 		echo "--- modernize ---"; \
-		go run golang.org/x/tools/gopls/internal/analysis/modernize/cmd/modernize@$(MODERNIZE) ./...'
+		go run golang.org/x/tools/gopls/internal/analysis/modernize/cmd/modernize@$(MODERNIZE) ./...; \
+		echo "--- gocyclo ---"; \
+		[ -x /gocache/bin/gocyclo ] || go install github.com/fzipp/gocyclo/cmd/gocyclo@$(GOCYCLO); \
+		/gocache/bin/gocyclo -over 10 -ignore "vendor/|helper-projects/|\.gocache/|web/" .'
 
 up:
 	docker compose up --build -d
