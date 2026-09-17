@@ -1,0 +1,75 @@
+name: Cleanup Artifacts
+
+# The build matrix uploads one IPK artifact per architecture (30+ per run) only so
+# the publish job can download them again. They serve no purpose afterwards, and a
+# full artifact store makes every later run fail at "Upload package artifact" with
+# "Artifact storage quota has been hit", which skips the publish job and leaves the
+# release without IPKs. This workflow deletes the leftovers.
+
+on:
+  schedule:
+    # 04:07 UTC daily. An off-hour, off-minute slot keeps this away from the
+    # release runs and away from the crowded top of the hour.
+    - cron: '7 4 * * *'
+  workflow_dispatch:
+    inputs:
+      max_age_days:
+        description: 'Delete artifacts older than this many days (0 = delete all)'
+        required: false
+        default: '1'
+
+permissions:
+  actions: write
+
+jobs:
+  cleanup:
+    name: Delete old build artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete artifacts
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const maxAgeDays = Number(context.payload.inputs?.max_age_days ?? 1);
+            const cutoff = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
+
+            const artifacts = await github.paginate(
+              github.rest.actions.listArtifactsForRepo,
+              { owner: context.repo.owner, repo: context.repo.repo, per_page: 100 }
+            );
+
+            let deleted = 0, freed = 0, kept = 0, failed = 0;
+            for (const artifact of artifacts) {
+              // An expired artifact still occupies the quota until it is removed,
+              // so delete it regardless of age.
+              const old = new Date(artifact.created_at).getTime() < cutoff;
+              if (!old && !artifact.expired) { kept++; continue; }
+              try {
+                await github.rest.actions.deleteArtifact({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  artifact_id: artifact.id,
+                });
+                deleted++;
+                freed += artifact.size_in_bytes;
+              } catch (err) {
+                // A concurrent run may delete the same artifact first. Report the
+                // count instead of failing the whole job.
+                failed++;
+                core.warning(`delete ${artifact.id} (${artifact.name}): ${err.message}`);
+              }
+            }
+
+            const mib = (freed / 1024 / 1024).toFixed(1);
+            core.info(`scanned=${artifacts.length} deleted=${deleted} kept=${kept} failed=${failed} freed=${mib} MiB`);
+            core.summary
+              .addHeading('Artifact cleanup')
+              .addTable([
+                [{ data: 'Metric', header: true }, { data: 'Value', header: true }],
+                ['Scanned', String(artifacts.length)],
+                ['Deleted', String(deleted)],
+                ['Kept', String(kept)],
+                ['Failed', String(failed)],
+                ['Freed', `${mib} MiB`],
+              ])
+              .write();
