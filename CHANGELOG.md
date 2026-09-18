@@ -6,6 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [1.5.1] - 2026-09-18
+
+### Added
+- Answer a repeat `GET /v1/models` request with `304 Not Modified`. The catalog is built from the registry and from configuration fixed at startup, so it carries a strong ETag and `public, max-age=300`, and a client no longer fetches the whole list every time
+- Send a strong validator with a generated image, so a client whose copy expired revalidates instead of downloading the bytes again
+
+### Fixed
+- Refuse cache storage on every JSON response by default. The shared writer declared no cache rule at all, and a 200 that declares no expiry lets a cache assign its own freshness to a body carrying conversation content, the session mapping or account data
+- Refuse cache storage on every SSE stream. The stream header block declared `no-cache`, which permits storage and only forces revalidation, and a turn's answer exists once and cannot be revalidated
+- Refuse cache storage on the health routes, so a cached liveness answer cannot report a process that is no longer there
+- Send no validator with an immutable asset. An asset under `/assets/` carries the hash of its bytes in its file name, so a conditional request on it could only ever confirm the copy the client already held
+- Recreate the build cache subdirectories on every gate run, because the system reclaims an empty `tmp` and every Go command then dies with `creating work dir`
+- Stop the gate at the first failing step, so the exit code names the step that broke rather than whichever one ran last
+
+### Changed
+- Bring every function in the module to a cyclomatic complexity of 10 or less. Sixty-three functions were over the limit, and the two largest were 81 and 69. A long streaming responder is now a state type with one method per job that reports the next loop action through `streamLoopStep`, and the same shape applies to the SignalR turn, the tool-calling parsers, the authentication flows and the coding tools
+- Run the complexity gate inside `make check`. The limit was a rule nothing enforced, so a function over it reached a commit whenever nobody ran `gocyclo` by hand
+- Pin the local `modernize` to the version CI runs, so the two cannot disagree over an idiom one of them does not know
+- Track the module Go floor in the CI modernize job instead of a literal, so the pin cannot drift below the floor and fail every push
+- Delete leftover build artifacts on a schedule
+
 ## [1.5.0] - 2026-09-04
 
 ### Added
