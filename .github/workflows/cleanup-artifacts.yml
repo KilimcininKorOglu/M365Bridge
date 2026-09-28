@@ -1,10 +1,15 @@
-name: Cleanup Artifacts
+name: Cleanup Artifacts and Caches
 
-# The build matrix uploads one IPK artifact per architecture (30+ per run) only so
-# the publish job can download them again. They serve no purpose afterwards, and a
-# full artifact store makes every later run fail at "Upload package artifact" with
-# "Artifact storage quota has been hit", which skips the publish job and leaves the
-# release without IPKs. This workflow deletes the leftovers.
+# An artifact left in the store keeps occupying the repository quota until it is
+# removed, and a full store makes every later upload fail with "Artifact storage
+# quota has been hit". This workflow deletes the leftovers once a day so the quota
+# stays free, whether the artifact came from CI, a release run or a manual run.
+#
+# A cache follows different rules: GitHub evicts one after 7 unused days and drops
+# the least recently used entry above the 10 GB repository limit. What those rules
+# miss is a cache written for a ref nobody builds again, so the second step deletes
+# the caches of deleted branches and closed pull requests. The caches of live
+# branches stay, so the next CI run still starts warm.
 
 on:
   schedule:
@@ -14,23 +19,55 @@ on:
   workflow_dispatch:
     inputs:
       max_age_days:
+        # Artifacts only. The cache step selects by ref, never by age. Leave it
+        # empty to use DEFAULT_MAX_AGE_DAYS below.
         description: 'Delete artifacts older than this many days (0 = delete all)'
         required: false
-        default: '1'
+
+env:
+  # The retention this repository wants, in ONE place. A scheduled run carries no
+  # inputs, so the step below must not fall back to a second literal: raising the
+  # input default alone would leave the daily run on the old value. Raise this to
+  # keep an artifact that somebody downloads by hand days later.
+  DEFAULT_MAX_AGE_DAYS: '1'
 
 permissions:
+  # A permissions block sets every scope it does not name to no access, so the
+  # cache step needs its two read scopes spelled out: contents for the branch
+  # list, pull-requests for the state of a pull request.
   actions: write
+  contents: read
+  pull-requests: read
+
+# A scheduled run and a manual run can overlap. Two runs deleting the same
+# artifact or cache make each other fail, so let one finish first.
+concurrency:
+  group: cleanup-artifacts
+  cancel-in-progress: false
 
 jobs:
   cleanup:
-    name: Delete old build artifacts
+    name: Delete leftover artifacts and caches
     runs-on: ubuntu-latest
     steps:
       - name: Delete artifacts
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         with:
           script: |
-            const maxAgeDays = Number(context.payload.inputs?.max_age_days ?? 1);
+            // An empty input field must NOT read as 0, because 0 deletes every
+            // artifact. Only an explicit number overrides the repository default.
+            const fallback = Number(process.env.DEFAULT_MAX_AGE_DAYS);
+            const raw = context.payload.inputs?.max_age_days;
+            const maxAgeDays = raw === undefined || String(raw).trim() === ''
+              ? fallback
+              : Number(raw);
+            if (!Number.isFinite(maxAgeDays) || maxAgeDays < 0) {
+              core.setFailed(
+                `max age is not a non-negative number: input=${raw} ` +
+                `default=${process.env.DEFAULT_MAX_AGE_DAYS}`
+              );
+              return;
+            }
             const cutoff = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
 
             const artifacts = await github.paginate(
@@ -62,11 +99,92 @@ jobs:
 
             const mib = (freed / 1024 / 1024).toFixed(1);
             core.info(`scanned=${artifacts.length} deleted=${deleted} kept=${kept} failed=${failed} freed=${mib} MiB`);
-            core.summary
+            await core.summary
               .addHeading('Artifact cleanup')
               .addTable([
                 [{ data: 'Metric', header: true }, { data: 'Value', header: true }],
                 ['Scanned', String(artifacts.length)],
+                ['Deleted', String(deleted)],
+                ['Kept', String(kept)],
+                ['Failed', String(failed)],
+                ['Freed', `${mib} MiB`],
+              ])
+              .write();
+
+      - name: Delete caches of dead branches and closed pull requests
+        # A failed artifact step must not hide the cache quota, and the other way
+        # around. Each step reports its own counts.
+        if: always()
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+
+            const caches = await github.paginate(
+              github.rest.actions.getActionsCacheList,
+              { owner, repo, per_page: 100 }
+            );
+
+            // One listing instead of one lookup per cache, and it avoids passing a
+            // branch name with slashes through a URL path parameter.
+            const branchRefs = new Set(
+              (await github.paginate(
+                github.rest.repos.listBranches,
+                { owner, repo, per_page: 100 }
+              )).map((branch) => `refs/heads/${branch.name}`)
+            );
+
+            async function pullIsOpen(number) {
+              try {
+                const { data } = await github.rest.pulls.get({
+                  owner, repo, pull_number: number,
+                });
+                return data.state === 'open';
+              } catch (err) {
+                // A deleted pull request cannot receive another build.
+                if (err.status === 404) return false;
+                throw err;
+              }
+            }
+
+            async function refIsLive(ref) {
+              const pull = ref.match(/^refs\/pull\/(\d+)\//);
+              if (pull) return pullIsOpen(Number(pull[1]));
+              if (ref.startsWith('refs/heads/')) return branchRefs.has(ref);
+              // A tag ref or a shape this step does not know: never guess, keep it.
+              return true;
+            }
+
+            // Cache the verdict per ref, because one ref carries many caches.
+            const verdicts = new Map();
+            let deleted = 0, freed = 0, kept = 0, failed = 0;
+
+            for (const entry of caches) {
+              if (!verdicts.has(entry.ref)) {
+                verdicts.set(entry.ref, await refIsLive(entry.ref));
+              }
+              if (verdicts.get(entry.ref)) { kept++; continue; }
+              try {
+                await github.rest.actions.deleteActionsCacheById({
+                  owner, repo, cache_id: entry.id,
+                });
+                deleted++;
+                freed += entry.size_in_bytes;
+              } catch (err) {
+                // A concurrent run may delete the same cache first. Report the
+                // count instead of failing the whole job.
+                failed++;
+                core.warning(`delete cache ${entry.id} (${entry.key} @ ${entry.ref}): ${err.message}`);
+              }
+            }
+
+            const mib = (freed / 1024 / 1024).toFixed(1);
+            core.info(`scanned=${caches.length} deleted=${deleted} kept=${kept} failed=${failed} freed=${mib} MiB`);
+            await core.summary
+              .addHeading('Cache cleanup')
+              .addTable([
+                [{ data: 'Metric', header: true }, { data: 'Value', header: true }],
+                ['Scanned', String(caches.length)],
                 ['Deleted', String(deleted)],
                 ['Kept', String(kept)],
                 ['Failed', String(failed)],
