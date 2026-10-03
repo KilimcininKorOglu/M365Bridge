@@ -1,8 +1,12 @@
+name: m365bridge
+
 services:
   m365bridge:
     build: .
     image: ghcr.io/kilimcininkoroglu/m365bridge:latest
     container_name: m365bridge
+    environment:
+      TZ: Europe/Istanbul
     ports:
       - "8230:8000"
     volumes:
