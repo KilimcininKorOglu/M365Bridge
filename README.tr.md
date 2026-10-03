@@ -729,6 +729,7 @@ Model seçimi, M365 backend'inin okuduğu `tone` alanında taşınır. GPT-5.x k
 | `gpt5.4-reasoning`         | Gpt_5_4_Reasoning | gpt-5.4-reasoning | Evet     | GPT-5   |
 | `gpt5.5`                   | Gpt_5_5_Chat      | gpt-5.5           | Hayır    | GPT-5   |
 | `gpt5.5-reasoning`         | Gpt_5_5_Reasoning | gpt-5.5-reasoning | Evet     | GPT-5   |
+| `gpt5.6`                   | Gpt_5_6_Chat      | gpt-5.6           | Hayır    | GPT-5   |
 | `gpt5.6-reasoning`         | Gpt_5_6_Reasoning | gpt-5.6-reasoning | Evet     | GPT-5   |
 | `claude`                   | Claude_Sonnet     | claude-sonnet-4.6 | Hayır    | Claude  |
 | `claude-sonnet`            | Claude_Sonnet     | claude-sonnet-4.6 | Hayır    | Claude  |

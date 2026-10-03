@@ -729,6 +729,7 @@ Model selection travels in the `tone` field the M365 backend reads. GPT-5.x keys
 | `gpt5.4-reasoning`         | Gpt_5_4_Reasoning | gpt-5.4-reasoning | Yes      | GPT-5   |
 | `gpt5.5`                   | Gpt_5_5_Chat      | gpt-5.5           | No       | GPT-5   |
 | `gpt5.5-reasoning`         | Gpt_5_5_Reasoning | gpt-5.5-reasoning | Yes      | GPT-5   |
+| `gpt5.6`                   | Gpt_5_6_Chat      | gpt-5.6           | No       | GPT-5   |
 | `gpt5.6-reasoning`         | Gpt_5_6_Reasoning | gpt-5.6-reasoning | Yes      | GPT-5   |
 | `claude`                   | Claude_Sonnet     | claude-sonnet-4.6 | No       | Claude  |
 | `claude-sonnet`            | Claude_Sonnet     | claude-sonnet-4.6 | No       | Claude  |

@@ -168,6 +168,12 @@ var ModelRegistry = map[string]ModelConfig{
 		DisplayName: "GPT-5.5 Reasoning",
 		Thinking:    true,
 	},
+	"gpt5.6": {
+		Tone:        "Gpt_5_6_Chat",
+		Override:    "",
+		OpenAIID:    "gpt-5.6",
+		DisplayName: "GPT-5.6",
+	},
 	"gpt5.6-reasoning": {
 		Tone:        "Gpt_5_6_Reasoning",
 		Override:    "",
