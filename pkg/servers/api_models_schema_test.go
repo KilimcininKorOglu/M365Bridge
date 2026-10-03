@@ -178,6 +178,9 @@ var wantEffort = map[string]bool{
 	"gpt-6-astra": false, "gpt-5.6-chat-uppercase": false, "gpt-5.6-reasoning-uppercase": false,
 	"gpt-6-sol-chat": false, "gpt-6-sol-reasoning": true,
 	"gpt-6-sol-chat-uppercase": false, "gpt-6-sol-reasoning-uppercase": false,
+	"claude-sonnet-reasoning": false, "claude-fable": false,
+	"grok-4.5": false, "grok-auto": false, "grok-reasoning": true,
+	"muse-spark": false, "critique": false,
 	"claude-sonnet-4.6": false, "claude-opus-4.6": false,
 }
 
@@ -190,6 +193,9 @@ var wantThinking = map[string]bool{
 	"gpt-6-astra": false, "gpt-5.6-chat-uppercase": false, "gpt-5.6-reasoning-uppercase": true,
 	"gpt-6-sol-chat": false, "gpt-6-sol-reasoning": false,
 	"gpt-6-sol-chat-uppercase": false, "gpt-6-sol-reasoning-uppercase": false,
+	"claude-sonnet-reasoning": false, "claude-fable": false,
+	"grok-4.5": false, "grok-auto": false, "grok-reasoning": false,
+	"muse-spark": false, "critique": false,
 	"claude-sonnet-4.6": false, "claude-opus-4.6": true,
 }
 

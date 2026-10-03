@@ -214,6 +214,55 @@ var ModelRegistry = map[string]ModelConfig{
 	"gpt6-sol-reasoning-uppercase": {
 		Tone: "GPT_6_Sol_Reasoning", OpenAIID: "gpt-6-sol-reasoning-uppercase", DisplayName: "GPT-6 Sol Reasoning (uppercase tone)",
 	},
+	// Tones verified only to complete a turn on the included scenario
+	// (2026-10-03 probes); none attests the model serving behind it, and
+	// Claude_Sonnet_Reasoning, Grok_Auto and Critique self-identified as
+	// GPT-5.5 in that probe. They are advertised as selectors, not as model
+	// identities.
+	"claude-sonnet-think-deeper": {
+		Tone:        "Claude_Sonnet_Reasoning",
+		Override:    "",
+		OpenAIID:    "claude-sonnet-reasoning",
+		DisplayName: "Claude Sonnet Reasoning",
+		Owner:       OwnerAnthropic,
+	},
+	"claude-fable": {
+		Tone:        "Claude_Fable",
+		Override:    "",
+		OpenAIID:    "claude-fable",
+		DisplayName: "Claude Fable",
+		Owner:       OwnerAnthropic,
+	},
+	"grok-4.5": {
+		Tone:        "Grok_4_5",
+		Override:    "",
+		OpenAIID:    "grok-4.5",
+		DisplayName: "Grok 4.5",
+	},
+	"grok-auto": {
+		Tone:        "Grok_Auto",
+		Override:    "",
+		OpenAIID:    "grok-auto",
+		DisplayName: "Grok Auto",
+	},
+	"grok-reasoning": {
+		Tone:        "Grok_Reasoning",
+		Override:    "",
+		OpenAIID:    "grok-reasoning",
+		DisplayName: "Grok Reasoning",
+	},
+	"muse-spark": {
+		Tone:        "Muse_Spark",
+		Override:    "",
+		OpenAIID:    "muse-spark",
+		DisplayName: "Muse Spark",
+	},
+	"critique": {
+		Tone:        "Critique",
+		Override:    "",
+		OpenAIID:    "critique",
+		DisplayName: "Critique",
+	},
 	// Claude — real Anthropic models (verified via tone test, July 2026)
 	"claude": {
 		Tone:        "Claude_Sonnet",

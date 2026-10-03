@@ -739,10 +739,19 @@ Model selection travels in the `tone` field the M365 backend reads. GPT-5.x keys
 | `gpt6-sol-reasoning`       | Gpt_6_Sol_Reasoning | gpt-6-sol-reasoning | No   | GPT-6   |
 | `gpt6-sol-chat-uppercase`  | GPT_6_Sol_Chat    | gpt-6-sol-chat-uppercase | No | GPT-6   |
 | `gpt6-sol-reasoning-uppercase` | GPT_6_Sol_Reasoning | gpt-6-sol-reasoning-uppercase | No | GPT-6 |
+| `claude-sonnet-think-deeper` | Claude_Sonnet_Reasoning | claude-sonnet-reasoning | No | Claude  |
+| `claude-fable`             | Claude_Fable      | claude-fable      | No       | Claude  |
+| `grok-4.5`                 | Grok_4_5          | grok-4.5          | No       | Grok    |
+| `grok-auto`                | Grok_Auto         | grok-auto         | No       | Grok    |
+| `grok-reasoning`           | Grok_Reasoning    | grok-reasoning    | No       | Grok    |
+| `muse-spark`               | Muse_Spark        | muse-spark        | No       | Muse    |
+| `critique`                 | Critique          | critique          | No       | Critique |
 | `claude`                   | Claude_Sonnet     | claude-sonnet-4.6 | No       | Claude  |
 | `claude-sonnet`            | Claude_Sonnet     | claude-sonnet-4.6 | No       | Claude  |
 | `claude-opus`              | Claude_Opus       | claude-opus-4.6   | Yes      | Claude  |
 | `claude-sonnet-4-20250514` | Claude_Sonnet     | claude-sonnet-4.6 | No       | Claude  |
+
+The `claude-sonnet-think-deeper`, `claude-fable`, `grok-4.5`, `grok-auto`, `grok-reasoning`, `muse-spark` and `critique` entries are selectors, not attested model identities. Each completed a live turn on 2026-10-03, and M365 does not state which model serves behind a tone; in the same probe `Claude_Sonnet_Reasoning`, `Grok_Auto` and `Critique` answered a direct identity question with "GPT 5.5". Tone availability and routing drift with Microsoft's rollout, so a tone that serves today may refuse tomorrow.
 
 ### Which one to use
 

@@ -739,10 +739,19 @@ Model seçimi, M365 backend'inin okuduğu `tone` alanında taşınır. GPT-5.x k
 | `gpt6-sol-reasoning`       | Gpt_6_Sol_Reasoning | gpt-6-sol-reasoning | Hayır | GPT-6  |
 | `gpt6-sol-chat-uppercase`  | GPT_6_Sol_Chat    | gpt-6-sol-chat-uppercase | Hayır | GPT-6 |
 | `gpt6-sol-reasoning-uppercase` | GPT_6_Sol_Reasoning | gpt-6-sol-reasoning-uppercase | Hayır | GPT-6 |
+| `claude-sonnet-think-deeper` | Claude_Sonnet_Reasoning | claude-sonnet-reasoning | Hayır | Claude |
+| `claude-fable`             | Claude_Fable      | claude-fable      | Hayır    | Claude  |
+| `grok-4.5`                 | Grok_4_5          | grok-4.5          | Hayır    | Grok    |
+| `grok-auto`                | Grok_Auto         | grok-auto         | Hayır    | Grok    |
+| `grok-reasoning`           | Grok_Reasoning    | grok-reasoning    | Hayır    | Grok    |
+| `muse-spark`               | Muse_Spark        | muse-spark        | Hayır    | Muse    |
+| `critique`                 | Critique          | critique          | Hayır    | Critique |
 | `claude`                   | Claude_Sonnet     | claude-sonnet-4.6 | Hayır    | Claude  |
 | `claude-sonnet`            | Claude_Sonnet     | claude-sonnet-4.6 | Hayır    | Claude  |
 | `claude-opus`              | Claude_Opus       | claude-opus-4.6   | Evet     | Claude  |
 | `claude-sonnet-4-20250514` | Claude_Sonnet     | claude-sonnet-4.6 | Hayır    | Claude  |
+
+`claude-sonnet-think-deeper`, `claude-fable`, `grok-4.5`, `grok-auto`, `grok-reasoning`, `muse-spark` ve `critique` girdileri selector'dır; arkalarında hangi modelin servis ettiği doğrulanmış değildir. Her biri 2026-10-03 tarihinde canlı bir turu tamamladı ve M365 bir tone'un arkasındaki modeli açıklamaz; aynı probe'da `Claude_Sonnet_Reasoning`, `Grok_Auto` ve `Critique` doğrudan kimlik sorusuna "GPT 5.5" ile yanıt verdi. Tone erişilebilirliği ve yönlendirme Microsoft'un rollout'uyla değişir, bugün servis eden bir tone yarın reddedebilir.
 
 ### Hangisini kullanmalı
 
