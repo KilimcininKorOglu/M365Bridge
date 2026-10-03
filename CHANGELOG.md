@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [1.5.2] - 2026-10-03
+
+### Added
+- Serve the GPT-5.6 chat tone as `gpt5.6`. The tone was measured serving on the included scenario; the registry only carried the reasoning variant
+- Serve GPT-6 Sol as `gpt6sol`. The tone self-identifies as a GPT-6 reasoning model, serves on the included scenario, and emitted no reasoning content in the measured turn, so it advertises no thinking. `Gpt_6_Reasoning` was also probed and fails with an InternalError deflection on this account under both scenarios, so it stays unregistered and the WS query keeps the included scenario
+- Register the additional verified M365 tones from PR #26: `gpt6-astra`, the uppercase `GPT_`-prefix variants of the 5.6 chat and reasoning tones, and the Sol chat and reasoning tones in both casings. Every one was probed live and completed a turn
+- Publish a deduplicated and order-stable `/v1/models` list, and carry the Codex catalog fields (`base_instructions`, `apply_patch_tool_type`, `default_reasoning_level`) on every entry
+
+### Fixed
+- Advertise thinking for `gpt5.6-reasoning-uppercase`, which reaches the same tone as `gpt5.6-reasoning` but silently disagreed with its sibling in the capability catalog
+
+### Changed
+- List the new tone entries in both README model tables
+- Delete old caches alongside old artifacts on a schedule
+
 ## [1.5.1] - 2026-09-18
 
 ### Added
