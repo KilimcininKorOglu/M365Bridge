@@ -200,6 +200,7 @@ var ModelRegistry = map[string]ModelConfig{
 	},
 	"gpt5.6-reasoning-uppercase": {
 		Tone: "GPT_5_6_Reasoning", OpenAIID: "gpt-5.6-reasoning-uppercase", DisplayName: "GPT-5.6 Reasoning (uppercase tone)",
+		Thinking: true,
 	},
 	"gpt6-sol-chat": {
 		Tone: "Gpt_6_Sol_Chat", OpenAIID: "gpt-6-sol-chat", DisplayName: "GPT-6 Sol Chat",
