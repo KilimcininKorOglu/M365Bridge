@@ -594,11 +594,13 @@ const designerBrokerScope = "https://designerappservice.officeapps.live.com/.def
 // request body. MSAL.js uses the brk-multihub scheme for brokered flows.
 const designerBrokerRedirectURI = "brk-multihub://outlook.office.com"
 
-// brokerClientID is the broker app client_id used in broker token requests.
+// BrokerClientID is the broker app client_id used in broker token requests.
 // This is always c0ab8ce9 (the M365 Copilot broker app), regardless of the
 // configured M365_CLIENT_ID, because the broker flow requires the broker
 // app's client_id to acquire tokens on behalf of the brokered app (4765445b).
-const brokerClientID = "c0ab8ce9-e9a0-42e7-b064-33d422df41f1"
+// It is exported because the browser login flow classifies a captured token
+// exchange as the broker grant by this value.
+const BrokerClientID = "c0ab8ce9-e9a0-42e7-b064-33d422df41f1"
 
 // designerTokenCache is the on-disk cache for the designerapp access token.
 type designerTokenCache struct {
@@ -738,13 +740,13 @@ func (tm *TokenManager) buildDesignerTokenRequest(refreshToken string) (*http.Re
 		tm.tenant,
 		designerClientID,
 		url.QueryEscape(defaultRedirectURI),
-		brokerClientID,
+		BrokerClientID,
 		generateClientRequestID(),
 	)
 
 	// Build the request body matching MSAL.js broker flow
 	body := url.Values{
-		"client_id":                  {brokerClientID},
+		"client_id":                  {BrokerClientID},
 		"redirect_uri":               {designerBrokerRedirectURI},
 		"scope":                      {designerBrokerScope},
 		"grant_type":                 {"refresh_token"},
@@ -884,7 +886,7 @@ func (tm *TokenManager) acquireBrokerRefreshTokenViaSSO() (string, error) {
 // why the standard token cannot be reused for it.
 func (tm *TokenManager) brokerAuthorizeTarget(challenge string) string {
 	params := url.Values{
-		"client_id":             {brokerClientID},
+		"client_id":             {BrokerClientID},
 		"response_type":         {"code"},
 		"redirect_uri":          {designerBrokerRedirectURI},
 		"scope":                 {designerBrokerScope},
@@ -985,12 +987,12 @@ func (tm *TokenManager) exchangeBrokerAuthCode(authCode, verifier string) (strin
 		tm.tenant,
 		designerClientID,
 		url.QueryEscape(defaultRedirectURI),
-		brokerClientID,
+		BrokerClientID,
 		generateClientRequestID(),
 	)
 
 	body := url.Values{
-		"client_id":        {brokerClientID},
+		"client_id":        {BrokerClientID},
 		"redirect_uri":     {designerBrokerRedirectURI},
 		"scope":            {designerBrokerScope},
 		"grant_type":       {"authorization_code"},
@@ -1070,6 +1072,15 @@ func (tm *TokenManager) readBrokerRefreshToken() (string, error) {
 
 // writeBrokerRefreshToken encrypts and writes the broker refresh token to file.
 func (tm *TokenManager) writeBrokerRefreshToken(token string) error {
+	return SaveBrokerRefreshToken(token)
+}
+
+// SaveBrokerRefreshToken encrypts and stores a broker-compatible refresh
+// token, the credential GetDesignerToken redeems for designerapp access
+// tokens. The setup flows call it with a value captured from the browser,
+// so it shares the encrypted store and write discipline of the other
+// credential files.
+func SaveBrokerRefreshToken(token string) error {
 	encrypted, err := crypto.Encrypt(token)
 	if err != nil {
 		return fmt.Errorf("failed to encrypt broker refresh token: %w", err)

@@ -59,6 +59,9 @@ func main() {
 		case "setup-wizard":
 			runSetupWizard(os.Args[2:])
 			return
+		case "login":
+			runLogin(os.Args[2:])
+			return
 		}
 	}
 
@@ -87,6 +90,7 @@ USAGE
   m365-bridge [flags] ["question"]      Ask one question, or start interactive mode
   m365-bridge serve [flags]             Run the HTTP API server and web interface
   m365-bridge setup-wizard [flags]      Import credentials from a browser export
+  m365-bridge login [flags]             Capture every credential in your own browser
   m365-bridge --help                    Print this text
 
   Every flag is optional. With none, serve listens on port %d and setup-wizard
@@ -107,6 +111,10 @@ SERVE FLAGS
 SETUP-WIZARD FLAGS
   -file <path>      Setup JSON with oid, tenant and refresh_token (default %q)
 
+LOGIN FLAGS
+  -browser <path>   Browser executable to drive (default: discover the
+                    installed Chrome automatically)
+
 `, models.Version, defaultPort, defaultSetupFile, defaultModel, defaultPort, defaultSetupFile)
 
 	printEnvironment(w)
@@ -118,6 +126,7 @@ EXAMPLES
   m365-bridge serve --port 8000
   m365-bridge --list-models
   m365-bridge setup-wizard
+  m365-bridge login
 `)
 }
 
@@ -249,6 +258,20 @@ func runSetupWizard(args []string) {
 	_ = fs.Parse(args)
 
 	if err := setup.Run(*file); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// runLogin drives the user's own browser through the M365 sign-in and
+// captures every credential the gateway keeps in one pass.
+func runLogin(args []string) {
+	fs := flag.NewFlagSet("login", flag.ExitOnError)
+	fs.Usage = func() { printUsage(os.Stdout) }
+	browser := fs.String("browser", "", "Browser executable to drive; empty discovers the installed Chrome")
+	_ = fs.Parse(args)
+
+	if err := setup.RunLogin(setup.LoginOptions{BrowserPath: *browser}); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
