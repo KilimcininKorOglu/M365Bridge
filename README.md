@@ -731,6 +731,7 @@ Model selection travels in the `tone` field the M365 backend reads. GPT-5.x keys
 | `gpt5.5-reasoning`         | Gpt_5_5_Reasoning | gpt-5.5-reasoning | Yes      | GPT-5   |
 | `gpt5.6`                   | Gpt_5_6_Chat      | gpt-5.6           | No       | GPT-5   |
 | `gpt5.6-reasoning`         | Gpt_5_6_Reasoning | gpt-5.6-reasoning | Yes      | GPT-5   |
+| `gpt6sol`                  | Gpt_6_Sol_Reasoning | gpt-6-sol       | No       | GPT-6   |
 | `claude`                   | Claude_Sonnet     | claude-sonnet-4.6 | No       | Claude  |
 | `claude-sonnet`            | Claude_Sonnet     | claude-sonnet-4.6 | No       | Claude  |
 | `claude-opus`              | Claude_Opus       | claude-opus-4.6   | Yes      | Claude  |
@@ -743,7 +744,7 @@ Model selection travels in the `tone` field the M365 backend reads. GPT-5.x keys
 | General purpose, let the backend decide   | `auto`             |
 | Fast answers to simple questions          | `quick`            |
 | Complex reasoning, multi-step problems    | `gpt5.5-reasoning` |
-| The newest reasoning model                | `gpt5.6-reasoning` |
+| The newest reasoning model                | `gpt6sol`          |
 | Plain chat on a recent model              | `gpt5.5`           |
 | Claude Sonnet 4.6                         | `claude-sonnet`    |
 | Claude Opus 4.6, the most capable         | `claude-opus`      |

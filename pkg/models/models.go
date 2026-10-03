@@ -181,6 +181,17 @@ var ModelRegistry = map[string]ModelConfig{
 		DisplayName: "GPT-5.6 Reasoning",
 		Thinking:    true,
 	},
+	// GPT-6 Sol is the tone the M365 web client labels "GPT 6.0 Sol". It serves
+	// on the included scenario and self-identified as a GPT-6 reasoning model,
+	// but emitted no reasoning content in the measured turn, so Thinking stays
+	// off until a turn produces it. Gpt_6_Reasoning was also probed and fails
+	// with an InternalError deflection on this account under both scenarios.
+	"gpt6sol": {
+		Tone:        "Gpt_6_Sol_Reasoning",
+		Override:    "",
+		OpenAIID:    "gpt-6-sol",
+		DisplayName: "GPT-6 Sol",
+	},
 	// Claude — real Anthropic models (verified via tone test, July 2026)
 	"claude": {
 		Tone:        "Claude_Sonnet",

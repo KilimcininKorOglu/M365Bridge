@@ -731,6 +731,7 @@ Model seçimi, M365 backend'inin okuduğu `tone` alanında taşınır. GPT-5.x k
 | `gpt5.5-reasoning`         | Gpt_5_5_Reasoning | gpt-5.5-reasoning | Evet     | GPT-5   |
 | `gpt5.6`                   | Gpt_5_6_Chat      | gpt-5.6           | Hayır    | GPT-5   |
 | `gpt5.6-reasoning`         | Gpt_5_6_Reasoning | gpt-5.6-reasoning | Evet     | GPT-5   |
+| `gpt6sol`                  | Gpt_6_Sol_Reasoning | gpt-6-sol       | Hayır    | GPT-6   |
 | `claude`                   | Claude_Sonnet     | claude-sonnet-4.6 | Hayır    | Claude  |
 | `claude-sonnet`            | Claude_Sonnet     | claude-sonnet-4.6 | Hayır    | Claude  |
 | `claude-opus`              | Claude_Opus       | claude-opus-4.6   | Evet     | Claude  |
@@ -743,7 +744,7 @@ Model seçimi, M365 backend'inin okuduğu `tone` alanında taşınır. GPT-5.x k
 | Genel kullanım, seçimi backend yapsın      | `auto`             |
 | Basit sorulara hızlı cevap                 | `quick`            |
 | Karmaşık akıl yürütme, çok adımlı problem  | `gpt5.5-reasoning` |
-| En yeni reasoning modeli                   | `gpt5.6-reasoning` |
+| En yeni reasoning modeli                   | `gpt6sol`          |
 | Güncel bir modelde düz sohbet              | `gpt5.5`           |
 | Claude Sonnet 4.6                          | `claude-sonnet`    |
 | Claude Opus 4.6, en yetenekli olan         | `claude-opus`      |
