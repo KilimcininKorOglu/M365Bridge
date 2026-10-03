@@ -114,6 +114,8 @@ SETUP-WIZARD FLAGS
 LOGIN FLAGS
   -browser <path>   Browser executable to drive (default: discover the
                     installed Chrome automatically)
+  -cookies <path>   JSON cookie file to seed the browser with, for an
+                    unattended sign-in
 
 `, models.Version, defaultPort, defaultSetupFile, defaultModel, defaultPort, defaultSetupFile)
 
@@ -269,9 +271,10 @@ func runLogin(args []string) {
 	fs := flag.NewFlagSet("login", flag.ExitOnError)
 	fs.Usage = func() { printUsage(os.Stdout) }
 	browser := fs.String("browser", "", "Browser executable to drive; empty discovers the installed Chrome")
+	cookies := fs.String("cookies", "", "JSON cookie file to seed the browser with, for an unattended sign-in")
 	_ = fs.Parse(args)
 
-	if err := setup.RunLogin(setup.LoginOptions{BrowserPath: *browser}); err != nil {
+	if err := setup.RunLogin(setup.LoginOptions{BrowserPath: *browser, CookiesFile: *cookies}); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}

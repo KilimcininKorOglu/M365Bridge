@@ -30,7 +30,7 @@ const (
 	libraryURL        = "https://m365.cloud.microsoft/library"
 	searchURL         = "https://m365.cloud.microsoft/search"
 	tokenURLPath      = "/oauth2/v2.0/token"
-	defaultLoginWait  = 5 * time.Minute
+	defaultLoginWait  = 10 * time.Minute
 	defaultRouteWait  = 8 * time.Second
 	defaultBrokerWait = 45 * time.Second
 )
@@ -40,6 +40,12 @@ type LoginOptions struct {
 	// BrowserPath is the executable to drive. Empty discovers the user's
 	// installed Chrome automatically.
 	BrowserPath string
+	// CookiesFile optionally seeds the browser with cookies before the first
+	// navigation, as a JSON array of {name, value, domain, path, secure,
+	// httpOnly} objects. A seeding file from an earlier run signs the browser
+	// in without interactive typing, which is how one command run renews
+	// everything unattended.
+	CookiesFile string
 }
 
 // RunLogin runs the full browser login: open the browser, wait for the
@@ -48,25 +54,14 @@ type LoginOptions struct {
 func RunLogin(opts LoginOptions) error {
 	printLoginBanner()
 
-	profileDir, err := os.MkdirTemp("", "m365-bridge-login-")
-	if err != nil {
-		return fmt.Errorf("failed to create a browser profile: %w", err)
-	}
-	defer os.RemoveAll(profileDir)
-
-	taskCtx, cancel, err := startBrowser(opts.BrowserPath, profileDir)
+	capture := newTokenCapture()
+	taskCtx, cancel, err := startCaptureSession(opts, capture)
 	if err != nil {
 		return err
 	}
 	defer cancel()
 
-	capture := newTokenCapture(taskCtx)
-	chromedp.ListenTarget(taskCtx, capture.onEvent)
-	if err := chromedp.Run(taskCtx, network.Enable()); err != nil {
-		return fmt.Errorf("failed to attach the network listener: %w", err)
-	}
-
-	if err := chromedp.Run(taskCtx, chromedp.Navigate(chatHomeURL)); err != nil {
+	if err := chromedp.Run(taskCtx, navigate(chatHomeURL)); err != nil {
 		return fmt.Errorf("failed to open the M365 page: %w", err)
 	}
 	fmt.Println("  A Chrome window is open. Sign in to your M365 account there.")
@@ -109,9 +104,59 @@ func printLoginBanner() {
 	fmt.Println("    - the designer broker refresh token (image generation)")
 	fmt.Println("    - every cookie the browser holds (login and M365 web)")
 	fmt.Println()
+	fmt.Println("  The browser profile persists under data/browser-profile, so the")
+	fmt.Println("  first run needs one interactive sign-in and later runs renew")
+	fmt.Println("  on their own.")
+	fmt.Println()
 }
 
-// startBrowser launches the user's own Chrome headed on a throwaway profile
+// startCaptureSession launches the browser with the persistent profile,
+// attaches the token capture, and seeds cookies when a file is configured.
+//
+// The browser profile lives under data/browser-profile and is kept across
+// runs on purpose: the app's MSAL state from the first interactive sign-in
+// is what lets every later run renew unattended. A throwaway profile was
+// measured dropping the app back to its own login route even when the
+// session cookies granted a fresh authorization code.
+func startCaptureSession(opts LoginOptions, capture *tokenCapture) (context.Context, context.CancelFunc, error) {
+	profileDir := "data/browser-profile"
+	if err := os.MkdirAll(profileDir, 0700); err != nil {
+		return nil, nil, fmt.Errorf("failed to create the browser profile: %w", err)
+	}
+
+	taskCtx, cancel, err := startBrowser(opts.BrowserPath, profileDir)
+	if err != nil {
+		return nil, nil, err
+	}
+	// A hard ceiling so no browser round-trip can hang the command forever.
+	taskCtx, timeoutCancel := context.WithTimeout(taskCtx, defaultLoginWait+time.Minute)
+
+	chromedp.ListenTarget(taskCtx, capture.onEvent)
+	if err := chromedp.Run(taskCtx, chromedp.ActionFunc(func(actx context.Context) error {
+		// The executor only exists once Run has attached to the target, so
+		// the capture stores this bound context for its later round-trips.
+		if err := network.Enable().Do(actx); err != nil {
+			return err
+		}
+		capture.ctx = actx
+		return nil
+	})); err != nil {
+		timeoutCancel()
+		cancel()
+		return nil, nil, fmt.Errorf("failed to attach the network listener: %w", err)
+	}
+
+	if opts.CookiesFile != "" {
+		if err := seedCookies(taskCtx, opts.CookiesFile); err != nil {
+			timeoutCancel()
+			cancel()
+			return nil, nil, err
+		}
+	}
+	return taskCtx, func() { timeoutCancel(); cancel() }, nil
+}
+
+// startBrowser launches the user's own Chrome headed on the given profile
 // and returns the tab context with its cancel function.
 func startBrowser(browserPath, profileDir string) (context.Context, context.CancelFunc, error) {
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
@@ -126,22 +171,87 @@ func startBrowser(browserPath, profileDir string) (context.Context, context.Canc
 	return taskCtx, func() { taskCancel(); allocCancel() }, nil
 }
 
+// seedCookies loads a cookie file into the browser before the first
+// navigation, so a browser holding valid session cookies signs in without
+// interactive typing. The seeding happens through the login command's own
+// CDP session: a second client driving the same tab desynchronizes this
+// session's load-state tracking and hangs every later command.
+func seedCookies(ctx context.Context, path string) error {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("failed to read the cookie file: %w", err)
+	}
+	cookies, err := parseCookieFile(raw)
+	if err != nil {
+		return fmt.Errorf("failed to parse the cookie file: %w", err)
+	}
+	return chromedp.Run(ctx, chromedp.ActionFunc(func(actx context.Context) error {
+		cookieParams := make([]*network.CookieParam, 0, len(cookies))
+		for _, c := range cookies {
+			if c.Domain == "" {
+				return fmt.Errorf("cookie %s carries no domain", c.Name)
+			}
+			cookieParams = append(cookieParams, &network.CookieParam{
+				Name:     c.Name,
+				Value:    c.Value,
+				Domain:   strings.TrimPrefix(c.Domain, "."),
+				Path:     c.Path,
+				Secure:   c.Secure,
+				HTTPOnly: c.HttpOnly,
+			})
+		}
+		return storage.SetCookies(cookieParams).Do(actx)
+	}))
+}
+
+// parseCookieFile decodes the JSON cookie array the capture tools and the
+// wizard hand around.
+func parseCookieFile(raw []byte) ([]auth.SSOCookie, error) {
+	var cookies []auth.SSOCookie
+	if err := json.Unmarshal(raw, &cookies); err != nil {
+		return nil, err
+	}
+	if len(cookies) == 0 {
+		return nil, fmt.Errorf("the cookie file holds no cookies")
+	}
+	return cookies, nil
+}
+
+// navigate points the tab at a URL through a page-script location change
+// deferred with setTimeout(0). Two measured hangs shaped this: the
+// protocol's Page.navigate waits for a frame event a live SPA never lets
+// settle, and a synchronous location change destroys the execution context
+// before Runtime.evaluate can answer, which hangs the evaluate itself. The
+// deferred change answers first and navigates after; the callers settle by
+// polling.
+func navigate(page string) chromedp.Action {
+	return chromedp.Evaluate(fmt.Sprintf("setTimeout(() => { window.location.href = %q; }, 0); 'queued'", page), nil)
+}
+
 // waitForSignIn polls the tab location until the SPA has landed back on the
-// chat surface, which happens only after a completed sign-in.
+// chat surface, which happens only after a completed sign-in. Two
+// consecutive confirmations a second apart are required, so the first poll
+// cannot answer before the app redirects an unauthenticated visitor away.
 func waitForSignIn(ctx context.Context, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
+	confirmed := 0
 	for {
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("login did not complete: %w", err)
 		}
 		var loc string
 		if err := chromedp.Run(ctx, chromedp.Location(&loc)); err == nil && onAppSurface(loc) {
-			return nil
+			confirmed++
+			if confirmed >= 2 {
+				return nil
+			}
+		} else {
+			confirmed = 0
 		}
 		if time.Now().After(deadline) {
 			return fmt.Errorf("login was not completed within %s", timeout)
 		}
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(time.Second)
 	}
 }
 
@@ -163,14 +273,14 @@ func captureStandard(ctx context.Context, capture *tokenCapture) (string, error)
 		if rt := capture.Standard(); rt != "" {
 			return rt, nil
 		}
-		if err := chromedp.Run(ctx, chromedp.Navigate(page)); err != nil {
+		if err := chromedp.Run(ctx, navigate(page)); err != nil {
 			return "", fmt.Errorf("failed to navigate to %s: %w", page, err)
 		}
 		if err := waitRoute(ctx, defaultRouteWait, capture.standardCh); err == nil {
 			return capture.Standard(), nil
 		}
 	}
-	return "", fmt.Errorf("no standard refresh token was captured while walking the app routes")
+	return "", fmt.Errorf("no standard refresh token was captured while walking the app routes (%s)", capture.summary())
 }
 
 // captureBroker asks the app for one image so the designer broker grant
@@ -374,15 +484,39 @@ type tokenCapture struct {
 	tokenReqs  map[network.RequestID]bool
 	standardCh chan string
 	brokerCh   chan string
+	requests   int
+	exchanges  int
+	docs       []string
+	note       string
 }
 
-func newTokenCapture(ctx context.Context) *tokenCapture {
+func newTokenCapture() *tokenCapture {
 	return &tokenCapture{
-		ctx:        ctx,
 		tokenReqs:  map[network.RequestID]bool{},
 		standardCh: make(chan string, 4),
 		brokerCh:   make(chan string, 4),
 	}
+}
+
+// summary reports how many network requests and token endpoint exchanges the
+// browser fired, which documents it loaded, and why the last exchange was
+// not captured.
+func (c *tokenCapture) summary() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	base := fmt.Sprintf("%d network requests seen, %d token endpoint exchanges, documents: %s",
+		c.requests, c.exchanges, strings.Join(c.docs, " -> "))
+	if c.note != "" {
+		return base + "; last note: " + c.note
+	}
+	return base
+}
+
+// noteProblem records why an exchange was not captured.
+func (c *tokenCapture) noteProblem(format string, args ...any) {
+	c.mu.Lock()
+	c.note = fmt.Sprintf(format, args...)
+	c.mu.Unlock()
 }
 
 // Standard returns the captured standard refresh token, if any.
@@ -405,17 +539,29 @@ func (c *tokenCapture) Broker() string {
 func (c *tokenCapture) onEvent(ev any) {
 	switch ev := ev.(type) {
 	case *network.EventRequestWillBeSent:
+		c.mu.Lock()
+		c.requests++
+		if ev.Type == "Document" && len(c.docs) < 6 && !strings.Contains(ev.Request.URL, "login.microsoftonline.com") {
+			c.docs = append(c.docs, fmt.Sprintf("%.60s", strings.TrimPrefix(ev.Request.URL, "https://")))
+		}
+		c.mu.Unlock()
 		if strings.Contains(ev.Request.URL, tokenURLPath) {
 			c.mu.Lock()
 			c.tokenReqs[ev.RequestID] = true
 			c.mu.Unlock()
 		}
 	case *network.EventResponseReceived:
+		if !strings.Contains(ev.Response.URL, tokenURLPath) {
+			return
+		}
 		c.mu.Lock()
+		c.exchanges++
 		_, known := c.tokenReqs[ev.RequestID]
 		c.mu.Unlock()
 		if known {
 			go c.classify(ev.RequestID)
+		} else {
+			c.noteProblem("response %s was never seen as a request", ev.RequestID)
 		}
 	}
 }
@@ -426,11 +572,13 @@ func (c *tokenCapture) onEvent(ev any) {
 func (c *tokenCapture) classify(id network.RequestID) {
 	body, err := network.GetResponseBody(id).Do(c.ctx)
 	if err != nil {
+		c.noteProblem("response body of %s: %v", id, err)
 		return
 	}
 
 	rt := refreshTokenFrom(body)
 	if rt == "" {
+		c.noteProblem("response %s carried no refresh_token", id)
 		return
 	}
 	isBroker := clientIDFromPost(c, id) == auth.BrokerClientID
