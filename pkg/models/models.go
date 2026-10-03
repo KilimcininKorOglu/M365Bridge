@@ -192,6 +192,27 @@ var ModelRegistry = map[string]ModelConfig{
 		OpenAIID:    "gpt-6-sol",
 		DisplayName: "GPT-6 Sol",
 	},
+	"gpt6-astra": {
+		Tone: "GPT_6_Astra", OpenAIID: "gpt-6-astra", DisplayName: "GPT-6 Astra",
+	},
+	"gpt5.6-chat-uppercase": {
+		Tone: "GPT_5_6_Chat", OpenAIID: "gpt-5.6-chat-uppercase", DisplayName: "GPT-5.6 Chat (uppercase tone)",
+	},
+	"gpt5.6-reasoning-uppercase": {
+		Tone: "GPT_5_6_Reasoning", OpenAIID: "gpt-5.6-reasoning-uppercase", DisplayName: "GPT-5.6 Reasoning (uppercase tone)",
+	},
+	"gpt6-sol-chat": {
+		Tone: "Gpt_6_Sol_Chat", OpenAIID: "gpt-6-sol-chat", DisplayName: "GPT-6 Sol Chat",
+	},
+	"gpt6-sol-reasoning": {
+		Tone: "Gpt_6_Sol_Reasoning", OpenAIID: "gpt-6-sol-reasoning", DisplayName: "GPT-6 Sol Reasoning",
+	},
+	"gpt6-sol-chat-uppercase": {
+		Tone: "GPT_6_Sol_Chat", OpenAIID: "gpt-6-sol-chat-uppercase", DisplayName: "GPT-6 Sol Chat (uppercase tone)",
+	},
+	"gpt6-sol-reasoning-uppercase": {
+		Tone: "GPT_6_Sol_Reasoning", OpenAIID: "gpt-6-sol-reasoning-uppercase", DisplayName: "GPT-6 Sol Reasoning (uppercase tone)",
+	},
 	// Claude — real Anthropic models (verified via tone test, July 2026)
 	"claude": {
 		Tone:        "Claude_Sonnet",
