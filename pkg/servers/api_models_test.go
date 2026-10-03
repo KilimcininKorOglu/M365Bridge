@@ -69,6 +69,34 @@ func TestModelsListIsDeduplicatedAndStable(t *testing.T) {
 	}
 }
 
+func TestAdditionalTonesResolveAndAppearInCatalog(t *testing.T) {
+	want := map[string]struct {
+		id   string
+		tone string
+	}{
+		"gpt6-astra":                   {"gpt-6-astra", "GPT_6_Astra"},
+		"gpt5.6-chat-uppercase":        {"gpt-5.6-chat-uppercase", "GPT_5_6_Chat"},
+		"gpt5.6-reasoning-uppercase":   {"gpt-5.6-reasoning-uppercase", "GPT_5_6_Reasoning"},
+		"gpt6-sol-chat":                {"gpt-6-sol-chat", "Gpt_6_Sol_Chat"},
+		"gpt6-sol-reasoning":           {"gpt-6-sol-reasoning", "Gpt_6_Sol_Reasoning"},
+		"gpt6-sol-chat-uppercase":      {"gpt-6-sol-chat-uppercase", "GPT_6_Sol_Chat"},
+		"gpt6-sol-reasoning-uppercase": {"gpt-6-sol-reasoning-uppercase", "GPT_6_Sol_Reasoning"},
+	}
+	listed := make(map[string]bool)
+	for _, entry := range fetchModels(t, &models.Config{}).Data {
+		listed[entry.ID] = true
+	}
+	for key, expected := range want {
+		cfg, ok := models.FindModel(key)
+		if !ok || cfg.OpenAIID != expected.id || cfg.Tone != expected.tone {
+			t.Errorf("%s: resolved (%v, %q, %q), want (%q, %q)", key, ok, cfg.OpenAIID, cfg.Tone, expected.id, expected.tone)
+		}
+		if !listed[expected.id] {
+			t.Errorf("%s is absent from /v1/models", expected.id)
+		}
+	}
+}
+
 func TestModelsListReportsOwnerAndCapabilities(t *testing.T) {
 	got := fetchModels(t, &models.Config{ContextWindowTokens: 1_000_000, MaxOutputTokens: 1_000_000})
 
