@@ -732,6 +732,13 @@ Model seçimi, M365 backend'inin okuduğu `tone` alanında taşınır. GPT-5.x k
 | `gpt5.6`                   | Gpt_5_6_Chat      | gpt-5.6           | Hayır    | GPT-5   |
 | `gpt5.6-reasoning`         | Gpt_5_6_Reasoning | gpt-5.6-reasoning | Evet     | GPT-5   |
 | `gpt6sol`                  | Gpt_6_Sol_Reasoning | gpt-6-sol       | Hayır    | GPT-6   |
+| `gpt6-astra`               | GPT_6_Astra       | gpt-6-astra       | Hayır    | GPT-6   |
+| `gpt5.6-chat-uppercase`    | GPT_5_6_Chat      | gpt-5.6-chat-uppercase | Hayır | GPT-5  |
+| `gpt5.6-reasoning-uppercase` | GPT_5_6_Reasoning | gpt-5.6-reasoning-uppercase | Evet | GPT-5 |
+| `gpt6-sol-chat`            | Gpt_6_Sol_Chat    | gpt-6-sol-chat    | Hayır    | GPT-6   |
+| `gpt6-sol-reasoning`       | Gpt_6_Sol_Reasoning | gpt-6-sol-reasoning | Hayır | GPT-6  |
+| `gpt6-sol-chat-uppercase`  | GPT_6_Sol_Chat    | gpt-6-sol-chat-uppercase | Hayır | GPT-6 |
+| `gpt6-sol-reasoning-uppercase` | GPT_6_Sol_Reasoning | gpt-6-sol-reasoning-uppercase | Hayır | GPT-6 |
 | `claude`                   | Claude_Sonnet     | claude-sonnet-4.6 | Hayır    | Claude  |
 | `claude-sonnet`            | Claude_Sonnet     | claude-sonnet-4.6 | Hayır    | Claude  |
 | `claude-opus`              | Claude_Opus       | claude-opus-4.6   | Evet     | Claude  |

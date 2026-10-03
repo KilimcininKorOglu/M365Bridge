@@ -732,6 +732,13 @@ Model selection travels in the `tone` field the M365 backend reads. GPT-5.x keys
 | `gpt5.6`                   | Gpt_5_6_Chat      | gpt-5.6           | No       | GPT-5   |
 | `gpt5.6-reasoning`         | Gpt_5_6_Reasoning | gpt-5.6-reasoning | Yes      | GPT-5   |
 | `gpt6sol`                  | Gpt_6_Sol_Reasoning | gpt-6-sol       | No       | GPT-6   |
+| `gpt6-astra`               | GPT_6_Astra       | gpt-6-astra       | No       | GPT-6   |
+| `gpt5.6-chat-uppercase`    | GPT_5_6_Chat      | gpt-5.6-chat-uppercase | No  | GPT-5   |
+| `gpt5.6-reasoning-uppercase` | GPT_5_6_Reasoning | gpt-5.6-reasoning-uppercase | Yes | GPT-5 |
+| `gpt6-sol-chat`            | Gpt_6_Sol_Chat    | gpt-6-sol-chat    | No       | GPT-6   |
+| `gpt6-sol-reasoning`       | Gpt_6_Sol_Reasoning | gpt-6-sol-reasoning | No   | GPT-6   |
+| `gpt6-sol-chat-uppercase`  | GPT_6_Sol_Chat    | gpt-6-sol-chat-uppercase | No | GPT-6   |
+| `gpt6-sol-reasoning-uppercase` | GPT_6_Sol_Reasoning | gpt-6-sol-reasoning-uppercase | No | GPT-6 |
 | `claude`                   | Claude_Sonnet     | claude-sonnet-4.6 | No       | Claude  |
 | `claude-sonnet`            | Claude_Sonnet     | claude-sonnet-4.6 | No       | Claude  |
 | `claude-opus`              | Claude_Opus       | claude-opus-4.6   | Yes      | Claude  |
