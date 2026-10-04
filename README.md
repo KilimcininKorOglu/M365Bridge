@@ -131,6 +131,20 @@ You will collect three things from your browser, write them into one JSON file, 
 
 > Collect all three. The refresh token alone expires after **24 hours**, and a setup without cookies stops working the next day. This is the single most common reason for "it worked yesterday and now it asks me to sign in again".
 
+### Recommended: the login command
+
+On a desktop install, `m365-bridge login` does this whole chapter in one command:
+
+```bash
+./m365-bridge login
+```
+
+It opens your own Chrome, waits for you to sign in, then captures the refresh token, the designer broker refresh token that powers image generation, and every cookie the browser holds. Each refresh token is verified by redeeming it before anything is stored, so a capture that cannot be redeemed never replaces a credential that works.
+
+The browser profile persists under `data/browser-profile`, so the first run needs one interactive sign-in and later runs renew on their own: rerun the same command when the service reports an authentication failure. No DevTools, no JSON file. Pass `-browser <path>` when Chrome is not installed on the default path, or `-cookies <file>` to seed the browser from a JSON cookie export instead of signing in.
+
+The command needs a desktop browser, so Docker installs keep the manual chapter below. When the credentials it captured expire, rerunning it renews everything the same way.
+
 ### Step 1: Get the refresh token
 
 1. Open [m365.cloud.microsoft](https://m365.cloud.microsoft) and sign in.

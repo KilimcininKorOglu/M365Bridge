@@ -131,6 +131,20 @@ Tarayıcınızdan üç şey toplayacak, bunları tek bir JSON dosyasına yazacak
 
 > Üçünü de toplayın. Refresh token tek başına **24 saat** sonra geçersiz olur; cookie'siz bir kurulum ertesi gün çalışmayı bırakır. "Dün çalışıyordu, bugün yine oturum açmamı istiyor" şikayetinin tek sebebi budur.
 
+### Önerilen: login komutu
+
+Masaüstü kurulumunda `m365-bridge login` bu bölümün tamamını tek komutta yapar:
+
+```bash
+./m365-bridge login
+```
+
+Kendi Chrome'unu açar, oturum açmanızı bekler, sonra refresh token'ı, görsel üretimini çalıştıran designer broker refresh token'ını ve tarayıcının tuttuğu tüm cookie'leri yakalar. Her refresh token, bir şey yazılmadan önce redeem edilerek doğrulanır; redeem edilemeyen bir yakalama çalışan bir credential'ın yerine geçmez.
+
+Tarayıcı profili `data/browser-profile` altında kalıcıdır: ilk koşu bir kez interactive oturum açmanızı ister, sonraki koşular kendi kendini yeniler. Servis kimlik doğrulama hatası bildirdiğinde aynı komutu yeniden çalıştırmanız yeterli. DevTools yok, JSON dosyası yok. Chrome varsayılan yolda kurulu değilse `-browser <path>`, oturum açmak yerine bir JSON cookie dış aktarımıyla tarayıcıyı beslemek için `-cookies <file>` verin.
+
+Komut bir masaüstü tarayıcısı gerektirir; Docker kurulumları aşağıdaki manuel bölümü kullanmaya devam eder. Yakaladığı credential'lar dolduğunda aynı şekilde yeniden çalıştırmak her şeyi yeniler.
+
 ### Adım 1: Refresh token'ı alın
 
 1. [m365.cloud.microsoft](https://m365.cloud.microsoft) adresini açın ve oturum açın.
