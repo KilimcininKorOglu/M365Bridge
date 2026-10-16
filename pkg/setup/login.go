@@ -55,7 +55,7 @@ func RunDeviceLogin(quiet bool) error {
 		return fmt.Errorf("device authentication failed: %w", err)
 	}
 
-	return finishNativeLogin(res, models.DefaultDeviceClientID, quiet)
+	return finishNativeLogin(res, models.DefaultClientID, quiet)
 }
 
 func printDeviceBanner(quiet bool, dc *auth.DeviceCode) {
