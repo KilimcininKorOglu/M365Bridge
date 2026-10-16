@@ -28,3 +28,4 @@ LICENSE
 test_logs/
 .playwright-mcp/
 .gocache/
+.claude/
