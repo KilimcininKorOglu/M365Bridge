@@ -217,8 +217,8 @@ func (c *M365Client) UploadFile(base64Data, mediaType, fileName, conversationID,
 
 // dialConnection opens a new WebSocket connection for a single request.
 // The caller is responsible for closing the connection when done.
-func (c *M365Client) dialConnection(conversationID, userOID, tenantID string) (*websocket.Conn, string, string, error) {
-	logging.Debugf("dialConnection: convID=%s", conversationID)
+func (c *M365Client) dialConnection(conversationID, userOID, tenantID, tone, gptOverride string) (*websocket.Conn, string, string, error) {
+	logging.Debugf("dialConnection: convID=%s tone=%s override=%s", conversationID, tone, gptOverride)
 	token, err := c.tokenManager.Get()
 	if err != nil {
 		logging.Errorf("dialConnection: failed to get token: %v", err)
@@ -228,7 +228,8 @@ func (c *M365Client) dialConnection(conversationID, userOID, tenantID string) (*
 	hexSID := strings.ReplaceAll(uuid.New().String(), "-", "")
 	uuidSID := formatUUID(hexSID)
 
-	url, _, _, err := payload.BuildURL(token, hexSID, conversationID, userOID, tenantID)
+	scenario, licenseType := models.EffectiveScenarioAndLicense(tone, gptOverride)
+	url, _, _, err := payload.BuildURLWithScenario(token, hexSID, conversationID, userOID, tenantID, scenario, licenseType)
 	if err != nil {
 		return nil, "", "", err
 	}
@@ -237,10 +238,14 @@ func (c *M365Client) dialConnection(conversationID, userOID, tenantID string) (*
 		HandshakeTimeout: c.handshakeTimeout,
 	}
 
+	header := http.Header{}
+	header.Set("Origin", "https://m365.cloud.microsoft")
+	header.Set("x-scenario", scenario)
+
 	// The dial response carries the status the backend refused with. Discarding
 	// it would leave an expired token, a throttled account and a backend outage
 	// indistinguishable at the HTTP layer.
-	conn, dialResp, err := dialer.Dial(url, nil)
+	conn, dialResp, err := dialer.Dial(url, header)
 	if err != nil {
 		status := 0
 		if dialResp != nil {
@@ -274,7 +279,7 @@ func (c *M365Client) dialConnection(conversationID, userOID, tenantID string) (*
 // When hasTools is true, code_interpreter option flags are stripped from the payload.
 func (c *M365Client) Chat(text, tone, gptOverride, conversationID, userOID, tenantID string, hasTools bool) (string, error) {
 	logging.Infof("Chat: tone=%s override=%s convID=%s hasTools=%v", tone, gptOverride, conversationID, hasTools)
-	conn, hexSID, uuidSID, err := c.dialConnection(conversationID, userOID, tenantID)
+	conn, hexSID, uuidSID, err := c.dialConnection(conversationID, userOID, tenantID, tone, gptOverride)
 	if err != nil {
 		return "", err
 	}
@@ -538,7 +543,7 @@ func (c *M365Client) runConversationStream(
 	tone, gptOverride, conversationID, userOID, tenantID string,
 	hasTools bool,
 ) {
-	conn, hexSID, uuidSID, err := c.dialConnection(conversationID, userOID, tenantID)
+	conn, hexSID, uuidSID, err := c.dialConnection(conversationID, userOID, tenantID, tone, gptOverride)
 	if err != nil {
 		logging.Errorf("ChatConversationStreamGen: dial failed: %v", err)
 		if ctx.Err() == nil {

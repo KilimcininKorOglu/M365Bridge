@@ -14,6 +14,7 @@ package toolcalling
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/google/uuid"
@@ -136,4 +137,55 @@ func FormatToolResult(toolCallID, toolName, result string) string {
 // history) into text that the M365 backend can understand.
 func FormatAssistantToolCall(toolName string, arguments json.RawMessage) string {
 	return fmt.Sprintf("[Previous Tool Call: %s]\nArguments: %s", toolName, string(arguments))
+}
+
+// ToolNameSynonyms maps canonical tool names to common alternative spellings or aliases
+// used by coding agents (Claude Code, Cline, Roo Code, Cursor, etc.).
+var ToolNameSynonyms = map[string][]string{
+	"write": {"write_file", "create_file", "write_to_file", "save_file"},
+	"read":  {"read_file", "view_file", "read_file_content"},
+	"edit":  {"edit_file", "modify_file", "replace_file_content"},
+	"bash":  {"sh", "shell", "exec", "exec_command", "run_command"},
+	"glob":  {"find_files", "list_files", "file_search"},
+	"grep":  {"search_code", "search_text", "grep_search"},
+}
+
+// ResolveToolName matches a model-emitted tool name against the client's declared tools.
+// It checks:
+// 1. Exact match in allowed
+// 2. Case-insensitive match in allowed (e.g. "Write" vs "write", "bash" vs "Bash")
+// 3. Known coding tool synonyms (e.g. model returns "write_file" when client declared "Write")
+func ResolveToolName(name string, allowed map[string]bool) string {
+	if len(allowed) == 0 || allowed[name] {
+		return name
+	}
+	for decl := range allowed {
+		if strings.EqualFold(decl, name) {
+			return decl
+		}
+	}
+	return resolveSynonymToolName(name, allowed)
+}
+
+func resolveSynonymToolName(name string, allowed map[string]bool) string {
+	low := strings.ToLower(name)
+	for canonical, synonyms := range ToolNameSynonyms {
+		if !nameMatchesSynonymGroup(low, canonical, synonyms) {
+			continue
+		}
+		for decl := range allowed {
+			declLow := strings.ToLower(decl)
+			if nameMatchesSynonymGroup(declLow, canonical, synonyms) {
+				return decl
+			}
+		}
+	}
+	return name
+}
+
+func nameMatchesSynonymGroup(name, canonical string, synonyms []string) bool {
+	if name == canonical {
+		return true
+	}
+	return slices.Contains(synonyms, name)
 }

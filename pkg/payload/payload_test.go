@@ -36,6 +36,33 @@ func TestBuildURLUsesEduStarterRoute(t *testing.T) {
 	}
 }
 
+func TestBuildURLWithScenarioElevates(t *testing.T) {
+	raw, _, _, err := BuildURLWithScenario(
+		"token",
+		"0123456789abcdef0123456789abcdef",
+		"",
+		"user",
+		"tenant",
+		"OfficeWebPaidCopilot",
+		"Premium",
+	)
+	if err != nil {
+		t.Fatalf("BuildURLWithScenario returned error: %v", err)
+	}
+
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		t.Fatalf("BuildURLWithScenario returned invalid URL: %v", err)
+	}
+	query := parsed.Query()
+	if got := query.Get("licenseType"); got != "Premium" {
+		t.Fatalf("licenseType = %q, want Premium", got)
+	}
+	if got := query.Get("scenario"); got != "OfficeWebPaidCopilot" {
+		t.Fatalf("scenario = %q, want OfficeWebPaidCopilot", got)
+	}
+}
+
 // The flag is measured rather than copied from a browser capture: without it a
 // long answer arrived as about 840 writeAtCursor deltas, with it as about 130,
 // carrying the same bytes. Losing it costs six times more SSE frames per turn

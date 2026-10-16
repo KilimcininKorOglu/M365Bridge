@@ -3,10 +3,13 @@
 package models
 
 import (
+	"maps"
 	"os"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/logging"
@@ -365,6 +368,79 @@ var ModelRegistry = map[string]ModelConfig{
 		OpenAIID:    "dall-e-3",
 		DisplayName: "DALL-E 3",
 	},
+	// GPT-6.1 Sol serves on the included scenario across all Entra M365 accounts.
+	"gpt6.1sol": {
+		Tone:        "Gpt_61_Sol_Reasoning",
+		Override:    "",
+		OpenAIID:    "gpt-6.1-sol",
+		DisplayName: "GPT-6.1 Sol",
+	},
+	"gpt6.1-sol-chat": {
+		Tone:        "Gpt_61_Sol_Chat",
+		Override:    "",
+		OpenAIID:    "gpt-6.1-sol-chat",
+		DisplayName: "GPT-6.1 Sol Chat",
+	},
+	"gpt6.1-sol-reasoning": {
+		Tone:        "Gpt_61_Sol_Reasoning",
+		Override:    "",
+		OpenAIID:    "gpt-6.1-sol-reasoning",
+		DisplayName: "GPT-6.1 Sol Reasoning",
+	},
+	"gpt6": {
+		Tone:        "Gpt_6_Reasoning",
+		Override:    "",
+		OpenAIID:    "gpt-6",
+		DisplayName: "GPT-6",
+		Thinking:    true,
+	},
+	"gpt6-reasoning": {
+		Tone:        "Gpt_6_Reasoning",
+		Override:    "",
+		OpenAIID:    "gpt-6-reasoning",
+		DisplayName: "GPT-6 Reasoning",
+		Thinking:    true,
+	},
+	"claude-sonnet-5": {
+		Tone:        "Claude_Sonnet_5",
+		Override:    "",
+		OpenAIID:    "claude-sonnet-5",
+		DisplayName: "Claude Sonnet 5",
+		Thinking:    true,
+		Owner:       OwnerAnthropic,
+	},
+	"claude-sonnet-5.5": {
+		Tone:        "Claude_Sonnet",
+		Override:    "",
+		OpenAIID:    "claude-sonnet-5.5",
+		DisplayName: "Claude Sonnet 5.5",
+		Thinking:    true,
+		Owner:       OwnerAnthropic,
+	},
+	"claude-opus-5": {
+		Tone:        "Claude_Opus",
+		Override:    "",
+		OpenAIID:    "claude-opus-5",
+		DisplayName: "Claude Opus 5",
+		Thinking:    true,
+		Owner:       OwnerAnthropic,
+	},
+	"claude-opus-5.5": {
+		Tone:        "Claude_Opus",
+		Override:    "",
+		OpenAIID:    "claude-opus-5.5",
+		DisplayName: "Claude Opus 5.5",
+		Thinking:    true,
+		Owner:       OwnerAnthropic,
+	},
+	"claude-opus-4.8": {
+		Tone:        "Claude_Opus",
+		Override:    "",
+		OpenAIID:    "claude-opus-4.8",
+		DisplayName: "Claude Opus 4.8",
+		Thinking:    true,
+		Owner:       OwnerAnthropic,
+	},
 }
 
 // ToolMessageType maps WebSocket message types to tool function names.
@@ -587,7 +663,193 @@ func FindModel(key string) (ModelConfig, bool) {
 			return cfg, true
 		}
 	}
+	if cfg, ok := findDynamicModel(key); ok {
+		return cfg, true
+	}
+	if strings.HasPrefix(strings.ToLower(key), "tone:") {
+		raw := strings.TrimSpace(key[5:])
+		if raw != "" {
+			return ModelConfig{
+				Tone:        raw,
+				OpenAIID:    key,
+				DisplayName: raw,
+			}, true
+		}
+	}
 	return ModelConfig{}, false
+}
+
+func findDynamicModel(key string) (ModelConfig, bool) {
+	dynamicMu.RLock()
+	defer dynamicMu.RUnlock()
+	if cfg, ok := dynamicModels[key]; ok {
+		return cfg, true
+	}
+	for _, cfg := range dynamicModels {
+		if cfg.OpenAIID == key {
+			return cfg, true
+		}
+	}
+	return ModelConfig{}, false
+}
+
+var (
+	dynamicMu     sync.RWMutex
+	dynamicModels = make(map[string]ModelConfig)
+	toneDigits    = regexp.MustCompile(`^\d+$`)
+)
+
+// RegisterDynamicTone registers a dynamically discovered upstream tone as an available model.
+func RegisterDynamicTone(tone string) (ModelConfig, bool) {
+	spec, ok := ToneToPublicModel(tone)
+	if !ok {
+		return ModelConfig{}, false
+	}
+	dynamicMu.Lock()
+	defer dynamicMu.Unlock()
+	dynamicModels[spec.OpenAIID] = spec
+	dynamicModels[strings.ToLower(spec.OpenAIID)] = spec
+	return spec, true
+}
+
+// AllDynamicModels returns a snapshot of all dynamically registered models.
+func AllDynamicModels() map[string]ModelConfig {
+	dynamicMu.RLock()
+	defer dynamicMu.RUnlock()
+	out := make(map[string]ModelConfig, len(dynamicModels))
+	maps.Copy(out, dynamicModels)
+	return out
+}
+
+// ToneToPublicModel deterministically converts an upstream tone string into a ModelConfig.
+func ToneToPublicModel(tone string) (ModelConfig, bool) {
+	tone = strings.TrimSpace(tone)
+	if tone == "" {
+		return ModelConfig{}, false
+	}
+	switch strings.ToLower(tone) {
+	case "magic", "chat", "reasoning":
+		return ModelConfig{}, false
+	}
+	parts := strings.Split(tone, "_")
+	if len(parts) < 2 {
+		return ModelConfig{}, false
+	}
+	if strings.EqualFold(parts[len(parts)-1], "auto") || parts[0] == "GPT" {
+		return ModelConfig{}, false
+	}
+	head := strings.ToLower(parts[0])
+	switch head {
+	case "gpt":
+		return parseGptToneSpec(tone, parts)
+	case "claude":
+		return parseClaudeToneSpec(tone, parts)
+	default:
+		return parseGenericToneSpec(tone, parts)
+	}
+}
+
+func parseGptToneSpec(tone string, parts []string) (ModelConfig, bool) {
+	ver, restIdx := extractGptToneVersion(parts)
+	if ver == "" {
+		return ModelConfig{}, false
+	}
+	rest := parts[restIdx:]
+	idSuffix, nameSuffix, thinking := formatGptRestSuffix(rest)
+	return ModelConfig{
+		Tone:        tone,
+		OpenAIID:    "gpt-" + ver + idSuffix,
+		DisplayName: "GPT-" + ver + nameSuffix,
+		Thinking:    thinking,
+	}, true
+}
+
+func formatGptRestSuffix(rest []string) (string, string, bool) {
+	if len(rest) == 0 || (len(rest) == 1 && strings.EqualFold(rest[0], "chat")) {
+		return "", "", false
+	}
+	if len(rest) == 1 && strings.EqualFold(rest[0], "reasoning") {
+		return "-reasoning", " Reasoning", true
+	}
+	var idParts, nameParts []string
+	thinking := false
+	for _, p := range rest {
+		idParts = append(idParts, strings.ToLower(p))
+		nameParts = append(nameParts, p)
+		if strings.EqualFold(p, "reasoning") {
+			thinking = true
+		}
+	}
+	return "-" + strings.Join(idParts, "-"), " " + strings.Join(nameParts, " "), thinking
+}
+
+func extractGptToneVersion(parts []string) (string, int) {
+	if len(parts) >= 3 && len(parts[1]) == 1 && toneDigits.MatchString(parts[1]) && len(parts[2]) == 1 && toneDigits.MatchString(parts[2]) {
+		return parts[1] + "." + parts[2], 3
+	}
+	if len(parts[1]) == 2 && toneDigits.MatchString(parts[1]) {
+		return parts[1][:1] + "." + parts[1][1:], 2
+	}
+	if toneDigits.MatchString(parts[1]) {
+		return parts[1], 2
+	}
+	return "", 0
+}
+
+func parseClaudeToneSpec(tone string, parts []string) (ModelConfig, bool) {
+	nameParts := make([]string, len(parts)-1)
+	copy(nameParts, parts[1:])
+	idParts := make([]string, len(nameParts))
+	for i, p := range nameParts {
+		idParts[i] = strings.ToLower(p)
+	}
+	return ModelConfig{
+		Tone:        tone,
+		OpenAIID:    "claude-" + strings.Join(idParts, "-"),
+		DisplayName: "Claude " + strings.Join(nameParts, " "),
+		Owner:       OwnerAnthropic,
+		Thinking:    true,
+	}, true
+}
+
+func parseGenericToneSpec(tone string, parts []string) (ModelConfig, bool) {
+	idParts := make([]string, len(parts))
+	nameParts := make([]string, len(parts))
+	for i, p := range parts {
+		idParts[i] = strings.ToLower(p)
+		nameParts[i] = p
+	}
+	return ModelConfig{
+		Tone:        tone,
+		OpenAIID:    strings.Join(idParts, "-"),
+		DisplayName: strings.Join(nameParts, " "),
+	}, true
+}
+
+// EffectiveScenarioAndLicense determines the appropriate SignalR scenario and licenseType
+// for a given model or upstream tone. Models that require paid/premium entitlements
+// (such as GPT-6 Reasoning, Claude Sonnet 5, Claude Opus) are automatically elevated
+// to OfficeWebPaidCopilot with Premium license so accounts with Copilot Pro or Enterprise
+// licenses can access them without deflection errors.
+func EffectiveScenarioAndLicense(tone, model string) (scenario, licenseType string) {
+	if isPaidModelOrTone(tone, model) {
+		return "OfficeWebPaidCopilot", "Premium"
+	}
+	return "OfficeWebIncludedCopilot", "Starter"
+}
+
+func isPaidModelOrTone(tone, model string) bool {
+	switch strings.ToLower(strings.TrimSpace(model)) {
+	case "gpt-6", "gpt-6-reasoning", "gpt-6-think-deeper",
+		"claude-sonnet-5", "claude-sonnet-5.5",
+		"claude-opus", "claude-opus-5", "claude-opus-5.5":
+		return true
+	}
+	switch tone {
+	case "Gpt_6_Reasoning", "GPT_6_Reasoning", "Claude_Sonnet_5", "Claude_Opus":
+		return true
+	}
+	return false
 }
 
 // getEnvWithDefault returns an environment variable value or a default fallback.

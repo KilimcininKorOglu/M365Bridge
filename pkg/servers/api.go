@@ -420,8 +420,9 @@ func (api *APIServer) Start(port int) error {
 	}
 	api.mu.Unlock()
 
-	// Start background token refresher
+	// Start background token refresher and tone discoverer
 	go api.runTokenRefresher()
+	go api.runToneDiscoverer()
 
 	if len(api.config.APIKeys) > 0 {
 		logging.Infof("Starting API server on port %d (API key required, %d key(s) configured)", port, len(api.config.APIKeys))
@@ -463,6 +464,43 @@ func (api *APIServer) performPeriodicRefresh() {
 		logging.Errorf("Background designer token refresh failed: %v", err)
 	} else {
 		logging.Debug("Background designer token refresh succeeded")
+	}
+}
+
+// runToneDiscoverer periodically checks M365's authenticated RefreshNavPane store
+// to discover newly rolled-out Copilot model tones and expose them dynamically.
+func (api *APIServer) runToneDiscoverer() {
+	select {
+	case <-api.stopCh:
+		return
+	case <-time.After(5 * time.Second):
+		api.performToneDiscovery()
+	}
+
+	ticker := time.NewTicker(6 * time.Hour)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-api.stopCh:
+			return
+		case <-ticker.C:
+			api.performToneDiscovery()
+		}
+	}
+}
+
+func (api *APIServer) performToneDiscovery() {
+	convClient := client.NewConversationClient(api.tokenManager)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	discovered, err := convClient.DiscoverTones(ctx)
+	if err != nil {
+		logging.Debugf("Tone discovery check: %v", err)
+		return
+	}
+	if len(discovered) > 0 {
+		logging.Infof("Tone discovery: registered %d new upstream tone(s): %v", len(discovered), discovered)
 	}
 }
 
@@ -637,6 +675,12 @@ func (api *APIServer) handleModels(w http.ResponseWriter, r *http.Request) {
 	for key, cfg := range models.ModelRegistry {
 		byID[cfg.OpenAIID] = cfg
 		keysByID[cfg.OpenAIID] = append(keysByID[cfg.OpenAIID], key)
+	}
+	for id, cfg := range models.AllDynamicModels() {
+		if _, exists := byID[cfg.OpenAIID]; !exists {
+			byID[cfg.OpenAIID] = cfg
+			keysByID[cfg.OpenAIID] = []string{id}
+		}
 	}
 	ids := slices.Sorted(maps.Keys(byID))
 

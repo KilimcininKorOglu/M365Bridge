@@ -341,3 +341,103 @@ func TestBuildRepairNoteNamesToolsAndRequiredFields(t *testing.T) {
 		}
 	}
 }
+
+func TestResolveToolNameCaseInsensitiveAndSynonyms(t *testing.T) {
+	allowed := map[string]bool{
+		"Write": true,
+		"Bash":  true,
+		"Read":  true,
+		"Edit":  true,
+	}
+
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"Write", "Write"},
+		{"write", "Write"},
+		{"WRITE", "Write"},
+		{"write_file", "Write"},
+		{"create_file", "Write"},
+		{"save_file", "Write"},
+		{"Bash", "Bash"},
+		{"bash", "Bash"},
+		{"sh", "Bash"},
+		{"exec", "Bash"},
+		{"run_command", "Bash"},
+		{"read_file", "Read"},
+		{"view_file", "Read"},
+		{"edit_file", "Edit"},
+		{"unknown_tool", "unknown_tool"},
+	}
+
+	for _, tc := range tests {
+		got := ResolveToolName(tc.input, allowed)
+		if got != tc.want {
+			t.Errorf("ResolveToolName(%q) = %q, want %q", tc.input, got, tc.want)
+		}
+	}
+}
+
+func TestNormalizeToolArgumentsAliases(t *testing.T) {
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"file_path": map[string]any{"type": "string"},
+			"command":   map[string]any{"type": "string"},
+		},
+	}
+	required := []string{"file_path"}
+
+	args := map[string]any{
+		"path": "/src/main.go",
+		"cmd":  "go build",
+	}
+
+	NormalizeToolArguments(args, schema, required)
+
+	if got := args["file_path"]; got != "/src/main.go" {
+		t.Fatalf("file_path = %v, want /src/main.go", got)
+	}
+	if _, exists := args["path"]; exists {
+		t.Fatalf("path alias was not removed from args")
+	}
+	if got := args["command"]; got != "go build" {
+		t.Fatalf("command = %v, want go build", got)
+	}
+	if _, exists := args["cmd"]; exists {
+		t.Fatalf("cmd alias was not removed from args")
+	}
+}
+
+func TestToolContractsValidateNormalizesAliases(t *testing.T) {
+	contracts := ToolContracts{
+		Schemas: map[string]map[string]any{
+			"Write": {
+				"type": "object",
+				"properties": map[string]any{
+					"file_path": map[string]any{"type": "string"},
+					"content":   map[string]any{"type": "string"},
+				},
+				"required": []any{"file_path", "content"},
+			},
+		},
+		Required: map[string][]string{
+			"Write": {"file_path", "content"},
+		},
+	}
+
+	rawArgs := json.RawMessage(`{"path":"app.js","body":"console.log(1);"}`)
+	validated, reason, _ := contracts.validate("Write", rawArgs)
+	if reason != "" {
+		t.Fatalf("validation failed: %s", reason)
+	}
+
+	var parsed map[string]any
+	if err := json.Unmarshal(validated, &parsed); err != nil {
+		t.Fatalf("decode validated: %v", err)
+	}
+	if parsed["file_path"] != "app.js" || parsed["content"] != "console.log(1);" {
+		t.Fatalf("unexpected normalized args: %v", parsed)
+	}
+}

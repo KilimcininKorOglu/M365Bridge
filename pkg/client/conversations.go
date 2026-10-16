@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -199,4 +200,62 @@ func conversationErrorField(responseBody []byte) error {
 		return fmt.Errorf("M365 conversation request failed: %s", message)
 	}
 	return nil
+}
+
+var toneRegexPattern = regexp.MustCompile(`(?i)\b(Gpt_\d+[\w]*|Claude_[\w]+|Grok_[\w]+)\b`)
+
+// DiscoverTones queries the authenticated M365 session (via RefreshNavPane store metadata)
+// for upstream tone identifiers and registers any newly discovered models dynamically.
+func (c *ConversationClient) DiscoverTones(ctx context.Context) ([]string, error) {
+	var rawResp map[string]any
+	body := map[string]any{
+		"action":                    "RefreshNavPane",
+		"conversationHistoryFilter": nil,
+		"skipNotebooks":             false,
+		"skipAgentListCache":        true,
+	}
+	if err := c.request(ctx, body, &rawResp); err != nil {
+		return nil, err
+	}
+	seen := make(map[string]bool)
+	collectNavPaneTones(rawResp, seen)
+	if rawBytes, err := json.Marshal(rawResp); err == nil {
+		matches := toneRegexPattern.FindAllString(string(rawBytes), -1)
+		for _, m := range matches {
+			seen[m] = true
+		}
+	}
+	var discovered []string
+	for tone := range seen {
+		if _, ok := models.RegisterDynamicTone(tone); ok {
+			discovered = append(discovered, tone)
+		}
+	}
+	return discovered, nil
+}
+
+func collectNavPaneTones(v any, seen map[string]bool) {
+	switch node := v.(type) {
+	case map[string]any:
+		if opts, ok := node["availableModelSelectionOptions"].([]any); ok {
+			extractModelOptions(opts, seen)
+		}
+		for _, child := range node {
+			collectNavPaneTones(child, seen)
+		}
+	case []any:
+		for _, item := range node {
+			collectNavPaneTones(item, seen)
+		}
+	}
+}
+
+func extractModelOptions(opts []any, seen map[string]bool) {
+	for _, rawOpt := range opts {
+		if opt, ok := rawOpt.(map[string]any); ok {
+			if id, ok := opt["id"].(string); ok && strings.TrimSpace(id) != "" {
+				seen[strings.TrimSpace(id)] = true
+			}
+		}
+	}
 }

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"slices"
 
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/logging"
 )
@@ -102,6 +103,73 @@ func (c ToolContracts) choiceAllows(name string) bool {
 	return c.Choice == name
 }
 
+// Common parameter aliases used by coding agents and Copilot models.
+var parameterAliasGroups = [][]string{
+	{"file_path", "filePath", "path", "filepath", "filename", "file", "target_file"},
+	{"command", "cmd", "input", "script", "code"},
+	{"content", "contents", "text", "body", "code", "data"},
+	{"pattern", "regex", "query"},
+}
+
+// NormalizeToolArguments aligns model-emitted argument keys to the property names
+// expected by the tool's declared JSON schema or required list.
+func NormalizeToolArguments(args map[string]any, schema map[string]any, required []string) {
+	if len(args) == 0 {
+		return
+	}
+	props, _ := schema["properties"].(map[string]any)
+	for _, group := range parameterAliasGroups {
+		normalizeAliasGroup(args, props, required, group)
+	}
+}
+
+func normalizeAliasGroup(args map[string]any, props map[string]any, required []string, group []string) {
+	targetKey := findTargetKeyInSchema(props, required, group)
+	if targetKey == "" {
+		return
+	}
+	if _, hasTarget := args[targetKey]; hasTarget {
+		return
+	}
+	for _, alias := range group {
+		if alias == targetKey {
+			continue
+		}
+		if val, ok := args[alias]; ok {
+			args[targetKey] = val
+			delete(args, alias)
+			return
+		}
+	}
+}
+
+func findTargetKeyInSchema(props map[string]any, required []string, group []string) string {
+	for _, key := range group {
+		if props != nil {
+			if _, ok := props[key]; ok {
+				return key
+			}
+		}
+		if slices.Contains(required, key) {
+			return key
+		}
+	}
+	return ""
+}
+
+func (c ToolContracts) normalizeArguments(name string, arguments json.RawMessage) (json.RawMessage, map[string]any) {
+	var decoded map[string]any
+	if err := json.Unmarshal(arguments, &decoded); err != nil || decoded == nil {
+		return arguments, nil
+	}
+	NormalizeToolArguments(decoded, c.Schemas[name], c.Required[name])
+	normalized, err := json.Marshal(decoded)
+	if err != nil {
+		return arguments, decoded
+	}
+	return normalized, decoded
+}
+
 // validate checks one tool call's arguments. It returns the arguments to
 // forward, which may have had undeclared keys pruned, a rejection reason that
 // is empty when the call is acceptable, and whether re-asking the model could
@@ -115,6 +183,8 @@ func (c ToolContracts) validate(name string, arguments json.RawMessage) (result 
 		}
 		return arguments, fmt.Sprintf("tool_choice pins %q, so %q may not be called", c.Choice, name), true
 	}
+
+	arguments, decoded := c.normalizeArguments(name, arguments)
 	if !toolCallSatisfiesRequired(arguments, c.Required[name]) {
 		return arguments, "required arguments were missing or empty", true
 	}
@@ -124,11 +194,10 @@ func (c ToolContracts) validate(name string, arguments json.RawMessage) (result 
 		return arguments, "", false
 	}
 
-	var decoded map[string]any
-	if err := json.Unmarshal(arguments, &decoded); err != nil {
-		// Only an object can be validated. A non-object payload already failed
-		// the required check unless the tool declares no required arguments.
-		return arguments, "arguments were not a JSON object", true
+	if decoded == nil {
+		if err := json.Unmarshal(arguments, &decoded); err != nil {
+			return arguments, "arguments were not a JSON object", true
+		}
 	}
 	if err := ValidateAndPrune(decoded, schema); err != nil {
 		return arguments, err.Error(), true

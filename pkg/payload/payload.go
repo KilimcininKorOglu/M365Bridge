@@ -453,9 +453,14 @@ func extFromMediaType(mediaType string) string {
 	}
 }
 
-// BuildURL constructs the WebSocket URL for M365 Copilot connection.
+// BuildURL constructs the WebSocket URL for M365 Copilot connection using the default included scenario.
 // Returns the complete URL, hex session ID, and UUID session ID.
 func BuildURL(token, hexSID, conversationID, userOID, tenantID string) (string, string, string, error) {
+	return BuildURLWithScenario(token, hexSID, conversationID, userOID, tenantID, "OfficeWebIncludedCopilot", "Starter")
+}
+
+// BuildURLWithScenario constructs the WebSocket URL for M365 Copilot connection with a specific scenario and licenseType.
+func BuildURLWithScenario(token, hexSID, conversationID, userOID, tenantID, scenario, licenseType string) (string, string, string, error) {
 	if userOID == "" || tenantID == "" {
 		return "", "", "", fmt.Errorf("M365_USER_OID and M365_TENANT_ID are required")
 	}
@@ -465,6 +470,13 @@ func BuildURL(token, hexSID, conversationID, userOID, tenantID string) (string, 
 	}
 
 	uuidSID := formatUUID(hexSID)
+
+	if scenario == "" {
+		scenario = "OfficeWebIncludedCopilot"
+	}
+	if licenseType == "" {
+		licenseType = "Starter"
+	}
 
 	baseURL := fmt.Sprintf("wss://substrate.office.com/m365Copilot/Chathub/%s@%s", userOID, tenantID)
 	url := fmt.Sprintf("%s?chatsessionid=%s&XRoutingParameterSessionKey=%s&clientrequestid=%s&X-SessionId=%s",
@@ -477,7 +489,7 @@ func BuildURL(token, hexSID, conversationID, userOID, tenantID string) (string, 
 	url += fmt.Sprintf("&access_token=%s", token)
 	url += fmt.Sprintf("&variants=%s", variants)
 	url += "&source=%22officeweb%22&product=Office&agentHost=Bizchat.FullScreen"
-	url += "&licenseType=Starter&isEdu=true&agent=web&scenario=OfficeWebIncludedCopilot"
+	url += fmt.Sprintf("&licenseType=%s&isEdu=true&agent=web&scenario=%s", licenseType, scenario)
 
 	return url, hexSID, uuidSID, nil
 }

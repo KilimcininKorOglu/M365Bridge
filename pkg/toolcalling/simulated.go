@@ -508,6 +508,7 @@ func appendAnthropicToolUse(block map[string]any, result *SimulatedResult, allow
 	if name == "" {
 		return
 	}
+	name = ResolveToolName(name, allowed)
 	if len(allowed) > 0 && !allowed[name] {
 		return
 	}
@@ -672,6 +673,7 @@ func appendChatToolCall(tc map[string]any, result *SimulatedResult, allowed map[
 	if name == "" {
 		return
 	}
+	name = ResolveToolName(name, allowed)
 	// Filter out tool calls whose name the client never declared
 	// (e.g. M365-injected "code_interpreter"). When allowed is empty,
 	// filtering is skipped (back-compat / non-tool requests).
