@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/auth"
+	"github.com/KilimcininKorOglu/M365Bridge/pkg/models"
 	"github.com/google/uuid"
 )
 
@@ -128,14 +129,23 @@ func (c *ConversationClient) request(ctx context.Context, payload any, destinati
 	return nil
 }
 
-// buildRequest stamps the browser headers the M365 chat dispatcher expects,
-// including the web app cookies this endpoint authenticates with rather than a
-// bearer token.
-func (c *ConversationClient) buildRequest(ctx context.Context, payload any) (*http.Request, error) {
+func (c *ConversationClient) resolveAuthHeaders(req *http.Request) error {
 	cookieHeader, err := c.tokenManager.M365CookieHeader()
-	if err != nil {
-		return nil, err
+	if err == nil && cookieHeader != "" {
+		req.Header.Set("Cookie", cookieHeader)
+		return nil
 	}
+	token, tokenErr := c.tokenManager.RefreshWithScope(models.M365CloudScope)
+	if tokenErr == nil && token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+		return nil
+	}
+	return err
+}
+
+// buildRequest stamps the browser headers the M365 chat dispatcher expects,
+// supporting both web app cookies and OAuth bearer tokens.
+func (c *ConversationClient) buildRequest(ctx context.Context, payload any) (*http.Request, error) {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("marshal conversation request: %w", err)
@@ -144,7 +154,9 @@ func (c *ConversationClient) buildRequest(ctx context.Context, payload any) (*ht
 	if err != nil {
 		return nil, fmt.Errorf("create conversation request: %w", err)
 	}
-	req.Header.Set("Cookie", cookieHeader)
+	if err := c.resolveAuthHeaders(req); err != nil {
+		return nil, err
+	}
 	req.Header.Set("Content-Type", "application/json;charset=utf-8")
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Origin", "https://m365.cloud.microsoft")

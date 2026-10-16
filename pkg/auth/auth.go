@@ -18,6 +18,8 @@ import (
 
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/crypto"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/logging"
+	"github.com/KilimcininKorOglu/M365Bridge/pkg/models"
+	"github.com/KilimcininKorOglu/M365Bridge/pkg/textcut"
 )
 
 var (
@@ -194,7 +196,9 @@ func (tm *TokenManager) redeemRefreshToken(refreshToken string) ([]byte, int, er
 	}
 
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Origin", "https://m365.cloud.microsoft")
+	if tm.clientID == models.LegacySPAClientID {
+		req.Header.Set("Origin", "https://m365.cloud.microsoft")
+	}
 	req.Header.Set("User-Agent", "Mozilla/5.0")
 
 	client := &http.Client{}
@@ -260,6 +264,69 @@ func (tm *TokenManager) storeRefreshResult(result refreshResponse) (string, erro
 
 	logging.Infof("TokenManager.Refresh: success, expires_in=%d expires_at=%s", result.ExpiresIn, expiresAt.Format(time.RFC3339))
 	return result.AccessToken, nil
+}
+
+// RefreshWithScope exchanges the stored refresh token for an access token scoped
+// to a specific resource (such as Designer or M365 Cloud), rotating and saving
+// the refresh token on success.
+func (tm *TokenManager) RefreshWithScope(scope string) (string, error) {
+	tm.refreshMu.Lock()
+	defer tm.refreshMu.Unlock()
+
+	refreshToken, err := tm.readRefreshToken()
+	if err != nil {
+		return "", err
+	}
+
+	body, err := tm.executeScopeRefresh(refreshToken, scope)
+	if err != nil {
+		return "", err
+	}
+
+	var result refreshResponse
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "", fmt.Errorf("%w: failed to parse scope refresh response: %v", ErrRefreshFailed, err)
+	}
+
+	if result.RefreshToken != "" {
+		if err := tm.writeRefreshToken(result.RefreshToken); err != nil {
+			logging.Warnf("TokenManager.RefreshWithScope: failed to save rotated refresh token: %v", err)
+		}
+	}
+
+	return result.AccessToken, nil
+}
+
+func (tm *TokenManager) executeScopeRefresh(refreshToken, scope string) ([]byte, error) {
+	data := url.Values{
+		"client_id":     {tm.clientID},
+		"refresh_token": {refreshToken},
+		"grant_type":    {"refresh_token"},
+		"scope":         {scope},
+	}
+
+	req, err := http.NewRequest("POST", tm.tokenURL, bytes.NewBufferString(data.Encode()))
+	if err != nil {
+		return nil, fmt.Errorf("%w: failed to create scope request: %v", ErrRefreshFailed, err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("%w: scope refresh request failed: %v", ErrRefreshFailed, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, tokenResponseMax+1))
+	if err != nil {
+		return nil, fmt.Errorf("%w: failed to read scope response: %v", ErrRefreshFailed, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%w: scope refresh status %d: %s", ErrRefreshFailed, resp.StatusCode, textcut.Truncate(string(body), 200))
+	}
+	return body, nil
 }
 
 // readRefreshToken reads and decrypts the refresh token from file.

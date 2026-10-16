@@ -158,7 +158,7 @@ func Run(filePath string) error {
 	}
 
 	// Step 4: Save environment configuration
-	if err := saveEnv(verifiedTenant, verifiedOID); err != nil {
+	if err := saveEnv(verifiedTenant, verifiedOID, models.DefaultClientID); err != nil {
 		return err
 	}
 
@@ -508,14 +508,21 @@ func verifyToken(tenant, oid, refreshToken string) (string, string, error) {
 }
 
 // saveEnv saves the environment configuration to .env file.
-func saveEnv(tenant, oid string) error {
-	envContent := fmt.Sprintf("# M365 Copilot Configuration\nM365_TENANT_ID=%s\nM365_USER_OID=%s\nM365_CLIENT_ID=%s\n",
-		tenant, oid, models.DefaultClientID)
+func saveEnv(tenant, oid, clientID string) error {
+	return saveEnvTo(tenant, oid, clientID, defaultEnvFile)
+}
 
-	if err := atomicfile.Write(defaultEnvFile, []byte(envContent), 0600); err != nil {
+func saveEnvTo(tenant, oid, clientID, envFile string) error {
+	if clientID == "" {
+		clientID = models.DefaultClientID
+	}
+	envContent := fmt.Sprintf("# M365 Copilot Configuration\nM365_TENANT_ID=%s\nM365_USER_OID=%s\nM365_CLIENT_ID=%s\n",
+		tenant, oid, clientID)
+
+	if err := atomicfile.Write(envFile, []byte(envContent), 0600); err != nil {
 		return fmt.Errorf("failed to save environment file: %w", err)
 	}
 
-	fmt.Printf("  Environment variables saved to %s\n", defaultEnvFile)
+	fmt.Printf("  Environment variables saved to %s\n", envFile)
 	return nil
 }

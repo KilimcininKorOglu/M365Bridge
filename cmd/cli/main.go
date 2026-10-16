@@ -90,7 +90,7 @@ USAGE
   m365-bridge [flags] ["question"]      Ask one question, or start interactive mode
   m365-bridge serve [flags]             Run the HTTP API server and web interface
   m365-bridge setup-wizard [flags]      Import credentials from a browser export
-  m365-bridge login [flags]             Capture every credential in your own browser
+  m365-bridge login [flags]             Sign in with zero-browser Device Code or PKCE flow
   m365-bridge --help                    Print this text
 
   Every flag is optional. With none, serve listens on port %d and setup-wizard
@@ -112,13 +112,9 @@ SETUP-WIZARD FLAGS
   -file <path>      Setup JSON with oid, tenant and refresh_token (default %q)
 
 LOGIN FLAGS
-  -browser <path>   Browser executable to drive (default: discover the
-                    installed Chrome automatically)
-  -cdp <url>        Remote Chrome DevTools Protocol endpoint (e.g.
-                    http://localhost:9222). Overrides -browser.
-  -headless         Run local browser in headless mode
-  -cookies <path>   JSON cookie file to seed the browser with, for an
-                    unattended sign-in
+  (default)         Sign in with zero-browser Device Code Flow (RFC 8628)
+  -pkce             Sign in via terminal-assisted PKCE flow
+  -quiet            Suppress banner and non-essential output
 
 `, models.Version, defaultPort, defaultSetupFile, defaultModel, defaultPort, defaultSetupFile)
 
@@ -163,9 +159,6 @@ func printEnvironment(w io.Writer) {
                                    reach it. The interface sends it in the same
                                    header an API client sends its key, so it is
                                    accepted wherever a key is.
-    M365_CDP_URL                   Remote Chrome DevTools Protocol URL for
-                                   browser login and unattended background
-                                   token renewal (e.g. http://chromium:9222).
 
   Answers
     M365_ENABLE_WEB_SEARCH         Let Copilot search the web (default true).
@@ -271,22 +264,17 @@ func runSetupWizard(args []string) {
 	}
 }
 
-// runLogin drives the user's own browser through the M365 sign-in and
-// captures every credential the gateway keeps in one pass.
+// runLogin performs zero-browser sign-in using Device Code or PKCE flow.
 func runLogin(args []string) {
 	fs := flag.NewFlagSet("login", flag.ExitOnError)
 	fs.Usage = func() { printUsage(os.Stdout) }
-	browser := fs.String("browser", "", "Browser executable to drive; empty discovers the installed Chrome")
-	cdp := fs.String("cdp", os.Getenv("M365_CDP_URL"), "CDP endpoint URL (e.g. http://localhost:9222 or ws://...)")
-	headless := fs.Bool("headless", false, "Run local browser in headless mode")
-	cookies := fs.String("cookies", "", "JSON cookie file to seed the browser with, for an unattended sign-in")
+	pkce := fs.Bool("pkce", false, "Use terminal-assisted PKCE sign-in flow")
+	quiet := fs.Bool("quiet", false, "Suppress banner and non-essential output")
 	_ = fs.Parse(args)
 
 	opts := setup.LoginOptions{
-		BrowserPath: *browser,
-		CDPURL:      *cdp,
-		Headless:    *headless,
-		CookiesFile: *cookies,
+		Quiet: *quiet,
+		PKCE:  *pkce,
 	}
 	if err := setup.RunLogin(opts); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)

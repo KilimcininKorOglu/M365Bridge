@@ -24,9 +24,8 @@ Copilot'un herkese açık bir API'si yok. Kendi web istemcisiyle bir SignalR Web
 
 ## Gereksinimler
 
-- **Microsoft 365 Copilot lisansı.** Copilot erişimi olan bir business veya enterprise hesabı. Copilot Chat (temel) hesabı da test edildi.
-- [m365.cloud.microsoft](https://m365.cloud.microsoft) adresinde **oturum açmış bir tarayıcı**. Kurulum sırasında kimlik bilgilerini bir kez buradan alacaksınız.
-- **Docker**, ya da kaynaktan derleyecekseniz **Go 1.26.6+**. Go 1.21 ve sonrası da çalışır: ilk derlemede 1.26.6 toolchain'ini kendisi indirir, `GOTOOLCHAIN` değeri `local` yapılmadığı sürece. Patch seviyesi gerekliliğin parçasıdır: 1.26.6 öncesi her sürüm, bu servisin kendi HTTP ve TLS yollarından ulaştığı standart kütüphane açıklarını taşır.
+- **Microsoft 365 Copilot lisansı:** Copilot erişimi olan bir iş veya kurumsal hesap. Copilot Chat (temel) hesabı da desteklenmektedir.
+- **Docker**, ya da kaynaktan derleyecekseniz **Go 1.26.6+**. Go 1.21 ve üzeri sürümler de çalışır; ilk derlemede 1.26.6 toolchain'ini otomatik olarak indirir (`GOTOOLCHAIN=local` yapılmadığı sürece). Yama seviyesi güvenlik gereksinimidir: 1.26.6 öncesi sürümler bu servisin HTTP/TLS yollarını etkileyen standart kütüphane açıkları barındırır.
 
 ## Özellikler
 
@@ -52,7 +51,7 @@ Aşağıdaki üç seçenekten birini seçin. Üçü de sizi aynı noktaya getiri
 
 ### Seçenek A: Docker
 
-En kısa yol. Yayınlanmış imaj derleme gerektirmez. Masaüstü/grafik arayüzü olmayan sunucularda ve VPS ortamlarında 7/24 kesintisiz token yenileme için Chromium sidecar ile birlikte çalıştırın:
+En hızlı ve pratik yöntem. Hazır imaj derleme gerektirmez. Yerel OAuth (Device Code) mimarisi sayesinde sunucuda tarayıcı veya yan konteyner (sidecar) çalıştırmanıza gerek yoktur:
 
 `docker-compose.yml` dosyasını oluşturun:
 
@@ -63,27 +62,10 @@ services:
     container_name: m365bridge
     environment:
       - TZ=Europe/Istanbul
-      - M365_CDP_URL=http://chromium:9222
     ports:
       - "8230:8000"
     volumes:
       - ./data:/app/data
-    depends_on:
-      - chromium
-    restart: unless-stopped
-
-  chromium:
-    image: zenika/alpine-chrome:latest
-    container_name: m365bridge-chromium
-    command:
-      - --no-sandbox
-      - --remote-debugging-address=0.0.0.0
-      - --remote-debugging-port=9222
-      - --user-data-dir=/data/browser-profile
-    ports:
-      - "127.0.0.1:9222:9222"
-    volumes:
-      - ./data/browser-profile:/data/browser-profile
     restart: unless-stopped
 ```
 
@@ -144,25 +126,52 @@ Windows'ta çıktıyı `bin\m365-bridge.exe` olarak verin. Seçenek B'deki çal�
 
 ## Microsoft 365 hesabınızı bağlamak
 
-Kurulumun tek bölümü budur. Üç kurulum seçeneği de bu bölümü aynen kullanır.
+Tüm kurulum yöntemleri için hesap bağlama adımları aynıdır.
 
-Tarayıcınızdan üç şey toplayacak, bunları tek bir JSON dosyasına yazacak ve dosyayı kurulum sihirbazına vereceksiniz. Sihirbaz her şeyi şifreler ve servisin her açılışta okuduğu yapılandırmayı yazar.
+### Önerilen: Tarayıcısız Giriş (Device Code Akışı)
 
-> Üçünü de toplayın. Refresh token tek başına **24 saat** sonra geçersiz olur; cookie'siz bir kurulum ertesi gün çalışmayı bırakır. "Dün çalışıyordu, bugün yine oturum açmamı istiyor" şikayetinin tek sebebi budur.
-
-### Önerilen: login komutu
-
-Masaüstü kurulumunda `m365-bridge login` bu bölümün tamamını tek komutta yapar:
+`m365-bridge login` komutu; sunucuda herhangi bir tarayıcı kurmanıza, başsız konteyner çalıştırmanıza veya DevTools üzerinden kod çalıştırmanıza gerek kalmadan hesabınızı saniyeler içinde bağlar:
 
 ```bash
+# Docker kullanıyorsanız:
+docker exec -it m365bridge ./bin/m365-bridge login
+
+# Linux / macOS binary:
 ./m365-bridge login
+
+# Windows PowerShell:
+.\m365-bridge.exe login
 ```
 
-Kendi Chrome'unu açar, oturum açmanızı bekler, sonra refresh token'ı, görsel üretimini çalıştıran designer broker refresh token'ını ve tarayıcının tuttuğu tüm cookie'leri yakalar. Her refresh token, bir şey yazılmadan önce redeem edilerek doğrulanır; redeem edilemeyen bir yakalama çalışan bir credential'ın yerine geçmez.
+1. Terminalde doğrulama adresi ve 8 haneli bir kod görüntülenir:
+   ```text
+   ======================================================================
+      M365Bridge - Device Code Login (RFC 8628)
+   ======================================================================
 
-Tarayıcı profili `data/browser-profile` altında kalıcıdır: ilk koşu bir kez interactive oturum açmanızı ister, sonraki koşular kendi kendini yeniler. Servis kimlik doğrulama hatası bildirdiğinde aynı komutu yeniden çalıştırmanız yeterli. DevTools yok, JSON dosyası yok. Chrome varsayılan yolda kurulu değilse `-browser <path>`, uzaktaki bir Chrome'u CDP üzerinden yönetmek için `-cdp <url>`, headless mod için `-headless`, oturum açmak yerine bir JSON cookie dış aktarımıyla tarayıcıyı beslemek için `-cookies <file>` verin.
+   To sign in, use any web browser on any device (phone, laptop, PC) to open:
+     https://login.microsoft.com/device
 
-Masaüstü ortamı olmayan Docker / VPS sunucularında: İlk oturumu kendi yerel bilgisayarınızda `m365-bridge login` ile açın, ardından oluşan `data/` klasörünü (özellikle `data/browser-profile` ve `data/encryption.key`) sunucunuza **sadece bir kez** kopyalayın. Yan servis olarak çalışan Chromium sidecar (`M365_CDP_URL=http://chromium:9222`) sayesinde M365Bridge 24 saatlik token süresi dolduğunda arka planda otomatik ve sessizce yenilemeyi kendi yapar; bir daha asla manuel dosya kopyalamak zorunda kalmazsınız.
+   And enter the following code:
+     ABCD-1234
+   ```
+2. Herhangi bir cihazınızdaki (telefon, dizüstü veya masaüstü bilgisayar) tarayıcıdan [https://login.microsoft.com/device](https://login.microsoft.com/device) adresini açın, kodu girin ve Microsoft 365 hesabınızla oturum açıp onay verin.
+3. Terminal onayınızı anında algılar; `tenant` ve `oid` değerlerinizi token içerisinden otomatik olarak okur, **90 günlük yenilenen (rolling) refresh token** alır, tüm yapılandırmayı AES-256-GCM ile şifreleyerek `data/` dizinine kaydeder.
+
+> [!TIP]
+> **24 Saatlik Süre Aşımı Duvarı Yok**: Web uygulamalarının (SPA) refresh token'ları 24 saat sonra geçersiz kalırken, M365Bridge resmi native/public client kimliğiyle çalışır. 90 günlük yenilenen refresh token her kullanımda kendini yenileyerek süresini baştan başlatır; yani servis 90 günde bir kez bile kullanılsa oturumunuz asla düşmez. Görsel üretimi (Designer) ve konuşma yönetimi yetkileri doğrudan bu token üzerinden alındığı için cookie veya tarayıcı ihtiyacı tamamen ortadan kalkmıştır.
+
+#### Alternatif: Terminal PKCE Akışı (`-pkce`)
+
+Eğer kurum yöneticiniz Device Code akışını kısıtladıysa:
+```bash
+./m365-bridge login -pkce
+```
+Bu komut resmi Microsoft yetkilendirme bağlantısını ekrana basar. Tarayıcınızda açıp oturum açtıktan sonra yönlendirilen adres çubuğundaki URL'yi terminale yapıştırarak giriş yapabilirsiniz.
+
+---
+
+### Alternatif: Tarayıcı ve JSON ile Manuel Kurulum (`setup-wizard`)
 
 ### Adım 1: Refresh token'ı alın
 

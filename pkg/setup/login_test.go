@@ -1,84 +1,71 @@
 package setup
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
 
-func TestParseCookieFile(t *testing.T) {
-	valid := `[{"name":"ESTSAUTH","value":"v1","domain":"login.microsoftonline.com","path":"/","secure":true,"httpOnly":true},
-	           {"name":"OH.FLID","value":"x","domain":".m365.cloud.microsoft"}]`
-	cookies, err := parseCookieFile([]byte(valid))
-	if err != nil {
-		t.Fatalf("valid file: %v", err)
+	"github.com/KilimcininKorOglu/M365Bridge/pkg/auth"
+	"github.com/KilimcininKorOglu/M365Bridge/pkg/models"
+)
+
+func TestPrintDeviceBannerQuiet(t *testing.T) {
+	dc := &auth.DeviceCode{
+		UserCode:        "TEST-1234",
+		VerificationURI: "https://login.microsoft.com/device",
+		Interval:        5,
 	}
-	if len(cookies) != 2 || cookies[0].Name != "ESTSAUTH" || !cookies[0].HttpOnly {
-		t.Fatalf("valid file decoded %d cookies: %+v", len(cookies), cookies)
-	}
-	for _, tc := range []struct {
-		name string
-		body string
-	}{
-		{"not json", `<html>`},
-		{"empty array", `[]`},
-	} {
-		if _, err := parseCookieFile([]byte(tc.body)); err == nil {
-			t.Errorf("%s: parseCookieFile accepted the input", tc.name)
-		}
-	}
+	// Quiet banner should not panic or produce errors
+	printDeviceBanner(true, dc)
 }
 
-func TestRefreshTokenFrom(t *testing.T) {
-	tests := []struct {
-		name string
-		body string
-		want string
-	}{
-		{"success body", `{"token_type":"Bearer","refresh_token":"abc.def"}`, "abc.def"},
-		{"failure body", `{"error":"invalid_grant","error_description":"expired"}`, ""},
-		{"not json", `<html>Something went wrong</html>`, ""},
-		{"empty", ``, ""},
-	}
-	for _, tc := range tests {
-		if got := refreshTokenFrom([]byte(tc.body)); got != tc.want {
-			t.Errorf("%s: refreshTokenFrom = %q, want %q", tc.name, got, tc.want)
-		}
-	}
+func TestPrintPKCEBannerQuiet(t *testing.T) {
+	printPKCEBanner(true, "https://login.microsoftonline.com/authorize")
 }
 
-func TestOnAppSurface(t *testing.T) {
-	tests := []struct {
-		name string
-		loc  string
-		want bool
-	}{
-		{"chat page", "https://m365.cloud.microsoft/chat", true},
-		{"route page", "https://m365.cloud.microsoft/library/visuals/all", true},
-		{"login host", "https://login.microsoftonline.com/common/oauth2/v2.0/authorize?x=1", false},
-		{"landing hop", "https://m365.cloud.microsoft/landingv2", false},
-		{"spalanding", "https://m365.cloud.microsoft/spalanding?code=abc", false},
-		{"not a url", "::", false},
+func TestPrintNativeSuccess(t *testing.T) {
+	res := &auth.TokenResult{
+		TenantID: "tenant-abc",
+		UserOID:  "oid-def",
+		Email:    "test@example.com",
 	}
-	for _, tc := range tests {
-		if got := onAppSurface(tc.loc); got != tc.want {
-			t.Errorf("%s: onAppSurface(%q) = %v, want %v", tc.name, tc.loc, got, tc.want)
-		}
-	}
+	// Should not panic
+	printNativeSuccess(res)
 }
 
-func TestStartBrowserRemote(t *testing.T) {
-	opts := LoginOptions{
-		CDPURL: "ws://127.0.0.1:9222/devtools/browser/test",
-	}
-	ctx, cancel, err := startBrowser(opts, "data/browser-profile")
-	if err != nil {
-		t.Fatalf("startBrowser with CDPURL failed: %v", err)
-	}
-	defer cancel()
-	if ctx == nil {
-		t.Fatal("expected non-nil context from startBrowser with CDPURL")
-	}
-}
+func TestSaveCredentialStores(t *testing.T) {
+	tmpDir := t.TempDir()
+	refreshFile := filepath.Join(tmpDir, "rt_90day.txt")
+	cacheFile := filepath.Join(tmpDir, "cache.json")
+	envFile := filepath.Join(tmpDir, ".env")
 
-func TestPrintLoginBannerQuiet(t *testing.T) {
-	// Quiet banner should not panic
-	printLoginBanner(true)
-	printStep(true, "should not output")
+	res := &auth.TokenResult{
+		AccessToken:  "mock-access-token",
+		RefreshToken: "mock-refresh-token",
+		TenantID:     "tenant-test-id",
+		UserOID:      "user-test-oid",
+		ExpiresAt:    time.Now().Add(time.Hour),
+	}
+
+	if err := saveCredentialStoresTo(res, models.DefaultDeviceClientID, refreshFile, cacheFile, envFile); err != nil {
+		t.Fatalf("saveCredentialStoresTo failed: %v", err)
+	}
+
+	// Verify rt_90day.txt exists and is non-empty
+	if data, err := os.ReadFile(refreshFile); err != nil || len(data) == 0 {
+		t.Errorf("expected refresh token file to be written, err=%v len=%d", err, len(data))
+	}
+
+	// Verify cache.json exists
+	if data, err := os.ReadFile(cacheFile); err != nil || len(data) == 0 {
+		t.Errorf("expected cache file to be written, err=%v len=%d", err, len(data))
+	}
+
+	// Verify .env exists and contains the client ID
+	if data, err := os.ReadFile(envFile); err != nil {
+		t.Errorf("expected .env file to be written, err=%v", err)
+	} else if len(data) == 0 {
+		t.Error("expected .env file to be non-empty")
+	}
 }

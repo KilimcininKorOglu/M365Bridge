@@ -7,25 +7,8 @@ services:
     container_name: m365bridge
     environment:
       TZ: Europe/Istanbul
-      M365_CDP_URL: http://chromium:9222
     ports:
       - "8230:8000"
     volumes:
       - ./data:/app/data
-    depends_on:
-      - chromium
-    restart: unless-stopped
-
-  chromium:
-    image: zenika/alpine-chrome:latest
-    container_name: m365bridge-chromium
-    command:
-      - --no-sandbox
-      - --remote-debugging-address=0.0.0.0
-      - --remote-debugging-port=9222
-      - --user-data-dir=/data/browser-profile
-    ports:
-      - "127.0.0.1:9222:9222"
-    volumes:
-      - ./data/browser-profile:/data/browser-profile
     restart: unless-stopped

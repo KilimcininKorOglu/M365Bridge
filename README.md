@@ -25,7 +25,6 @@ Copilot has no public API. It talks to its own web client over a SignalR WebSock
 ## Requirements
 
 - A **Microsoft 365 Copilot license**. A business or enterprise account with Copilot access. A Copilot Chat (basic) account has also been tested.
-- A **browser signed in** to [m365.cloud.microsoft](https://m365.cloud.microsoft). You will collect credentials from it once during setup.
 - **Docker**, or **Go 1.26.6+** if you build from source. Go 1.21 and newer also work, because they download the 1.26.6 toolchain on the first build, unless `GOTOOLCHAIN` is set to `local`. The patch level is part of the requirement: every release before 1.26.6 carries standard-library vulnerabilities this service reaches through its own HTTP and TLS paths.
 
 ## Features
@@ -52,7 +51,7 @@ Choose one of the three options below. All three leave you with the same thing: 
 
 ### Option A: Docker
 
-The shortest path. The published image needs no build. Pair it with the Chromium sidecar for unattended 24/7 token renewal on headless servers:
+The shortest path. The published image needs no build. With zero-browser native OAuth, no headless browser or sidecar container is needed:
 
 Create `docker-compose.yml`:
 
@@ -63,27 +62,10 @@ services:
     container_name: m365bridge
     environment:
       - TZ=Europe/Istanbul
-      - M365_CDP_URL=http://chromium:9222
     ports:
       - "8230:8000"
     volumes:
       - ./data:/app/data
-    depends_on:
-      - chromium
-    restart: unless-stopped
-
-  chromium:
-    image: zenika/alpine-chrome:latest
-    container_name: m365bridge-chromium
-    command:
-      - --no-sandbox
-      - --remote-debugging-address=0.0.0.0
-      - --remote-debugging-port=9222
-      - --user-data-dir=/data/browser-profile
-    ports:
-      - "127.0.0.1:9222:9222"
-    volumes:
-      - ./data/browser-profile:/data/browser-profile
     restart: unless-stopped
 ```
 
@@ -146,23 +128,50 @@ On Windows, build to `bin\m365-bridge.exe`. The same working-directory rule as O
 
 This is the only setup chapter. Every installation option uses it unchanged.
 
-You will collect three things from your browser, write them into one JSON file, and hand that file to the setup wizard. The wizard encrypts everything and writes the configuration the service reads on every start.
+### Recommended: Zero-Browser Login (Device Code Flow)
 
-> Collect all three. The refresh token alone expires after **24 hours**, and a setup without cookies stops working the next day. This is the single most common reason for "it worked yesterday and now it asks me to sign in again".
-
-### Recommended: the login command
-
-On a desktop install, `m365-bridge login` does this whole chapter in one command:
+`m365-bridge login` connects your account in seconds without requiring any browser installation on the host or server, no headless sidecar, and no DevTools inspection:
 
 ```bash
+# Docker:
+docker exec -it m365bridge ./bin/m365-bridge login
+
+# Linux / macOS binary:
 ./m365-bridge login
+
+# Windows PowerShell:
+.\m365-bridge.exe login
 ```
 
-It opens your own Chrome, waits for you to sign in, then captures the refresh token, the designer broker refresh token that powers image generation, and every cookie the browser holds. Each refresh token is verified by redeeming it before anything is stored, so a capture that cannot be redeemed never replaces a credential that works.
+1. The terminal displays a verification URL and an 8-character device code:
+   ```text
+   ======================================================================
+      M365Bridge - Device Code Login (RFC 8628)
+   ======================================================================
 
-The browser profile persists under `data/browser-profile`, so the first run needs one interactive sign-in and later runs renew on their own: rerun the same command when the service reports an authentication failure. No DevTools, no JSON file. Pass `-browser <path>` when Chrome is not installed on the default path, `-cdp <url>` to drive a remote Chrome instance via CDP, `-headless` for local headless execution, or `-cookies <file>` to seed the browser from a JSON cookie export instead of signing in.
+   To sign in, use any web browser on any device (phone, laptop, PC) to open:
+     https://login.microsoft.com/device
 
-For headless Docker / VPS deployments, run `m365-bridge login` locally once, then copy your `data/` directory (including `data/browser-profile` and `data/encryption.key`) to the server. With the Chromium sidecar running (`M365_CDP_URL=http://chromium:9222`), M365Bridge automatically and unattendedly renews tokens in the background when the 24-hour token expires—no recurring logins or manual file transfers needed.
+   And enter the following code:
+     ABCD-1234
+   ```
+2. Open [https://login.microsoft.com/device](https://login.microsoft.com/device) on any device (your phone, laptop, or desktop), enter the code, and sign in with your Microsoft 365 account.
+3. The command detects your approval, automatically extracts your `tenant` and `oid` claims from the token, acquires a **90-day rolling refresh token**, encrypts everything with AES-256-GCM, and saves the configuration into `data/`.
+
+> [!TIP]
+> **No 24-Hour Expiration Wall**: Unlike single-page web applications whose refresh tokens expire after 24 hours, M365Bridge authenticates as a native public client. The 90-day rolling refresh token rotates and extends its validity window on every refresh, staying active indefinitely as long as the service is used once every 90 days. Scopes for image generation (Designer) and conversation management are minted directly from this token—zero cookies or browser instances required!
+
+#### Alternative: Terminal PKCE Flow (`-pkce`)
+
+If your organization's conditional access policies restrict Device Code Flow, run:
+```bash
+./m365-bridge login -pkce
+```
+This prints an official Microsoft authorization URL to open in any web browser. After signing in, copy the final callback redirect URL from your browser's address bar and paste it back into the terminal.
+
+---
+
+### Alternative: Manual Setup via Browser & JSON (`setup-wizard`)
 
 ### Step 1: Get the refresh token
 

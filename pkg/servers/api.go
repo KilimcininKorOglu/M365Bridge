@@ -38,7 +38,6 @@ import (
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/logging"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/models"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/payload"
-	"github.com/KilimcininKorOglu/M365Bridge/pkg/setup"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/toolcalling"
 	"github.com/google/uuid"
 	"github.com/pkoukk/tiktoken-go"
@@ -451,13 +450,11 @@ func (api *APIServer) runTokenRefresher() {
 	}
 }
 
-// performPeriodicRefresh executes one scheduled token refresh round, falling
-// back to unattended browser renewal via CDP if configured and needed.
+// performPeriodicRefresh executes one scheduled token refresh round.
 func (api *APIServer) performPeriodicRefresh() {
 	logging.Debug("Token refresher: starting periodic refresh")
 	if _, err := api.tokenManager.Refresh(); err != nil {
 		logging.Errorf("Background token refresh failed: %v", err)
-		api.tryBrowserRefreshFallback()
 	} else {
 		logging.Info("Background token refresh succeeded")
 	}
@@ -467,25 +464,6 @@ func (api *APIServer) performPeriodicRefresh() {
 	} else {
 		logging.Debug("Background designer token refresh succeeded")
 	}
-}
-
-// tryBrowserRefreshFallback attempts unattended browser token renewal via
-// CDP when configured and standard refresh fails.
-func (api *APIServer) tryBrowserRefreshFallback() {
-	if api.config.CDPURL == "" {
-		return
-	}
-	logging.Info("Token refresher: attempting unattended browser renewal via CDP...")
-	opts := setup.LoginOptions{
-		CDPURL:   api.config.CDPURL,
-		Quiet:    true,
-		Headless: true,
-	}
-	if err := setup.RunLogin(opts); err != nil {
-		logging.Errorf("Token refresher: unattended browser renewal failed: %v", err)
-		return
-	}
-	logging.Info("Token refresher: unattended browser renewal succeeded")
 }
 
 // withAuth wraps a handler with API key authentication.
