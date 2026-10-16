@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [1.5.3] - 2026-10-16
+
+### Added
+- Capture every credential in one pass with the new `m365-bridge login` command. It drives the user's own Chrome through CDP, waits for the interactive sign-in, captures the standard refresh token, the designer broker refresh token and every cookie, and verifies each refresh token by redeeming it before writing its store. The browser profile persists under `data/browser-profile`, so the first run needs one interactive sign-in and later runs renew unattended; `-cookies` seeds the browser from a JSON cookie export and `-browser` overrides the executable
+- Register the seven selector tones from the Ciallo proxy tone list: `claude-sonnet-think-deeper` (id `claude-sonnet-reasoning`), `claude-fable`, `grok-4.5`, `grok-auto`, `grok-reasoning`, `muse-spark` and `critique`. Every one was probed live and completed a turn; they are advertised as selectors, not attested model identities
+
+### Fixed
+- Advertise thinking for `gpt5.6-reasoning-uppercase`, which reaches the same tone as `gpt5.6-reasoning` but silently disagreed with its sibling in the capability catalog
+
+### Changed
+- Make the login command the recommended setup path in both READMEs; Docker installs keep the manual chapter
+- Run the compose container on Istanbul time, and set the top-level Compose project name explicitly
+
 ## [1.5.2] - 2026-10-03
 
 ### Added
