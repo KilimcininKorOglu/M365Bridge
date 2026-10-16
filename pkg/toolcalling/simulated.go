@@ -46,6 +46,7 @@ func BuildSimulatedPrompt(requestJSON string, hasTools bool, toolChoice, evidenc
 		lines = append(lines,
 			"Tool calls are supported here: emit assistant tool calls when appropriate.",
 			`If returning tool calls, use choices[0].message.tool_calls and set choices[0].finish_reason to "tool_calls".`,
+			`When returning tool calls, you may optionally include a brief user-facing commentary or progress update in choices[0].message.content describing the immediate action.`,
 			"Do not refuse by saying tool invocation is unsupported.",
 			"For each tool call, function.arguments must be a JSON string value (not an object).",
 			"Every tool call MUST include all properties listed in that tool's parameters.required array, each with a concrete non-empty value inferred from the request; never emit a tool call with a missing or empty required field.",
@@ -151,6 +152,7 @@ func BuildSimulatedPromptAnthropic(requestJSON string, hasTools bool, toolChoice
 		lines = append(lines,
 			"Tool calls are supported here: emit assistant tool calls when appropriate.",
 			`If returning tool calls, use content blocks with "type": "tool_use" and set stop_reason to "tool_use".`,
+			`When returning tool calls, you may optionally include a brief user-facing text block before the tool_use blocks describing the immediate action.`,
 			"Do not refuse by saying tool invocation is unsupported.",
 			`For each tool_use block, "input" must be a JSON object (not a string).`,
 			"Every tool_use block MUST include all properties listed in that tool's input_schema.required array, each with a concrete non-empty value inferred from the request; never emit a tool_use block with a missing or empty required field.",
@@ -336,7 +338,7 @@ func (r SimulatedResult) DroppedNames() []string {
 // is silently dropped. If all tool calls are dropped, the response is treated as
 // a plain content response. Pass nil to disable filtering (not recommended).
 func ParseSimulatedResponse(text string, allowedToolNames []string, contracts ToolContracts) SimulatedResult {
-	return parseSimulatedResponse(text, allowedToolNames, contracts, false)
+	return parseSimulatedResponse(text, allowedToolNames, contracts, true)
 }
 
 // ParseSimulatedResponseResponses preserves assistant content alongside valid
@@ -535,17 +537,17 @@ func appendAnthropicToolUse(block map[string]any, result *SimulatedResult, allow
 }
 
 // finishAnthropicResult settles the content and the finish reason once every
-// block has been read. A turn that produced a tool call carries no text.
+// block has been read. It preserves assistant text alongside valid tool calls
+// so callers can display commentary or narration before tool execution.
 func finishAnthropicResult(result *SimulatedResult, textParts []string) {
+	result.Content = strings.Join(textParts, "\n")
 	if len(result.ToolCalls) > 0 {
-		result.Content = ""
 		result.FinishReason = "tool_calls"
 		return
 	}
 	if result.FinishReason == "tool_calls" {
 		result.FinishReason = "stop"
 	}
-	result.Content = strings.Join(textParts, "\n")
 }
 
 // scoreAnthropicCandidate scores a parsed JSON object by how much it resembles

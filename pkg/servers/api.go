@@ -1462,7 +1462,7 @@ func (api *APIServer) runToolLoop(r *http.Request, provider toolLoopProvider, me
 
 		callerCalls, localCalls := splitToolCalls(simulated.ToolCalls, local)
 		if len(callerCalls) > 0 {
-			return toolLoopResult{thinking: thinking, toolCalls: callerCalls, finishReason: "tool_calls", conversationID: currentConvID}, nil
+			return toolLoopResult{text: simulated.Content, thinking: thinking, toolCalls: callerCalls, finishReason: "tool_calls", conversationID: currentConvID}, nil
 		}
 		if iteration >= api.config.CodeToolMaxIterations-1 {
 			return toolLoopResult{conversationID: currentConvID}, errors.New("coding tool iteration limit reached")
@@ -2601,7 +2601,7 @@ func (api *APIServer) chatToolCalls(stream *chatStream, messages []payload.Messa
 		}
 	case len(sim.ToolCalls) > 0:
 		simToolCalls = sim.ToolCalls
-		fullText = ""
+		fullText = sim.Content
 	default:
 		fullText = sim.Content
 	}
@@ -2617,7 +2617,7 @@ func (api *APIServer) chatToolCalls(stream *chatStream, messages []payload.Messa
 	stream.reasoning(stream.thinkingFilter.Flush())
 
 	// If tool calling buffered text, send it now as a single chunk
-	if fullText != "" && len(simToolCalls) == 0 {
+	if fullText != "" {
 		stream.send(map[string]any{"content": fullText})
 	}
 	return fullText, simToolCalls
@@ -2725,7 +2725,9 @@ func (api *APIServer) respondBufferedChat(w http.ResponseWriter, result toolLoop
 	}
 	message := map[string]any{"role": "assistant", "content": result.text}
 	if len(result.toolCalls) > 0 {
-		message["content"] = nil
+		if result.text == "" {
+			message["content"] = nil
+		}
 		message["tool_calls"] = result.toolCalls
 	}
 	api.sendJSON(w, http.StatusOK, map[string]any{"id": fmt.Sprintf("chatcmpl-%s", uuid.New().String()), "object": "chat.completion", "created": time.Now().Unix(), "model": cfg.OpenAIID, "choices": []map[string]any{{"index": 0, "message": message, "finish_reason": result.finishReason}}, "usage": usage})
@@ -2828,7 +2830,7 @@ func (api *APIServer) applySimulatedToolCalls(provider toolLoopProvider, message
 			Function: client.ToolCallFunction{Name: pc.Name, Namespace: pc.Namespace, Arguments: string(pc.Arguments)},
 		})
 	}
-	return "", toolCalls, "tool_calls"
+	return sim.Content, toolCalls, "tool_calls"
 }
 
 // cutChatAnswer applies the caller's stop sequence and max_tokens.
@@ -3287,7 +3289,7 @@ func (api *APIServer) anthropicToolCalls(stream *anthropicStream, messages []pay
 		}
 	case len(sim.ToolCalls) > 0:
 		simToolCalls = sim.ToolCalls
-		fullText = ""
+		fullText = sim.Content
 	default:
 		fullText = sim.Content
 	}
@@ -3706,7 +3708,7 @@ func (api *APIServer) completionToolCalls(stream *completionStream, messages []p
 		}
 	case len(sim.ToolCalls) > 0:
 		simToolCalls = sim.ToolCalls
-		fullText = ""
+		fullText = sim.Content
 	default:
 		fullText = sim.Content
 	}
@@ -3719,7 +3721,7 @@ func (api *APIServer) completionToolCalls(stream *completionStream, messages []p
 	}
 
 	// If tool calling buffered text, send it now as a single chunk
-	if fullText != "" && len(simToolCalls) == 0 {
+	if fullText != "" {
 		stream.sendText(fullText)
 	}
 	return fullText, simToolCalls

@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/KilimcininKorOglu/M365Bridge/pkg/client"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/payload"
 )
 
@@ -141,5 +142,54 @@ func TestValidateToolResultMessagesRejectsATwiceAnsweredCall(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "call_1") {
 		t.Fatalf("error %q does not name the call", err)
+	}
+}
+
+func TestOpenAIAssistantMessagePreservesCommentaryWithToolCalls(t *testing.T) {
+	calls := []client.ToolCall{
+		{
+			ID:   "call_123",
+			Type: "function",
+			Function: client.ToolCallFunction{
+				Name:      "read_file",
+				Arguments: `{"path":"main.go"}`,
+			},
+		},
+	}
+	msg := openAIAssistantMessage("Checking main.go now.", "thinking...", calls)
+	if msg["content"] != "Checking main.go now." {
+		t.Fatalf("content = %v, want commentary preserved", msg["content"])
+	}
+	if msg["reasoning_content"] != "thinking..." {
+		t.Fatalf("reasoning_content = %v, want thinking preserved", msg["reasoning_content"])
+	}
+	if tcs, ok := msg["tool_calls"].([]map[string]any); !ok || len(tcs) != 1 {
+		t.Fatalf("tool_calls = %v, want 1 call", msg["tool_calls"])
+	}
+}
+
+func TestAnthropicContentBlocksPreservesTextWithToolCalls(t *testing.T) {
+	calls := []client.ToolCall{
+		{
+			ID:   "toolu_123",
+			Type: "function",
+			Function: client.ToolCallFunction{
+				Name:      "read_file",
+				Arguments: `{"path":"main.go"}`,
+			},
+		},
+	}
+	blocks := anthropicContentBlocks("thinking...", "Checking main.go now.", calls)
+	if len(blocks) != 3 {
+		t.Fatalf("blocks count = %d, want 3 (thinking, text, tool_use)", len(blocks))
+	}
+	if blocks[0]["type"] != "thinking" || blocks[0]["thinking"] != "thinking..." {
+		t.Fatalf("unexpected block 0: %v", blocks[0])
+	}
+	if blocks[1]["type"] != "text" || blocks[1]["text"] != "Checking main.go now." {
+		t.Fatalf("unexpected block 1: %v", blocks[1])
+	}
+	if blocks[2]["type"] != "tool_use" || blocks[2]["name"] != "read_file" {
+		t.Fatalf("unexpected block 2: %v", blocks[2])
 	}
 }

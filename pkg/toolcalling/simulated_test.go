@@ -441,3 +441,56 @@ func TestToolContractsValidateNormalizesAliases(t *testing.T) {
 		t.Fatalf("unexpected normalized args: %v", parsed)
 	}
 }
+
+func TestParseSimulatedResponsePreservesContentWithToolCalls(t *testing.T) {
+	raw := `{
+		"choices": [{
+			"message": {
+				"role": "assistant",
+				"content": "I will inspect the workspace files now.",
+				"tool_calls": [{
+					"id": "call_123",
+					"type": "function",
+					"function": {"name": "Agent", "arguments": "{\"description\":\"analyze\",\"prompt\":\"do it\"}"}
+				}]
+			},
+			"finish_reason": "tool_calls"
+		}]
+	}`
+
+	result := ParseSimulatedResponse(raw, []string{"Agent"}, agentContracts())
+
+	if len(result.ToolCalls) != 1 {
+		t.Fatalf("tool calls = %d, want 1", len(result.ToolCalls))
+	}
+	if result.Content != "I will inspect the workspace files now." {
+		t.Fatalf("content = %q, want commentary preserved", result.Content)
+	}
+	if result.FinishReason != "tool_calls" {
+		t.Fatalf("finish_reason = %q, want tool_calls", result.FinishReason)
+	}
+}
+
+func TestParseSimulatedResponseAnthropicPreservesContentWithToolCalls(t *testing.T) {
+	raw := `{
+		"type": "message",
+		"role": "assistant",
+		"stop_reason": "tool_use",
+		"content": [
+			{"type": "text", "text": "I will run the command to verify."},
+			{"type": "tool_use", "id": "toolu_456", "name": "Agent", "input": {"description": "run", "prompt": "verify"}}
+		]
+	}`
+
+	result := ParseSimulatedResponseAnthropic(raw, []string{"Agent"}, agentContracts())
+
+	if len(result.ToolCalls) != 1 {
+		t.Fatalf("tool calls = %d, want 1", len(result.ToolCalls))
+	}
+	if result.Content != "I will run the command to verify." {
+		t.Fatalf("content = %q, want text commentary preserved", result.Content)
+	}
+	if result.FinishReason != "tool_calls" {
+		t.Fatalf("finish_reason = %q, want tool_calls", result.FinishReason)
+	}
+}
