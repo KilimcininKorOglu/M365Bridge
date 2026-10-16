@@ -6,6 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [1.5.5] - 2026-10-16
+
+### Added
+- Zero-browser login via Device Code Flow (`./m365-bridge login`) and native OAuth 2.0 PKCE redirect support, eliminating browser dependencies for remote servers and Docker containers
+- Live quota and priority access allowance telemetry across the API (`/v1/quota`), Web UI sidebar, and container logs for Claude and GPT-6 models
+- Model registry expansion with `gpt-6.1-sol`, `claude-opus-4.8`, dynamic tone discovery, and automatic paid scenario elevation (`OfficeWebPaidCopilot`) for premium models
+- Support for `reasoning_effort` and Anthropic `thinking` configuration across chat completions and messages endpoints
+- Preserve narrative commentary and model intent alongside simulated function and tool calls
+- M365 environment variable overrides (`M365_SCENARIO`, `M365_LICENSE_TYPE`) and descriptive HTTP 403 error mapping for missing premium licenses
+
+### Fixed
+- Use first-party native client ID across CLI login and credential stores to acquire 90-day rolling refresh tokens
+
+### Changed
+- Add license tiers and priority access allowances columns to model tables in English and Turkish READMEs
+- Expand core documentation, troubleshooting guides, and multi-language support
+
 ## [1.5.4] - 2026-10-16
 
 ### Added
