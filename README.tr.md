@@ -52,7 +52,7 @@ Aşağıdaki üç seçenekten birini seçin. Üçü de sizi aynı noktaya getiri
 
 ### Seçenek A: Docker
 
-En kısa yol. Yayınlanmış imaj derleme gerektirmez.
+En kısa yol. Yayınlanmış imaj derleme gerektirmez. Masaüstü/grafik arayüzü olmayan sunucularda ve VPS ortamlarında 7/24 kesintisiz token yenileme için Chromium sidecar ile birlikte çalıştırın:
 
 `docker-compose.yml` dosyasını oluşturun:
 
@@ -61,10 +61,29 @@ services:
   m365bridge:
     image: ghcr.io/kilimcininkoroglu/m365bridge:latest
     container_name: m365bridge
+    environment:
+      - TZ=Europe/Istanbul
+      - M365_CDP_URL=http://chromium:9222
     ports:
       - "8230:8000"
     volumes:
       - ./data:/app/data
+    depends_on:
+      - chromium
+    restart: unless-stopped
+
+  chromium:
+    image: zenika/alpine-chrome:latest
+    container_name: m365bridge-chromium
+    command:
+      - --no-sandbox
+      - --remote-debugging-address=0.0.0.0
+      - --remote-debugging-port=9222
+      - --user-data-dir=/data/browser-profile
+    ports:
+      - "127.0.0.1:9222:9222"
+    volumes:
+      - ./data/browser-profile:/data/browser-profile
     restart: unless-stopped
 ```
 
@@ -141,9 +160,9 @@ Masaüstü kurulumunda `m365-bridge login` bu bölümün tamamını tek komutta 
 
 Kendi Chrome'unu açar, oturum açmanızı bekler, sonra refresh token'ı, görsel üretimini çalıştıran designer broker refresh token'ını ve tarayıcının tuttuğu tüm cookie'leri yakalar. Her refresh token, bir şey yazılmadan önce redeem edilerek doğrulanır; redeem edilemeyen bir yakalama çalışan bir credential'ın yerine geçmez.
 
-Tarayıcı profili `data/browser-profile` altında kalıcıdır: ilk koşu bir kez interactive oturum açmanızı ister, sonraki koşular kendi kendini yeniler. Servis kimlik doğrulama hatası bildirdiğinde aynı komutu yeniden çalıştırmanız yeterli. DevTools yok, JSON dosyası yok. Chrome varsayılan yolda kurulu değilse `-browser <path>`, oturum açmak yerine bir JSON cookie dış aktarımıyla tarayıcıyı beslemek için `-cookies <file>` verin.
+Tarayıcı profili `data/browser-profile` altında kalıcıdır: ilk koşu bir kez interactive oturum açmanızı ister, sonraki koşular kendi kendini yeniler. Servis kimlik doğrulama hatası bildirdiğinde aynı komutu yeniden çalıştırmanız yeterli. DevTools yok, JSON dosyası yok. Chrome varsayılan yolda kurulu değilse `-browser <path>`, uzaktaki bir Chrome'u CDP üzerinden yönetmek için `-cdp <url>`, headless mod için `-headless`, oturum açmak yerine bir JSON cookie dış aktarımıyla tarayıcıyı beslemek için `-cookies <file>` verin.
 
-Komut bir masaüstü tarayıcısı gerektirir; Docker kurulumları aşağıdaki manuel bölümü kullanmaya devam eder. Yakaladığı credential'lar dolduğunda aynı şekilde yeniden çalıştırmak her şeyi yeniler.
+Masaüstü ortamı olmayan Docker / VPS sunucularında: İlk oturumu kendi yerel bilgisayarınızda `m365-bridge login` ile açın, ardından oluşan `data/` klasörünü (özellikle `data/browser-profile` ve `data/encryption.key`) sunucunuza **sadece bir kez** kopyalayın. Yan servis olarak çalışan Chromium sidecar (`M365_CDP_URL=http://chromium:9222`) sayesinde M365Bridge 24 saatlik token süresi dolduğunda arka planda otomatik ve sessizce yenilemeyi kendi yapar; bir daha asla manuel dosya kopyalamak zorunda kalmazsınız.
 
 ### Adım 1: Refresh token'ı alın
 

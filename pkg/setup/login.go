@@ -40,6 +40,14 @@ type LoginOptions struct {
 	// BrowserPath is the executable to drive. Empty discovers the user's
 	// installed Chrome automatically.
 	BrowserPath string
+	// CDPURL optionally connects to an already-running Chrome instance via
+	// Chrome DevTools Protocol (CDP) instead of launching a local browser process.
+	CDPURL string
+	// Headless runs the browser in headless mode.
+	Headless bool
+	// Quiet suppresses user-facing terminal banners and progress lines,
+	// used for automated background token renewal.
+	Quiet bool
 	// CookiesFile optionally seeds the browser with cookies before the first
 	// navigation, as a JSON array of {name, value, domain, path, secure,
 	// httpOnly} objects. A seeding file from an earlier run signs the browser
@@ -52,7 +60,7 @@ type LoginOptions struct {
 // sign-in, capture tokens and cookies, verify what was captured by
 // redeeming it, and store everything the gateway's credential files hold.
 func RunLogin(opts LoginOptions) error {
-	printLoginBanner()
+	printLoginBanner(opts.Quiet)
 
 	capture := newTokenCapture()
 	taskCtx, cancel, err := startCaptureSession(opts, capture)
@@ -64,18 +72,18 @@ func RunLogin(opts LoginOptions) error {
 	if err := chromedp.Run(taskCtx, navigate(chatHomeURL)); err != nil {
 		return fmt.Errorf("failed to open the M365 page: %w", err)
 	}
-	fmt.Println("  A Chrome window is open. Sign in to your M365 account there.")
-	fmt.Println("  The capture starts by itself once the sign-in lands on the chat page.")
+	printStep(opts.Quiet, "  A Chrome window is open. Sign in to your M365 account there.")
+	printStep(opts.Quiet, "  The capture starts by itself once the sign-in lands on the chat page.")
 	if err := waitForSignIn(taskCtx, defaultLoginWait); err != nil {
 		return err
 	}
 
-	fmt.Println("  Signed in. Capturing the standard refresh token ...")
+	printStep(opts.Quiet, "  Signed in. Capturing the standard refresh token ...")
 	standardRT, err := captureStandard(taskCtx, capture)
 	if err != nil {
 		return err
 	}
-	fmt.Println("  Standard refresh token captured. Requesting one image so the designer broker fires ...")
+	printStep(opts.Quiet, "  Standard refresh token captured. Requesting one image so the designer broker fires ...")
 	brokerRT := captureBroker(taskCtx, capture)
 
 	cookies, err := collectCookies(taskCtx)
@@ -93,8 +101,18 @@ func RunLogin(opts LoginOptions) error {
 	})
 }
 
+// printStep writes one progress message unless quiet mode is requested.
+func printStep(quiet bool, msg string) {
+	if !quiet {
+		fmt.Println(msg)
+	}
+}
+
 // printLoginBanner prints the wizard-style header of the login flow.
-func printLoginBanner() {
+func printLoginBanner(quiet bool) {
+	if quiet {
+		return
+	}
 	fmt.Println("=" + strings.Repeat("=", 58))
 	fmt.Printf("  M365 Copilot Browser Login v%s\n", models.Version)
 	fmt.Println("=" + strings.Repeat("=", 58))
@@ -124,7 +142,7 @@ func startCaptureSession(opts LoginOptions, capture *tokenCapture) (context.Cont
 		return nil, nil, fmt.Errorf("failed to create the browser profile: %w", err)
 	}
 
-	taskCtx, cancel, err := startBrowser(opts.BrowserPath, profileDir)
+	taskCtx, cancel, err := startBrowser(opts, profileDir)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -156,17 +174,32 @@ func startCaptureSession(opts LoginOptions, capture *tokenCapture) (context.Cont
 	return taskCtx, func() { timeoutCancel(); cancel() }, nil
 }
 
-// startBrowser launches the user's own Chrome headed on the given profile
-// and returns the tab context with its cancel function.
-func startBrowser(browserPath, profileDir string) (context.Context, context.CancelFunc, error) {
-	opts := append(chromedp.DefaultExecAllocatorOptions[:],
-		chromedp.Flag("headless", false),
+// startBrowser launches a local Chrome instance or connects to a remote CDP
+// endpoint, returning the tab context and its cancel function.
+func startBrowser(opts LoginOptions, profileDir string) (context.Context, context.CancelFunc, error) {
+	if opts.CDPURL != "" {
+		return startRemoteBrowser(opts.CDPURL)
+	}
+	return startLocalBrowser(opts.BrowserPath, profileDir, opts.Headless)
+}
+
+// startRemoteBrowser connects to a Chrome instance running with remote debugging.
+func startRemoteBrowser(cdpURL string) (context.Context, context.CancelFunc, error) {
+	allocCtx, allocCancel := chromedp.NewRemoteAllocator(context.Background(), cdpURL)
+	taskCtx, taskCancel := chromedp.NewContext(allocCtx)
+	return taskCtx, func() { taskCancel(); allocCancel() }, nil
+}
+
+// startLocalBrowser launches the user's own Chrome on the given profile.
+func startLocalBrowser(browserPath, profileDir string, headless bool) (context.Context, context.CancelFunc, error) {
+	flags := append(chromedp.DefaultExecAllocatorOptions[:],
+		chromedp.Flag("headless", headless),
 		chromedp.UserDataDir(profileDir),
 	)
 	if browserPath != "" {
-		opts = append(opts, chromedp.ExecPath(browserPath))
+		flags = append(flags, chromedp.ExecPath(browserPath))
 	}
-	allocCtx, allocCancel := chromedp.NewExecAllocator(context.Background(), opts...)
+	allocCtx, allocCancel := chromedp.NewExecAllocator(context.Background(), flags...)
 	taskCtx, taskCancel := chromedp.NewContext(allocCtx)
 	return taskCtx, func() { taskCancel(); allocCancel() }, nil
 }

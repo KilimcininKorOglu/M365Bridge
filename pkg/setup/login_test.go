@@ -62,3 +62,23 @@ func TestOnAppSurface(t *testing.T) {
 		}
 	}
 }
+
+func TestStartBrowserRemote(t *testing.T) {
+	opts := LoginOptions{
+		CDPURL: "ws://127.0.0.1:9222/devtools/browser/test",
+	}
+	ctx, cancel, err := startBrowser(opts, "data/browser-profile")
+	if err != nil {
+		t.Fatalf("startBrowser with CDPURL failed: %v", err)
+	}
+	defer cancel()
+	if ctx == nil {
+		t.Fatal("expected non-nil context from startBrowser with CDPURL")
+	}
+}
+
+func TestPrintLoginBannerQuiet(t *testing.T) {
+	// Quiet banner should not panic
+	printLoginBanner(true)
+	printStep(true, "should not output")
+}

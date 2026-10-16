@@ -114,6 +114,9 @@ SETUP-WIZARD FLAGS
 LOGIN FLAGS
   -browser <path>   Browser executable to drive (default: discover the
                     installed Chrome automatically)
+  -cdp <url>        Remote Chrome DevTools Protocol endpoint (e.g.
+                    http://localhost:9222). Overrides -browser.
+  -headless         Run local browser in headless mode
   -cookies <path>   JSON cookie file to seed the browser with, for an
                     unattended sign-in
 
@@ -160,6 +163,9 @@ func printEnvironment(w io.Writer) {
                                    reach it. The interface sends it in the same
                                    header an API client sends its key, so it is
                                    accepted wherever a key is.
+    M365_CDP_URL                   Remote Chrome DevTools Protocol URL for
+                                   browser login and unattended background
+                                   token renewal (e.g. http://chromium:9222).
 
   Answers
     M365_ENABLE_WEB_SEARCH         Let Copilot search the web (default true).
@@ -271,10 +277,18 @@ func runLogin(args []string) {
 	fs := flag.NewFlagSet("login", flag.ExitOnError)
 	fs.Usage = func() { printUsage(os.Stdout) }
 	browser := fs.String("browser", "", "Browser executable to drive; empty discovers the installed Chrome")
+	cdp := fs.String("cdp", os.Getenv("M365_CDP_URL"), "CDP endpoint URL (e.g. http://localhost:9222 or ws://...)")
+	headless := fs.Bool("headless", false, "Run local browser in headless mode")
 	cookies := fs.String("cookies", "", "JSON cookie file to seed the browser with, for an unattended sign-in")
 	_ = fs.Parse(args)
 
-	if err := setup.RunLogin(setup.LoginOptions{BrowserPath: *browser, CookiesFile: *cookies}); err != nil {
+	opts := setup.LoginOptions{
+		BrowserPath: *browser,
+		CDPURL:      *cdp,
+		Headless:    *headless,
+		CookiesFile: *cookies,
+	}
+	if err := setup.RunLogin(opts); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}

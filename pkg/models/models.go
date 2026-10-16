@@ -348,6 +348,9 @@ type Config struct {
 	// and no API key gates the interface and leaves the API open, which is what
 	// an empty key list means everywhere else.
 	WebUIPassword string
+	// CDPURL optionally points to an external Chrome instance (e.g. a Docker
+	// sidecar) via Chrome DevTools Protocol for unattended browser renewal.
+	CDPURL string
 }
 
 const (
@@ -413,12 +416,13 @@ func LoadConfig() *Config {
 		EnableWebSearch:       getEnvBool("M365_ENABLE_WEB_SEARCH", true),
 		EnableWebUI:           getEnvBool("M365_ENABLE_WEB_UI", true),
 		WebUIPassword:         strings.TrimSpace(os.Getenv("M365_WEB_UI_PASSWORD")),
+		CDPURL:                strings.TrimSpace(os.Getenv("M365_CDP_URL")),
 	}
 
 	// The password itself never reaches a log line; only whether one is set.
-	logging.Infof("LoadConfig: tenantID=%s userOID=%s clientID=%s apiKeys=%d webUIPassword=%t",
+	logging.Infof("LoadConfig: tenantID=%s userOID=%s clientID=%s apiKeys=%d webUIPassword=%t cdpURL=%s",
 		cfg.TenantID, cfg.UserOID, cfg.ClientID[:min(8, len(cfg.ClientID))]+"...",
-		len(cfg.APIKeys), cfg.WebUIPassword != "")
+		len(cfg.APIKeys), cfg.WebUIPassword != "", cfg.CDPURL)
 	return cfg
 }
 

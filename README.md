@@ -52,7 +52,7 @@ Choose one of the three options below. All three leave you with the same thing: 
 
 ### Option A: Docker
 
-The shortest path. The published image needs no build.
+The shortest path. The published image needs no build. Pair it with the Chromium sidecar for unattended 24/7 token renewal on headless servers:
 
 Create `docker-compose.yml`:
 
@@ -61,10 +61,29 @@ services:
   m365bridge:
     image: ghcr.io/kilimcininkoroglu/m365bridge:latest
     container_name: m365bridge
+    environment:
+      - TZ=Europe/Istanbul
+      - M365_CDP_URL=http://chromium:9222
     ports:
       - "8230:8000"
     volumes:
       - ./data:/app/data
+    depends_on:
+      - chromium
+    restart: unless-stopped
+
+  chromium:
+    image: zenika/alpine-chrome:latest
+    container_name: m365bridge-chromium
+    command:
+      - --no-sandbox
+      - --remote-debugging-address=0.0.0.0
+      - --remote-debugging-port=9222
+      - --user-data-dir=/data/browser-profile
+    ports:
+      - "127.0.0.1:9222:9222"
+    volumes:
+      - ./data/browser-profile:/data/browser-profile
     restart: unless-stopped
 ```
 
@@ -141,9 +160,9 @@ On a desktop install, `m365-bridge login` does this whole chapter in one command
 
 It opens your own Chrome, waits for you to sign in, then captures the refresh token, the designer broker refresh token that powers image generation, and every cookie the browser holds. Each refresh token is verified by redeeming it before anything is stored, so a capture that cannot be redeemed never replaces a credential that works.
 
-The browser profile persists under `data/browser-profile`, so the first run needs one interactive sign-in and later runs renew on their own: rerun the same command when the service reports an authentication failure. No DevTools, no JSON file. Pass `-browser <path>` when Chrome is not installed on the default path, or `-cookies <file>` to seed the browser from a JSON cookie export instead of signing in.
+The browser profile persists under `data/browser-profile`, so the first run needs one interactive sign-in and later runs renew on their own: rerun the same command when the service reports an authentication failure. No DevTools, no JSON file. Pass `-browser <path>` when Chrome is not installed on the default path, `-cdp <url>` to drive a remote Chrome instance via CDP, `-headless` for local headless execution, or `-cookies <file>` to seed the browser from a JSON cookie export instead of signing in.
 
-The command needs a desktop browser, so Docker installs keep the manual chapter below. When the credentials it captured expire, rerunning it renews everything the same way.
+For headless Docker / VPS deployments, run `m365-bridge login` locally once, then copy your `data/` directory (including `data/browser-profile` and `data/encryption.key`) to the server. With the Chromium sidecar running (`M365_CDP_URL=http://chromium:9222`), M365Bridge automatically and unattendedly renews tokens in the background when the 24-hour token expires—no recurring logins or manual file transfers needed.
 
 ### Step 1: Get the refresh token
 
