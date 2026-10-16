@@ -110,8 +110,8 @@ func classifyUpstreamError(err error) (int, string) {
 	// Checked before the status lookup below: a failed turn reached the backend
 	// and carries no HTTP status, so it would otherwise fall through to the
 	// generic internal error and read as a bug on this side.
-	if turnFailed(err) {
-		return http.StatusBadGateway, upstreamTurnFailedCode
+	if status, code, ok := turnFailureStatus(err); ok {
+		return status, code
 	}
 
 	if status, ok := client.UpstreamStatus(err); ok {
@@ -121,14 +121,19 @@ func classifyUpstreamError(err error) (int, string) {
 	return http.StatusInternalServerError, internalProcessingCode
 }
 
-// turnFailed reports a turn that reached the backend and produced no answer. A
-// turn that ended with neither an answer nor a verdict counts too, because the
-// client can act on both the same way.
-func turnFailed(err error) bool {
-	if _, ok := client.TurnFailure(err); ok {
-		return true
+// turnFailureStatus reports whether the turn reached the backend and failed,
+// and maps quota exhaustion (OutOfCredits / Throttled) to 429 rate limit.
+func turnFailureStatus(err error) (int, string, bool) {
+	if failure, ok := client.TurnFailure(err); ok {
+		if failure.Value == "OutOfCredits" || failure.Value == "Throttled" {
+			return http.StatusTooManyRequests, upstreamRateLimitCode, true
+		}
+		return http.StatusBadGateway, upstreamTurnFailedCode, true
 	}
-	return errors.Is(err, client.ErrEmptyTurn)
+	if errors.Is(err, client.ErrEmptyTurn) {
+		return http.StatusBadGateway, upstreamTurnFailedCode, true
+	}
+	return 0, "", false
 }
 
 // classifyUpstreamStatus maps the backend's own HTTP status onto ours.

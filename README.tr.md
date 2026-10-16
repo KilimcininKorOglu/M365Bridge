@@ -33,6 +33,7 @@ Yapay Zeka Aracınız (Claude Code, Cursor, SDK)
 - **Düşünme Süreci (Reasoning)**: Modelin iç akıl yürütme adımlarını `reasoning_content` (OpenAI) ve `thinking` (Anthropic) bloklarıyla sunar.
 - **Yerleşik Web Arayüzü**: Go ikili dosyasına gömülü, çok turlu sohbet ve markdown desteği sunan Türkçe/İngilizce arayüz.
 - **Model Context Protocol (MCP)**: Copilot'u `/mcp` rotasında standart bir JSON-RPC 2.0 sunucusu olarak sunar.
+- **Kota ve Kullanım Takibi**: Konuşma mesaj tavanını ve Claude ile GPT-6 modellerinin günlük/haftalık öncelikli erişim kotalarını API (`/v1/quota`), sunucu logları ve Web arayüzünde canlı takip eder.
 
 ---
 

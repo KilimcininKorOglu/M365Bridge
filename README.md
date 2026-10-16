@@ -33,6 +33,7 @@ Your AI Client (Claude Code, Cursor, SDK)
 - **Reasoning Content**: Exposes internal chain-of-thought via `reasoning_content` (OpenAI) and `thinking` blocks (Anthropic).
 - **Embedded Web UI**: Self-contained web interface compiled into the binary with multi-turn chat, markdown rendering, and Turkish/English support.
 - **Model Context Protocol (MCP)**: JSON-RPC 2.0 server at `/mcp` exposing Copilot as leaf tools.
+- **Quota & Usage Telemetry**: Live tracking of conversation message limits and daily/weekly priority access allowances for Claude and GPT-6 models across the API (`/v1/quota`), logs, and Web UI.
 
 ---
 

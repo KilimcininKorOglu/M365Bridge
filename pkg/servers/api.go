@@ -315,6 +315,16 @@ func (api *APIServer) noteThrottling(info *client.ThrottlingInfo) {
 	api.throttlingMu.Lock()
 	api.lastThrottling = info
 	api.throttlingMu.Unlock()
+
+	warnExhaustedAllowances(info.Allowances)
+}
+
+func warnExhaustedAllowances(allowances map[string]client.ModelAllowance) {
+	for model, a := range allowances {
+		if (a.Daily != nil && *a.Daily == 0) || (a.Weekly != nil && *a.Weekly == 0) {
+			logging.Warnf("[Quota] priority allowance exhausted for %s: daily=%v weekly=%v", model, a.Daily, a.Weekly)
+		}
+	}
 }
 
 // currentThrottling returns the last known quota counters, or nil.
@@ -955,6 +965,10 @@ func (api *APIServer) handleQuota(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	api.sendJSON(w, http.StatusOK, buildQuotaResponse(info))
+}
+
+func buildQuotaResponse(info *client.ThrottlingInfo) map[string]any {
 	response := map[string]any{
 		"object":    "quota",
 		"available": true,
@@ -969,10 +983,16 @@ func (api *APIServer) handleQuota(w http.ResponseWriter, r *http.Request) {
 	if info.NumUserMessages != nil && info.MaxNumUserMessages != nil {
 		response["headroom"] = *info.MaxNumUserMessages - *info.NumUserMessages
 	}
+	if len(info.Allowances) > 0 {
+		response["allowances"] = info.Allowances
+	}
+	if len(info.RawMetering) > 0 {
+		response["raw_metering"] = info.RawMetering
+	}
 	if len(info.Extra) > 0 {
 		response["extra"] = info.Extra
 	}
-	api.sendJSON(w, http.StatusOK, response)
+	return response
 }
 
 // quotaExhausted reports whether the last observed counters show the

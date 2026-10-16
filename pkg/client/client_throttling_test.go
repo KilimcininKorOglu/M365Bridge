@@ -1,6 +1,9 @@
 package client
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // liveThrottlingFrame mirrors the object the backend sends on type 1 update
 // frames, including the third counter beyond the two documented ones.
@@ -71,5 +74,49 @@ func TestThrottlingExhaustedAndSummary(t *testing.T) {
 	}
 	if got := missing.Summary(); got != "" {
 		t.Fatalf("nil Summary() = %q, want empty", got)
+	}
+}
+
+func assertAllowance(t *testing.T, a ModelAllowance, model string, wantDaily, wantWeekly int) {
+	t.Helper()
+	if a.Daily == nil || *a.Daily != wantDaily {
+		t.Fatalf("%s daily = %v, want %d", model, a.Daily, wantDaily)
+	}
+	if a.Weekly == nil || *a.Weekly != wantWeekly {
+		t.Fatalf("%s weekly = %v, want %d", model, a.Weekly, wantWeekly)
+	}
+}
+
+func TestParseThrottlingWithMetering(t *testing.T) {
+	frame := map[string]any{
+		"numUserMessagesInConversation":    float64(3),
+		"maxNumUserMessagesInConversation": float64(600),
+		"metering": map[string]any{
+			"ClaudeSonnet55QueryDaily":  map[string]any{"remainingAllowance": float64(78)},
+			"ClaudeSonnet55QueryWeekly": map[string]any{"remainingAllowance": float64(148)},
+			"ClaudeOpusQueryDaily":      map[string]any{"remainingAllowance": float64(39)},
+			"ClaudeOpusQuery75":         map[string]any{"remainingAllowance": float64(74)},
+			"GPT61SolQueryDaily":        map[string]any{"remainingAllowance": float64(38)},
+			"GPT61SolQueryWeekly":       map[string]any{"remainingAllowance": float64(73)},
+			"DeepResearch":              float64(100),
+		},
+	}
+
+	info := parseThrottling(frame)
+	if info == nil {
+		t.Fatal("parseThrottling returned nil")
+	}
+	if info.RawMetering["DeepResearch"] != 100 {
+		t.Fatalf("RawMetering[DeepResearch] = %d, want 100", info.RawMetering["DeepResearch"])
+	}
+
+	assertAllowance(t, info.Allowances["claude-sonnet-5.5"], "claude-sonnet-5.5", 78, 148)
+	assertAllowance(t, info.Allowances["claude-opus"], "claude-opus", 39, 74)
+	assertAllowance(t, info.Allowances["gpt-6.1-sol"], "gpt-6.1-sol", 38, 73)
+
+	summary := info.Summary()
+	want := "allowance=[claude-opus(39d/74w) claude-sonnet-5.5(78d/148w) gpt-6.1-sol(38d/73w)]"
+	if !strings.Contains(summary, want) {
+		t.Fatalf("Summary %q does not contain %q", summary, want)
 	}
 }

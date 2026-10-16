@@ -318,6 +318,20 @@ func TestClassifyUpstreamErrorPrefersTheTurnVerdictOverAStatus(t *testing.T) {
 	}
 }
 
+func TestClassifyUpstreamErrorMapsOutOfCreditsToRateLimit(t *testing.T) {
+	err := fmt.Errorf("chat: %w", &client.TurnFailedError{
+		Value: "OutOfCredits", TurnState: "Failed", Message: "You have used your available priority access.",
+	})
+
+	status, code := classifyUpstreamError(err)
+	if status != http.StatusTooManyRequests {
+		t.Errorf("status = %d, want 429", status)
+	}
+	if code != upstreamRateLimitCode {
+		t.Errorf("code = %q, want %q", code, upstreamRateLimitCode)
+	}
+}
+
 func TestUpstreamErrorMessageExplainsAFailedTurn(t *testing.T) {
 	msg := upstreamErrorMessage("chat", upstreamTurnFailedCode)
 	if !strings.Contains(msg, "without producing an answer") {

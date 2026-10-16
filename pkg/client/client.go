@@ -332,14 +332,29 @@ type StreamChunk struct {
 // sends them in a `throttling` object on type 1 update frames. Counters are
 // pointers because a frame may carry only some of them, and zero is a
 // meaningful value that must not be confused with absent.
+// ModelAllowance represents the daily and/or weekly priority access allowance for a model.
+type ModelAllowance struct {
+	Daily  *int `json:"daily,omitempty"`
+	Weekly *int `json:"weekly,omitempty"`
+}
+
+// ThrottlingInfo carries M365's per-conversation quota counters and priority
+// access metering. The backend sends them in a `throttling` object on type 1
+// update frames. Counters are pointers because a frame may carry only some of
+// them, and zero is a meaningful value that must not be confused with absent.
 type ThrottlingInfo struct {
 	// NumUserMessages is the user message count consumed in this conversation.
-	NumUserMessages *int
+	NumUserMessages *int `json:"num_user_messages,omitempty"`
 	// MaxNumUserMessages is the ceiling M365 enforces per conversation.
-	MaxNumUserMessages *int
+	MaxNumUserMessages *int `json:"max_num_user_messages,omitempty"`
+	// Allowances maps recognized models (e.g. "claude-sonnet-5.5", "claude-opus",
+	// "gpt-6.1-sol") to their daily/weekly remaining priority allowances.
+	Allowances map[string]ModelAllowance `json:"allowances,omitempty"`
+	// RawMetering preserves the raw budget keys and remaining counts.
+	RawMetering map[string]int `json:"raw_metering,omitempty"`
 	// Extra holds every other key the backend sent, so a counter this build
 	// does not know about is still observable instead of silently dropped.
-	Extra map[string]any
+	Extra map[string]any `json:"extra,omitempty"`
 }
 
 // Exhausted reports whether the conversation reached its message ceiling.
@@ -355,7 +370,7 @@ func (t *ThrottlingInfo) Summary() string {
 	if t == nil {
 		return ""
 	}
-	parts := make([]string, 0, 3+len(t.Extra))
+	parts := make([]string, 0, 4+len(t.Extra))
 	if t.NumUserMessages != nil {
 		parts = append(parts, fmt.Sprintf("used=%d", *t.NumUserMessages))
 	}
@@ -365,14 +380,34 @@ func (t *ThrottlingInfo) Summary() string {
 	if t.NumUserMessages != nil && t.MaxNumUserMessages != nil {
 		parts = append(parts, fmt.Sprintf("headroom=%d", *t.MaxNumUserMessages-*t.NumUserMessages))
 	}
+	if len(t.Allowances) > 0 {
+		allowanceParts := formatAllowancesSummary(t.Allowances)
+		parts = append(parts, "allowance=["+strings.Join(allowanceParts, " ")+"]")
+	}
 	for _, key := range slices.Sorted(maps.Keys(t.Extra)) {
 		parts = append(parts, fmt.Sprintf("%s=%v", key, t.Extra[key]))
 	}
 	return strings.Join(parts, " ")
 }
 
+func formatAllowancesSummary(allowances map[string]ModelAllowance) []string {
+	parts := make([]string, 0, len(allowances))
+	for _, key := range slices.Sorted(maps.Keys(allowances)) {
+		a := allowances[key]
+		var s []string
+		if a.Daily != nil {
+			s = append(s, fmt.Sprintf("%dd", *a.Daily))
+		}
+		if a.Weekly != nil {
+			s = append(s, fmt.Sprintf("%dw", *a.Weekly))
+		}
+		parts = append(parts, fmt.Sprintf("%s(%s)", key, strings.Join(s, "/")))
+	}
+	return parts
+}
+
 // parseThrottling converts the backend's `throttling` object into
-// ThrottlingInfo. Keys beyond the two documented counters are preserved in
+// ThrottlingInfo. Keys beyond the documented counters are preserved in
 // Extra rather than dropped by a hardcoded key list.
 func parseThrottling(raw map[string]any) *ThrottlingInfo {
 	if len(raw) == 0 {
@@ -391,6 +426,12 @@ func parseThrottling(raw map[string]any) *ThrottlingInfo {
 				info.MaxNumUserMessages = &n
 				continue
 			}
+		case "metering":
+			if rawMetering := parseRawMetering(value); len(rawMetering) > 0 {
+				info.RawMetering = rawMetering
+				info.Allowances = extractModelAllowances(rawMetering)
+				continue
+			}
 		}
 		if info.Extra == nil {
 			info.Extra = make(map[string]any)
@@ -398,6 +439,59 @@ func parseThrottling(raw map[string]any) *ThrottlingInfo {
 		info.Extra[key] = value
 	}
 	return info
+}
+
+func parseRawMetering(val any) map[string]int {
+	m, ok := val.(map[string]any)
+	if !ok || len(m) == 0 {
+		return nil
+	}
+	out := make(map[string]int, len(m))
+	for k, v := range m {
+		if obj, ok := v.(map[string]any); ok {
+			if n, ok := jsonInt(obj["remainingAllowance"]); ok {
+				out[k] = n
+				continue
+			}
+		}
+		if n, ok := jsonInt(v); ok {
+			out[k] = n
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func extractModelAllowances(raw map[string]int) map[string]ModelAllowance {
+	if len(raw) == 0 {
+		return nil
+	}
+	out := make(map[string]ModelAllowance)
+	applyAllowance(out, "claude-sonnet-5.5", raw, "ClaudeSonnet55QueryDaily", []string{"ClaudeSonnet55QueryWeekly"})
+	applyAllowance(out, "claude-opus", raw, "ClaudeOpusQueryDaily", []string{"ClaudeOpusQuery75", "ClaudeOpusQuery"})
+	applyAllowance(out, "gpt-6.1-sol", raw, "GPT61SolQueryDaily", []string{"GPT61SolQueryWeekly"})
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func applyAllowance(out map[string]ModelAllowance, modelKey string, raw map[string]int, dailyKey string, weeklyKeys []string) {
+	var a ModelAllowance
+	if d, ok := raw[dailyKey]; ok {
+		a.Daily = &d
+	}
+	for _, wk := range weeklyKeys {
+		if w, ok := raw[wk]; ok {
+			a.Weekly = &w
+			break
+		}
+	}
+	if a.Daily != nil || a.Weekly != nil {
+		out[modelKey] = a
+	}
 }
 
 // jsonInt converts a JSON number to int, rejecting bools and non-numbers.

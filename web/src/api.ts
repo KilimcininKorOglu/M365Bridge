@@ -1,5 +1,5 @@
 import { ApiError } from './types'
-import type { M365Conversation, ModelEntry, SessionRecord } from './types'
+import type { M365Conversation, ModelEntry, QuotaResponse, SessionRecord } from './types'
 
 // The gateway authenticates on a header, never on a cookie, so a cross-site
 // form cannot carry the credential and no CSRF token is needed.
@@ -188,6 +188,14 @@ export interface Personalization {
 
 export async function fetchPersonalization(): Promise<Personalization> {
   return await getJSON<Personalization>('/v1/personalization')
+}
+
+export async function fetchQuota(): Promise<QuotaResponse | null> {
+  try {
+    return await getJSON<QuotaResponse>('/v1/quota')
+  } catch {
+    return null
+  }
 }
 
 /**

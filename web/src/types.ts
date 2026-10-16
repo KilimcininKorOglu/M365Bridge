@@ -69,3 +69,21 @@ export class ApiError extends Error {
     this.key = key
   }
 }
+
+export interface ModelAllowance {
+  daily?: number
+  weekly?: number
+}
+
+export interface QuotaResponse {
+  object: 'quota'
+  available: boolean
+  exhausted?: boolean
+  used?: number
+  max?: number
+  headroom?: number
+  allowances?: Record<string, ModelAllowance>
+  raw_metering?: Record<string, number>
+  detail?: string
+}
+

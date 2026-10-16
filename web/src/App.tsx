@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import * as api from './api'
 import { ApiError } from './types'
-import type { ChatMessage, ConversationRow, ModelEntry } from './types'
+import type { ChatMessage, ConversationRow, ModelEntry, QuotaResponse } from './types'
 import { apiKeyCookie, clearCookie, modelCookie, readCookie, writeCookie } from './cookies'
 import { useI18n } from './i18n'
 import { ApiKeyGate } from './components/ApiKeyGate'
@@ -125,6 +125,7 @@ export function App() {
   // stays null when the read failed, so the control is absent rather than
   // showing a state it cannot vouch for.
   const [memory, setMemory] = useState<MemoryState | null>(null)
+  const [quota, setQuota] = useState<QuotaResponse | null>(null)
 
   const [rows, setRows] = useState<ConversationRow[]>([])
   const [rowsLoaded, setRowsLoaded] = useState(false)
@@ -336,6 +337,22 @@ export function App() {
       // control and reports itself rather than blocking the interface.
       .catch(report)
   }, [report, unlocked])
+
+  const refreshQuota = useCallback(async () => {
+    try {
+      const q = await api.fetchQuota()
+      if (q && q.available) {
+        setQuota(q)
+      }
+    } catch {
+      // Quota is best-effort and does not report an error banner.
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!unlocked) return
+    void refreshQuota()
+  }, [refreshQuota, unlocked])
 
   const changeMemory = useCallback(
     (enabled: boolean) => {
@@ -580,9 +597,10 @@ export function App() {
         // The first turn is what creates the upstream conversation, so the
         // sidebar only learns its id once the turn is over.
         void refreshRows()
+        void refreshQuota()
       }
     },
-    [activeId, model, refreshRows, report],
+    [activeId, model, refreshQuota, refreshRows, report],
   )
 
   const stop = useCallback(() => {
@@ -696,6 +714,7 @@ export function App() {
         activeId={activeId}
         remoteListFailed={remoteListFailed}
         memory={memory}
+        quota={quota}
         onOpen={openRow}
         onNew={startNew}
         onDelete={removeRow}
