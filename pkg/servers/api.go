@@ -1620,7 +1620,9 @@ type chatCompletionsRequest struct {
 	ParallelToolCalls *bool          `json:"parallel_tool_calls"`
 	StreamOptions     *streamOptions `json:"stream_options"`
 	// Either a single string or an array of them, so it arrives untyped.
-	Stop any `json:"stop"`
+	Stop            any                 `json:"stop"`
+	ReasoningEffort string              `json:"reasoning_effort"`
+	Reasoning       *responsesReasoning `json:"reasoning"`
 }
 
 // readJSONRequest answers the method gate and decodes the body into dst. It
@@ -1695,7 +1697,13 @@ func (api *APIServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 	if !ok {
 		return
 	}
-	logging.Infof("handleChatCompletions: model=%s stream=%v tools=%d sid=%s", modelKey, req.Stream, len(req.Tools), modelSessionID)
+	deliberate, err := openAIChatRequestsDeliberation(req)
+	if err != nil {
+		api.sendError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	cfg = applyReasoningEffort(modelKey, cfg, deliberate)
+	logging.Infof("handleChatCompletions: model=%s tone=%s stream=%v tools=%d sid=%s", modelKey, cfg.Tone, req.Stream, len(req.Tools), modelSessionID)
 
 	ledger, ok := api.prepareToolLedger(w, req.Messages, "handleChatCompletions")
 	if !ok {
@@ -1907,6 +1915,15 @@ func (api *APIServer) handleAnthropicCountTokens(w http.ResponseWriter, r *http.
 	api.sendJSON(w, http.StatusOK, map[string]int{"input_tokens": countTokens(string(countable))})
 }
 
+type anthropicThinking struct {
+	Type         string `json:"type"`
+	BudgetTokens int    `json:"budget_tokens"`
+}
+
+type anthropicOutputConfig struct {
+	Effort string `json:"effort"`
+}
+
 // handleAnthropicMessages handles Anthropic messages API requests.
 // anthropicMessagesRequest is the wire shape of a /v1/messages request.
 type anthropicMessagesRequest struct {
@@ -1920,9 +1937,12 @@ type anthropicMessagesRequest struct {
 	ToolChoice  map[string]any        `json:"tool_choice"`
 	// Anthropic declares stop_sequences as an array of strings, unlike
 	// OpenAI's stop, which is also a bare string.
-	StopSequences []string `json:"stop_sequences"`
-	SessionID     string   `json:"session_id"`
-	User          string   `json:"user"`
+	StopSequences   []string               `json:"stop_sequences"`
+	SessionID       string                 `json:"session_id"`
+	User            string                 `json:"user"`
+	Thinking        *anthropicThinking     `json:"thinking"`
+	OutputConfig    *anthropicOutputConfig `json:"output_config"`
+	ReasoningEffort string                 `json:"reasoning_effort"`
 }
 
 func (api *APIServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
@@ -1939,7 +1959,13 @@ func (api *APIServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Req
 	if !ok {
 		return
 	}
-	logging.Infof("handleAnthropicMessages: model=%s stream=%v tools=%d sid=%s", modelKey, req.Stream, len(req.Tools), modelSessionID)
+	deliberate, err := anthropicRequestsDeliberation(req)
+	if err != nil {
+		api.sendError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	cfg = applyReasoningEffort(modelKey, cfg, deliberate)
+	logging.Infof("handleAnthropicMessages: model=%s tone=%s stream=%v tools=%d sid=%s", modelKey, cfg.Tone, req.Stream, len(req.Tools), modelSessionID)
 
 	ledger, ok := api.prepareToolLedger(w, req.Messages, "handleAnthropicMessages")
 	if !ok {
@@ -4356,13 +4382,10 @@ var reasoningEffortRank = map[string]int{
 	"max":     6,
 }
 
-// reasoningEffortRequestsDeliberation validates the effort value and reports
-// whether it asks for a reasoning tone. An unset block leaves the tone alone.
-func reasoningEffortRequestsDeliberation(reasoning *responsesReasoning) (bool, error) {
-	if reasoning == nil {
-		return false, nil
-	}
-	effort := strings.ToLower(strings.TrimSpace(reasoning.Effort))
+// parseReasoningEffort validates the effort string against accepted levels and reports
+// whether it asks for a reasoning tone (medium or higher).
+func parseReasoningEffort(effort string) (bool, error) {
+	effort = strings.ToLower(strings.TrimSpace(effort))
 	if effort == "" {
 		return false, nil
 	}
@@ -4370,11 +4393,51 @@ func reasoningEffortRequestsDeliberation(reasoning *responsesReasoning) (bool, e
 	if !ok {
 		return false, fmt.Errorf(
 			"unsupported reasoning effort %q; use %s",
-			reasoning.Effort,
+			effort,
 			strings.Join(models.ReasoningEffortNames(), ", "),
 		)
 	}
 	return rank >= reasoningEffortRank["medium"], nil
+}
+
+// reasoningEffortRequestsDeliberation validates the effort value from responsesReasoning
+// and reports whether it asks for a reasoning tone. An unset block leaves the tone alone.
+func reasoningEffortRequestsDeliberation(reasoning *responsesReasoning) (bool, error) {
+	if reasoning == nil {
+		return false, nil
+	}
+	return parseReasoningEffort(reasoning.Effort)
+}
+
+// openAIChatRequestsDeliberation checks reasoning_effort or reasoning.effort in OpenAI chat completions requests.
+func openAIChatRequestsDeliberation(req chatCompletionsRequest) (bool, error) {
+	if req.ReasoningEffort != "" {
+		return parseReasoningEffort(req.ReasoningEffort)
+	}
+	if req.Reasoning != nil {
+		return parseReasoningEffort(req.Reasoning.Effort)
+	}
+	return false, nil
+}
+
+// anthropicRequestsDeliberation checks reasoning_effort, output_config.effort, or thinking in Anthropic messages requests.
+func anthropicRequestsDeliberation(req anthropicMessagesRequest) (bool, error) {
+	if req.ReasoningEffort != "" {
+		return parseReasoningEffort(req.ReasoningEffort)
+	}
+	if req.OutputConfig != nil && req.OutputConfig.Effort != "" {
+		return parseReasoningEffort(req.OutputConfig.Effort)
+	}
+	if req.Thinking != nil {
+		typ := strings.ToLower(strings.TrimSpace(req.Thinking.Type))
+		if typ == "enabled" || typ == "adaptive" || req.Thinking.BudgetTokens > 0 {
+			return true, nil
+		}
+		if typ == "disabled" {
+			return false, nil
+		}
+	}
+	return false, nil
 }
 
 // applyReasoningEffort returns the model config to use, redirecting to the

@@ -88,3 +88,43 @@ func TestApplyReasoningEffortLeavesModelsWithoutAVariant(t *testing.T) {
 		t.Fatalf("low effort rerouted the model to %q", got.Tone)
 	}
 }
+
+func assertOpenAIDeliberation(t *testing.T, req chatCompletionsRequest, want bool) {
+	t.Helper()
+	got, err := openAIChatRequestsDeliberation(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != want {
+		t.Fatalf("openAIChatRequestsDeliberation = %v, want %v", got, want)
+	}
+}
+
+func TestOpenAIChatRequestsDeliberation(t *testing.T) {
+	assertOpenAIDeliberation(t, chatCompletionsRequest{}, false)
+	assertOpenAIDeliberation(t, chatCompletionsRequest{ReasoningEffort: "high"}, true)
+	assertOpenAIDeliberation(t, chatCompletionsRequest{ReasoningEffort: "low"}, false)
+	assertOpenAIDeliberation(t, chatCompletionsRequest{Reasoning: &responsesReasoning{Effort: "medium"}}, true)
+	if _, err := openAIChatRequestsDeliberation(chatCompletionsRequest{ReasoningEffort: "invalid"}); err == nil {
+		t.Fatal("expected error for invalid effort")
+	}
+}
+
+func assertAnthropicDeliberation(t *testing.T, req anthropicMessagesRequest, want bool) {
+	t.Helper()
+	got, err := anthropicRequestsDeliberation(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != want {
+		t.Fatalf("anthropicRequestsDeliberation = %v, want %v", got, want)
+	}
+}
+
+func TestAnthropicRequestsDeliberation(t *testing.T) {
+	assertAnthropicDeliberation(t, anthropicMessagesRequest{}, false)
+	assertAnthropicDeliberation(t, anthropicMessagesRequest{Thinking: &anthropicThinking{Type: "enabled"}}, true)
+	assertAnthropicDeliberation(t, anthropicMessagesRequest{Thinking: &anthropicThinking{Type: "disabled"}}, false)
+	assertAnthropicDeliberation(t, anthropicMessagesRequest{OutputConfig: &anthropicOutputConfig{Effort: "high"}}, true)
+	assertAnthropicDeliberation(t, anthropicMessagesRequest{ReasoningEffort: "high"}, true)
+}

@@ -51,12 +51,19 @@ Claude Code bu rotayı okur, `claude` veya `anthropic` ile başlayan model kimli
 
 ---
 
-## Responses API ve Sıkıştırma (Compact API)
+## Düşünme Yoğunluğu ve Kontrolü (Reasoning Effort)
 
-### Düşünme Yoğunluğu (Reasoning Effort)
-`/v1/responses` rotası `reasoning: {"effort": "<seviye>"}` parametresini destekler:
-- Kabul edilen değerler: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`.
-- `medium` veya daha yüksek seviyeler, isteği otomatik olarak modelin reasoning (düşünme) varyantına yönlendirir (örneğin `gpt5.5` -> `gpt5.5-reasoning`).
+Düşünme (akıl yürütme) yoğunluğu, standart OpenAI uyumlu `reasoning_effort` parametresi (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`), Anthropic'in `thinking` bloğu veya Responses API'nin `reasoning.effort` alanı üzerinden ayarlanır. Farklı düşünme seviyelerine geçmek için yapay model isimleri (örneğin `-reasoning` eki) kullanma zorunluluğu yoktur:
+
+- **OpenAI Chat Completions (`/v1/chat/completions`)**: `reasoning_effort: "<seviye>"` veya `reasoning: {"effort": "<seviye>"}` parametresini kabul eder.
+- **Anthropic Messages (`/v1/messages`)**: `thinking: {"type": "enabled"|"adaptive", "budget_tokens": <n>}`, `output_config: {"effort": "<seviye>"}` veya `reasoning_effort: "<seviye>"` parametrelerini kabul eder.
+- **Responses API (`/v1/responses`)**: `reasoning: {"effort": "<seviye>"}` parametresini kabul eder.
+
+Düşünme seviyesi `medium` veya daha yüksek seçildiğinde (ya da thinking etkinleştirildiğinde), temel modelleri (`gpt-5.5`, `gpt-5.4`, `gpt-5.3`, `gpt-5.2`, `gpt-5.6`, `claude-sonnet` vb.) hedefleyen istekler arka planda otomatik olarak ilgili düşünme (reasoning) tonuna yönlendirilir. Seviye `low`, `minimal` veya `none` olarak belirlendiğinde istek doğrudan hızlı ve düşünme adımı içermeyen sohbet tonunda çalıştırılır.
+
+---
+
+## Responses API ve Sıkıştırma (Compact API)
 
 ### Streaming Olay Akışı
 `/v1/responses` üzerindeki streaming istekleri şu SSE olaylarını üretir:

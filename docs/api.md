@@ -51,12 +51,19 @@ Claude Code inspects this endpoint, filters for models beginning with `claude` o
 
 ---
 
-## Responses API & Compact API (`/v1/responses`)
+## Reasoning Intensity & Effort Control
 
-### Reasoning Effort
-The `/v1/responses` route handles `reasoning: {"effort": "<level>"}`:
-- Accepted values: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`.
-- Values of `medium` or higher automatically map the request to the model's reasoning variant (e.g. `gpt5.5` -> `gpt5.5-reasoning`).
+Reasoning intensity is adjusted via the standard OpenAI-compatible `reasoning_effort` parameter (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`), Anthropic's `thinking` block, or Responses API's `reasoning.effort`. Fake model name suffixes (such as `-reasoning`) are no longer required to switch between reasoning levels:
+
+- **OpenAI Chat Completions (`/v1/chat/completions`)**: Accepts `reasoning_effort: "<level>"` or `reasoning: {"effort": "<level>"}`.
+- **Anthropic Messages (`/v1/messages`)**: Accepts `thinking: {"type": "enabled"|"adaptive", "budget_tokens": <n>}`, `output_config: {"effort": "<level>"}`, or `reasoning_effort: "<level>"`.
+- **Responses API (`/v1/responses`)**: Accepts `reasoning: {"effort": "<level>"}`.
+
+When reasoning effort is `medium` or higher (or thinking is enabled), requests targeting base models (`gpt-5.5`, `gpt-5.4`, `gpt-5.3`, `gpt-5.2`, `gpt-5.6`, `claude-sonnet`, etc.) automatically route to the corresponding reasoning tone upstream. Setting effort to `low`, `minimal`, or `none` (or thinking disabled) guarantees execution on the non-reasoning fast chat tone.
+
+---
+
+## Responses API & Compact API (`/v1/responses`)
 
 ### Streaming Event Sequence
 Streaming requests on `/v1/responses` emit typed SSE events:
