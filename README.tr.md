@@ -133,26 +133,38 @@ docker exec -it m365bridge ./bin/m365-bridge login
 
 M365Bridge, model isimlerini arka plandaki ilgili Copilot tonlarına yönlendirir:
 
-| Model Adı          | Copilot Tonu        | OpenAI Eşdeğer ID   | Düşünme (Thinking) | Arka Uç |
-|--------------------|---------------------|---------------------|--------------------|---------|
-| `auto`             | Magic               | `gpt-4-auto`        | Hayır              | GPT-5   |
-| `quick`            | Chat                | `gpt-4-quick`       | Hayır              | GPT-5   |
-| `gpt5.5`           | Gpt_5_5_Chat        | `gpt5.5`            | Hayır              | GPT-5   |
-| `gpt5.5-reasoning` | Gpt_5_5_Reasoning   | `gpt5.5-reasoning`  | Evet               | GPT-5   |
-| `gpt5.6`           | Gpt_5_6_Chat        | `gpt5.6`            | Hayır              | GPT-5   |
-| `gpt5.6-reasoning` | Gpt_5_6_Reasoning   | `gpt5.6-reasoning`  | Evet               | GPT-5   |
-| `gpt6sol`          | Gpt_6_Sol_Reasoning | `gpt-6-sol`         | Hayır              | GPT-6   |
-| `gpt6-astra`       | GPT_6_Astra         | `gpt-6-astra`       | Hayır              | GPT-6   |
-| `claude-sonnet`    | Claude_Sonnet       | `claude-sonnet-4.6` | Hayır              | Claude  |
-| `claude-opus`      | Claude_Opus         | `claude-opus-4.6`   | Evet               | Claude  |
+| Model Adı                 | Copilot Tonu            | OpenAI Eşdeğer ID         | Düşünme (Thinking) | Araç Çağırma (Tool Calling) | Arka Uç           |
+|---------------------------|-------------------------|---------------------------|--------------------|-----------------------------|-------------------|
+| `auto`                    | Magic                   | `gpt-4-auto`              | Hayır              | Evet                        | GPT-5             |
+| `quick`                   | Chat                    | `gpt-4-quick`             | Hayır              | Evet                        | GPT-5             |
+| `gpt5.2`                  | Gpt_5_2_Chat            | `gpt-5.2`                 | Hayır              | Evet                        | GPT-5             |
+| `gpt5.2-reasoning`        | Gpt_5_2_Reasoning       | `gpt-5.2-reasoning`       | Evet               | Evet                        | GPT-5             |
+| `gpt5.3`                  | Gpt_5_3_Chat            | `gpt-5.3`                 | Hayır              | Evet                        | GPT-5             |
+| `gpt5.3-reasoning`        | Gpt_5_3_Reasoning       | `gpt-5.3-reasoning`       | Evet               | Evet                        | GPT-5             |
+| `gpt5.4`                  | Gpt_5_4_Chat            | `gpt-5.4`                 | Hayır              | Evet                        | GPT-5             |
+| `gpt5.4-reasoning`        | Gpt_5_4_Reasoning       | `gpt-5.4-reasoning`       | Evet               | Evet                        | GPT-5             |
+| `gpt5.5`                  | Gpt_5_5_Chat            | `gpt5.5`                  | Hayır              | Evet                        | GPT-5             |
+| `gpt5.5-reasoning`        | Gpt_5_5_Reasoning       | `gpt5.5-reasoning`        | Evet               | Evet                        | GPT-5             |
+| `gpt5.6`                  | Gpt_5_6_Chat            | `gpt5.6`                  | Hayır              | Evet                        | GPT-5             |
+| `gpt5.6-reasoning`        | Gpt_5_6_Reasoning       | `gpt5.6-reasoning`        | Evet               | Evet                        | GPT-5             |
+| `gpt5.6-sol`              | Gpt_6_Sol_Reasoning     | `gpt-5.6-sol`             | Hayır              | Evet                        | GPT-6             |
+| `gpt6sol`                 | Gpt_6_Sol_Reasoning     | `gpt-6-sol`               | Hayır              | Evet                        | GPT-6             |
+| `gpt6-astra`              | GPT_6_Astra             | `gpt-6-astra`             | Hayır              | Evet                        | GPT-6             |
+| `claude-sonnet-reasoning` | Claude_Sonnet_Reasoning | `claude-sonnet-reasoning` | Evet               | Evet                        | Claude            |
+| `claude-fable`            | Claude_Fable            | `claude-fable`            | Hayır              | Evet                        | Claude            |
+| `claude-sonnet`           | Claude_Sonnet           | `claude-sonnet-4.6`       | Hayır              | Hayır (arka uç tonu kapalı) | Claude            |
+| `claude-opus`             | Claude_Opus             | `claude-opus-4.6`         | Evet               | Hayır (arka uç tonu kapalı) | Claude            |
+| `grok-4.5`                | Grok_4_5                | `grok-4.5`                | Hayır              | Evet                        | Grok              |
+| `dall-e-3`                | Magic                   | `dall-e-3`                | Hayır              | Evet                        | DALL-E / Designer |
+| `flux-3`                  | Magic                   | `flux-3`                  | Hayır              | Evet                        | Flux / Designer   |
 
 ### Model Tavsiyeleri
-| İhtiyaç                                            | Önerilen Model                     |
-|----------------------------------------------------|------------------------------------|
-| Genel sohbet ve hızlı sorular                      | `auto` veya `gpt5.5`               |
-| Kodlama ajanları, araç çağırma ve karmaşık mantık  | `gpt5.5-reasoning`                 |
-| Claude uyumlu araçlar (Claude Code, Anthropic SDK) | `claude-sonnet` veya `claude-opus` |
-| En güncel akıl yürütme modeli                      | `gpt6sol`                          |
+| İhtiyaç                                            | Önerilen Model                             |
+|----------------------------------------------------|--------------------------------------------|
+| Genel sohbet ve hızlı sorular                      | `auto` veya `gpt5.5`                       |
+| Kodlama ajanları, araç çağırma ve karmaşık mantık  | `gpt5.5-reasoning` veya `gpt5.6-reasoning` |
+| Claude uyumlu araçlar (Claude Code, Anthropic SDK) | `claude-sonnet-reasoning` veya `claude-fable` |
+| En güncel akıl yürütme modeli                      | `gpt6sol` veya `gpt5.6-sol`                |
 
 ---
 

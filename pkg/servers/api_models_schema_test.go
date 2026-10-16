@@ -171,23 +171,25 @@ func TestModelsCapabilityNamespacesDoNotCollide(t *testing.T) {
 // "Reasoning".
 var wantEffort = map[string]bool{
 	"gpt-4-auto": false, "gpt-4-quick": false, "gpt-4-reasoning": false,
-	"gpt-5.2": true, "gpt-5.3": false, "gpt-5.4": true,
-	"gpt-5.2-reasoning": true, "gpt-5.4-reasoning": true,
+	"gpt-5.2": true, "gpt-5.3": true, "gpt-5.4": true,
+	"gpt-5.2-reasoning": true, "gpt-5.3-reasoning": true, "gpt-5.4-reasoning": true,
 	"gpt-5.5": true, "gpt-5.5-reasoning": true, "gpt-5.6": true,
 	"gpt-5.6-reasoning": true, "gpt-6-sol": false,
 	"gpt-6-astra": false, "gpt-5.6-chat-uppercase": false, "gpt-5.6-reasoning-uppercase": false,
 	"gpt-6-sol-chat": false, "gpt-6-sol-reasoning": true,
 	"gpt-6-sol-chat-uppercase": false, "gpt-6-sol-reasoning-uppercase": false,
-	"claude-sonnet-reasoning": false, "claude-fable": false,
+	"claude-sonnet-reasoning": true, "claude-fable": false,
 	"grok-4.5": false, "grok-auto": false, "grok-reasoning": true,
 	"muse-spark": false, "critique": false,
-	"claude-sonnet-4.6": false, "claude-opus-4.6": false,
+	"claude-sonnet-4.6": true, "claude-opus-4.6": false,
+	"gpt-5.6-sol": false, "gpt-5.4-quick": false, "gpt-5.3-think-deeper": false,
+	"flux-3": false, "flux-4": false, "dall-e-3": false,
 }
 
 var wantThinking = map[string]bool{
 	"gpt-4-auto": false, "gpt-4-quick": false, "gpt-4-reasoning": true,
 	"gpt-5.2": false, "gpt-5.3": false, "gpt-5.4": false,
-	"gpt-5.2-reasoning": true, "gpt-5.4-reasoning": true,
+	"gpt-5.2-reasoning": true, "gpt-5.3-reasoning": true, "gpt-5.4-reasoning": true,
 	"gpt-5.5": false, "gpt-5.5-reasoning": true, "gpt-5.6": false,
 	"gpt-5.6-reasoning": true, "gpt-6-sol": false,
 	"gpt-6-astra": false, "gpt-5.6-chat-uppercase": false, "gpt-5.6-reasoning-uppercase": true,
@@ -197,6 +199,8 @@ var wantThinking = map[string]bool{
 	"grok-4.5": false, "grok-auto": false, "grok-reasoning": false,
 	"muse-spark": false, "critique": false,
 	"claude-sonnet-4.6": false, "claude-opus-4.6": true,
+	"gpt-5.6-sol": false, "gpt-5.4-quick": false, "gpt-5.3-think-deeper": true,
+	"flux-3": false, "flux-4": false, "dall-e-3": false,
 }
 
 // A new registry entry must be added to both tables, otherwise the capability

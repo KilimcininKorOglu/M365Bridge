@@ -133,26 +133,38 @@ docker exec -it m365bridge ./bin/m365-bridge login
 
 M365Bridge routes model identifiers to specific Copilot backend tones:
 
-| Model Key          | Tone                | OpenAI Equivalent ID | Thinking | Backend |
-|--------------------|---------------------|----------------------|----------|---------|
-| `auto`             | Magic               | `gpt-4-auto`         | No       | GPT-5   |
-| `quick`            | Chat                | `gpt-4-quick`        | No       | GPT-5   |
-| `gpt5.5`           | Gpt_5_5_Chat        | `gpt5.5`             | No       | GPT-5   |
-| `gpt5.5-reasoning` | Gpt_5_5_Reasoning   | `gpt5.5-reasoning`   | Yes      | GPT-5   |
-| `gpt5.6`           | Gpt_5_6_Chat        | `gpt5.6`             | No       | GPT-5   |
-| `gpt5.6-reasoning` | Gpt_5_6_Reasoning   | `gpt5.6-reasoning`   | Yes      | GPT-5   |
-| `gpt6sol`          | Gpt_6_Sol_Reasoning | `gpt-6-sol`          | No       | GPT-6   |
-| `gpt6-astra`       | GPT_6_Astra         | `gpt-6-astra`        | No       | GPT-6   |
-| `claude-sonnet`    | Claude_Sonnet       | `claude-sonnet-4.6`  | No       | Claude  |
-| `claude-opus`      | Claude_Opus         | `claude-opus-4.6`    | Yes      | Claude  |
+| Model Key                 | Tone                    | OpenAI Equivalent ID      | Thinking | Tool Calling           | Backend            |
+|---------------------------|-------------------------|---------------------------|----------|------------------------|--------------------|
+| `auto`                    | Magic                   | `gpt-4-auto`              | No       | Yes                    | GPT-5              |
+| `quick`                   | Chat                    | `gpt-4-quick`             | No       | Yes                    | GPT-5              |
+| `gpt5.2`                  | Gpt_5_2_Chat            | `gpt-5.2`                 | No       | Yes                    | GPT-5              |
+| `gpt5.2-reasoning`        | Gpt_5_2_Reasoning       | `gpt-5.2-reasoning`       | Yes      | Yes                    | GPT-5              |
+| `gpt5.3`                  | Gpt_5_3_Chat            | `gpt-5.3`                 | No       | Yes                    | GPT-5              |
+| `gpt5.3-reasoning`        | Gpt_5_3_Reasoning       | `gpt-5.3-reasoning`       | Yes      | Yes                    | GPT-5              |
+| `gpt5.4`                  | Gpt_5_4_Chat            | `gpt-5.4`                 | No       | Yes                    | GPT-5              |
+| `gpt5.4-reasoning`        | Gpt_5_4_Reasoning       | `gpt-5.4-reasoning`       | Yes      | Yes                    | GPT-5              |
+| `gpt5.5`                  | Gpt_5_5_Chat            | `gpt5.5`                  | No       | Yes                    | GPT-5              |
+| `gpt5.5-reasoning`        | Gpt_5_5_Reasoning       | `gpt5.5-reasoning`        | Yes      | Yes                    | GPT-5              |
+| `gpt5.6`                  | Gpt_5_6_Chat            | `gpt5.6`                  | No       | Yes                    | GPT-5              |
+| `gpt5.6-reasoning`        | Gpt_5_6_Reasoning       | `gpt5.6-reasoning`        | Yes      | Yes                    | GPT-5              |
+| `gpt5.6-sol`              | Gpt_6_Sol_Reasoning     | `gpt-5.6-sol`             | No       | Yes                    | GPT-6              |
+| `gpt6sol`                 | Gpt_6_Sol_Reasoning     | `gpt-6-sol`               | No       | Yes                    | GPT-6              |
+| `gpt6-astra`              | GPT_6_Astra             | `gpt-6-astra`             | No       | Yes                    | GPT-6              |
+| `claude-sonnet-reasoning` | Claude_Sonnet_Reasoning | `claude-sonnet-reasoning` | Yes      | Yes                    | Claude             |
+| `claude-fable`            | Claude_Fable            | `claude-fable`            | No       | Yes                    | Claude             |
+| `claude-sonnet`           | Claude_Sonnet           | `claude-sonnet-4.6`       | No       | No (upstream offline)  | Claude             |
+| `claude-opus`             | Claude_Opus             | `claude-opus-4.6`         | Yes      | No (upstream offline)  | Claude             |
+| `grok-4.5`                | Grok_4_5                | `grok-4.5`                | No       | Yes                    | Grok               |
+| `dall-e-3`                | Magic                   | `dall-e-3`                | No       | Yes                    | DALL-E / Designer  |
+| `flux-3`                  | Magic                   | `flux-3`                  | No       | Yes                    | Flux / Designer    |
 
 ### Model Recommendations
-| Task                                              | Recommended Model                |
-|---------------------------------------------------|----------------------------------|
-| General questions and conversational chat         | `auto` or `gpt5.5`               |
-| Coding assistants, tool calling, multi-step logic | `gpt5.5-reasoning`               |
-| Claude workflows (Claude Code, Anthropic SDK)     | `claude-sonnet` or `claude-opus` |
-| Latest reasoning backend                          | `gpt6sol`                        |
+| Task                                              | Recommended Model                                |
+|---------------------------------------------------|--------------------------------------------------|
+| General questions and conversational chat         | `auto` or `gpt5.5`                               |
+| Coding assistants, tool calling, multi-step logic | `gpt5.5-reasoning` or `gpt5.6-reasoning`         |
+| Claude workflows (Claude Code, Anthropic SDK)     | `claude-sonnet-reasoning` or `claude-fable`      |
+| Latest reasoning backend                          | `gpt6sol` or `gpt5.6-sol`                        |
 
 ---
 

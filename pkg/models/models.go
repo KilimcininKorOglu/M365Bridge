@@ -170,6 +170,13 @@ var ModelRegistry = map[string]ModelConfig{
 		OpenAIID:    "gpt-5.3",
 		DisplayName: "GPT-5.3",
 	},
+	"gpt5.3-reasoning": {
+		Tone:        "Gpt_5_3_Reasoning",
+		Override:    "",
+		OpenAIID:    "gpt-5.3-reasoning",
+		DisplayName: "GPT-5.3 Reasoning",
+		Thinking:    true,
+	},
 	"gpt5.4": {
 		Tone:        "Gpt_5_4_Chat",
 		Override:    "",
@@ -313,6 +320,50 @@ var ModelRegistry = map[string]ModelConfig{
 		OpenAIID:    "claude-sonnet-4.6",
 		DisplayName: "Claude Sonnet 4.6",
 		Owner:       OwnerAnthropic,
+	},
+	"claude-sonnet-reasoning": {
+		Tone:        "Claude_Sonnet_Reasoning",
+		Override:    "",
+		OpenAIID:    "claude-sonnet-reasoning",
+		DisplayName: "Claude Sonnet Reasoning",
+		Owner:       OwnerAnthropic,
+	},
+	"gpt5.6-sol": {
+		Tone:        "Gpt_6_Sol_Reasoning",
+		Override:    "",
+		OpenAIID:    "gpt-5.6-sol",
+		DisplayName: "GPT-5.6 Sol",
+	},
+	"gpt5.4-quick": {
+		Tone:        "Gpt_5_4_Chat",
+		Override:    "",
+		OpenAIID:    "gpt-5.4-quick",
+		DisplayName: "GPT-5.4 Quick",
+	},
+	"gpt5.3-think-deeper": {
+		Tone:        "Gpt_5_3_Reasoning",
+		Override:    "",
+		OpenAIID:    "gpt-5.3-think-deeper",
+		DisplayName: "GPT-5.3 Think Deeper",
+		Thinking:    true,
+	},
+	"flux-3": {
+		Tone:        "Magic",
+		Override:    "",
+		OpenAIID:    "flux-3",
+		DisplayName: "Flux 3",
+	},
+	"flux-4": {
+		Tone:        "Magic",
+		Override:    "",
+		OpenAIID:    "flux-4",
+		DisplayName: "Flux 4",
+	},
+	"dall-e-3": {
+		Tone:        "Magic",
+		Override:    "",
+		OpenAIID:    "dall-e-3",
+		DisplayName: "DALL-E 3",
 	},
 }
 
