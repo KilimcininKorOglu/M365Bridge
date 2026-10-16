@@ -134,45 +134,48 @@ docker exec -it m365bridge ./bin/m365-bridge login
 
 M365Bridge, model isimlerini arka plandaki ilgili Copilot tonlarına yönlendirir:
 
-| Model Adı                 | Copilot Tonu            | OpenAI Eşdeğer ID         | Düşünme (Thinking) | Araç Çağırma (Tool Calling) | Lisans Seviyesi | Arka Uç           |
-|---------------------------|-------------------------|---------------------------|--------------------|-----------------------------|-----------------|-------------------|
-| `auto`                    | Magic                   | `gpt-4-auto`              | Hayır              | Evet                        | Standart        | GPT-5             |
-| `quick`                   | Chat                    | `gpt-4-quick`             | Hayır              | Evet                        | Standart        | GPT-5             |
-| `gpt5.2`                  | Gpt_5_2_Chat            | `gpt-5.2`                 | Hayır              | Evet                        | Standart        | GPT-5             |
-| `gpt5.2-reasoning`        | Gpt_5_2_Reasoning       | `gpt-5.2-reasoning`       | Evet               | Evet                        | Standart        | GPT-5             |
-| `gpt5.3`                  | Gpt_5_3_Chat            | `gpt-5.3`                 | Hayır              | Evet                        | Standart        | GPT-5             |
-| `gpt5.3-reasoning`        | Gpt_5_3_Reasoning       | `gpt-5.3-reasoning`       | Evet               | Evet                        | Standart        | GPT-5             |
-| `gpt5.4`                  | Gpt_5_4_Chat            | `gpt-5.4`                 | Hayır              | Evet                        | Standart        | GPT-5             |
-| `gpt5.4-reasoning`        | Gpt_5_4_Reasoning       | `gpt-5.4-reasoning`       | Evet               | Evet                        | Standart        | GPT-5             |
-| `gpt5.5`                  | Gpt_5_5_Chat            | `gpt5.5`                  | Hayır              | Evet                        | Standart        | GPT-5             |
-| `gpt5.5-reasoning`        | Gpt_5_5_Reasoning       | `gpt5.5-reasoning`        | Evet               | Evet                        | Standart        | GPT-5             |
-| `gpt5.6`                  | Gpt_5_6_Chat            | `gpt5.6`                  | Hayır              | Evet                        | Standart        | GPT-5             |
-| `gpt5.6-reasoning`        | Gpt_5_6_Reasoning       | `gpt5.6-reasoning`        | Evet               | Evet                        | Standart        | GPT-5             |
-| `gpt5.6-sol`              | Gpt_6_Sol_Reasoning     | `gpt-5.6-sol`             | Hayır              | Evet                        | Standart        | GPT-6             |
-| `gpt6sol`                 | Gpt_6_Sol_Reasoning     | `gpt-6-sol`               | Hayır              | Evet                        | Standart        | GPT-6             |
-| `gpt6.1sol`               | Gpt_61_Sol_Reasoning    | `gpt-6.1-sol`             | Hayır              | Evet                        | Standart        | GPT-6             |
-| `gpt6.1-sol-chat`         | Gpt_61_Sol_Chat         | `gpt-6.1-sol-chat`        | Hayır              | Evet                        | Standart        | GPT-6             |
-| `gpt6.1-sol-reasoning`    | Gpt_61_Sol_Reasoning    | `gpt-6.1-sol-reasoning`   | Hayır              | Evet                        | Standart        | GPT-6             |
-| `gpt6`                    | Gpt_6_Reasoning         | `gpt-6`                   | Evet               | Evet                        | Premium         | GPT-6             |
-| `gpt6-reasoning`          | Gpt_6_Reasoning         | `gpt-6-reasoning`         | Evet               | Evet                        | Premium         | GPT-6             |
-| `gpt6-astra`              | GPT_6_Astra             | `gpt-6-astra`             | Hayır              | Evet                        | Standart        | GPT-6             |
-| `claude-sonnet-reasoning` | Claude_Sonnet_Reasoning | `claude-sonnet-reasoning` | Evet               | Evet                        | Premium         | Claude            |
-| `claude-sonnet-5`         | Claude_Sonnet_5         | `claude-sonnet-5`         | Evet               | Evet                        | Premium         | Claude            |
-| `claude-sonnet-5.5`       | Claude_Sonnet           | `claude-sonnet-5.5`       | Evet               | Evet                        | Premium         | Claude            |
-| `claude-fable`            | Claude_Fable            | `claude-fable`            | Hayır              | Evet                        | Standart        | Claude            |
-| `claude-sonnet`           | Claude_Sonnet           | `claude-sonnet-4.6`       | Hayır              | Hayır (arka uç tonu kapalı) | Premium         | Claude            |
-| `claude-opus`             | Claude_Opus             | `claude-opus-4.6`         | Evet               | Hayır (arka uç tonu kapalı) | Premium         | Claude            |
-| `claude-opus-5`           | Claude_Opus             | `claude-opus-5`           | Evet               | Evet                        | Premium         | Claude            |
-| `claude-opus-5.5`         | Claude_Opus             | `claude-opus-5.5`         | Evet               | Evet                        | Premium         | Claude            |
-| `claude-opus-4.8`         | Claude_Opus             | `claude-opus-4.8`         | Evet               | Evet                        | Premium         | Claude            |
-| `grok-4.5`                | Grok_4_5                | `grok-4.5`                | Hayır              | Evet                        | Standart        | Grok              |
-| `grok-reasoning`          | Grok_Reasoning          | `grok-reasoning`          | Evet               | Evet                        | Standart        | Grok              |
-| `dall-e-3`                | Magic                   | `dall-e-3`                | Hayır              | Evet                        | Standart        | DALL-E / Designer |
-| `flux-3`                  | Magic                   | `flux-3`                  | Hayır              | Evet                        | Standart        | Flux / Designer   |
-| `flux-4`                  | Magic                   | `flux-4`                  | Hayır              | Evet                        | Standart        | Flux / Designer   |
+| Model Adı                 | Copilot Tonu            | OpenAI Eşdeğer ID         | Düşünme (Thinking) | Araç Çağırma (Tool Calling) | Lisans Seviyesi | Öncelikli Erişim Kotası | Arka Uç           |
+|---------------------------|-------------------------|---------------------------|--------------------|-----------------------------|-----------------|-------------------------|-------------------|
+| `auto`                    | Magic                   | `gpt-4-auto`              | Hayır              | Evet                        | Standart        | Sınırsız                | GPT-5             |
+| `quick`                   | Chat                    | `gpt-4-quick`             | Hayır              | Evet                        | Standart        | Sınırsız                | GPT-5             |
+| `gpt5.2`                  | Gpt_5_2_Chat            | `gpt-5.2`                 | Hayır              | Evet                        | Standart        | Sınırsız                | GPT-5             |
+| `gpt5.2-reasoning`        | Gpt_5_2_Reasoning       | `gpt-5.2-reasoning`       | Evet               | Evet                        | Standart        | Sınırsız                | GPT-5             |
+| `gpt5.3`                  | Gpt_5_3_Chat            | `gpt-5.3`                 | Hayır              | Evet                        | Standart        | Sınırsız                | GPT-5             |
+| `gpt5.3-reasoning`        | Gpt_5_3_Reasoning       | `gpt-5.3-reasoning`       | Evet               | Evet                        | Standart        | Sınırsız                | GPT-5             |
+| `gpt5.4`                  | Gpt_5_4_Chat            | `gpt-5.4`                 | Hayır              | Evet                        | Standart        | Sınırsız                | GPT-5             |
+| `gpt5.4-reasoning`        | Gpt_5_4_Reasoning       | `gpt-5.4-reasoning`       | Evet               | Evet                        | Standart        | Sınırsız                | GPT-5             |
+| `gpt5.5`                  | Gpt_5_5_Chat            | `gpt5.5`                  | Hayır              | Evet                        | Standart        | Sınırsız                | GPT-5             |
+| `gpt5.5-reasoning`        | Gpt_5_5_Reasoning       | `gpt5.5-reasoning`        | Evet               | Evet                        | Standart        | Sınırsız                | GPT-5             |
+| `gpt5.6`                  | Gpt_5_6_Chat            | `gpt5.6`                  | Hayır              | Evet                        | Standart        | Sınırsız                | GPT-5             |
+| `gpt5.6-reasoning`        | Gpt_5_6_Reasoning       | `gpt5.6-reasoning`        | Evet               | Evet                        | Standart        | Sınırsız                | GPT-5             |
+| `gpt5.6-sol`              | Gpt_6_Sol_Reasoning     | `gpt-5.6-sol`             | Hayır              | Evet                        | Standart        | Sınırsız                | GPT-6             |
+| `gpt6sol`                 | Gpt_6_Sol_Reasoning     | `gpt-6-sol`               | Hayır              | Evet                        | Standart        | Sınırsız                | GPT-6             |
+| `gpt6.1sol`               | Gpt_61_Sol_Reasoning    | `gpt-6.1-sol`             | Hayır              | Evet                        | Standart        | 40/gün, 75/hafta        | GPT-6             |
+| `gpt6.1-sol-chat`         | Gpt_61_Sol_Chat         | `gpt-6.1-sol-chat`        | Hayır              | Evet                        | Standart        | Sınırsız                | GPT-6             |
+| `gpt6.1-sol-reasoning`    | Gpt_61_Sol_Reasoning    | `gpt-6.1-sol-reasoning`   | Hayır              | Evet                        | Standart        | 40/gün, 75/hafta        | GPT-6             |
+| `gpt6`                    | Gpt_6_Reasoning         | `gpt-6`                   | Evet               | Evet                        | Premium         | Ortak Öncelikli Kota    | GPT-6             |
+| `gpt6-reasoning`          | Gpt_6_Reasoning         | `gpt-6-reasoning`         | Evet               | Evet                        | Premium         | Ortak Öncelikli Kota    | GPT-6             |
+| `gpt6-astra`              | GPT_6_Astra             | `gpt-6-astra`             | Hayır              | Evet                        | Standart        | Sınırsız                | GPT-6             |
+| `claude-sonnet-reasoning` | Claude_Sonnet_Reasoning | `claude-sonnet-reasoning` | Evet               | Evet                        | Premium         | 80/gün, 150/hafta       | Claude            |
+| `claude-sonnet-5`         | Claude_Sonnet_5         | `claude-sonnet-5`         | Evet               | Evet                        | Premium         | 80/gün, 150/hafta       | Claude            |
+| `claude-sonnet-5.5`       | Claude_Sonnet           | `claude-sonnet-5.5`       | Evet               | Evet                        | Premium         | 80/gün, 150/hafta       | Claude            |
+| `claude-fable`            | Claude_Fable            | `claude-fable`            | Hayır              | Evet                        | Standart        | Sınırsız                | Claude            |
+| `claude-sonnet`           | Claude_Sonnet           | `claude-sonnet-4.6`       | Hayır              | Hayır (arka uç tonu kapalı) | Premium         | Kapalı                  | Claude            |
+| `claude-opus`             | Claude_Opus             | `claude-opus-4.6`         | Evet               | Hayır (arka uç tonu kapalı) | Premium         | Kapalı                  | Claude            |
+| `claude-opus-5`           | Claude_Opus             | `claude-opus-5`           | Evet               | Evet                        | Premium         | 40/gün, 75/hafta        | Claude            |
+| `claude-opus-5.5`         | Claude_Opus             | `claude-opus-5.5`         | Evet               | Evet                        | Premium         | 40/gün, 75/hafta        | Claude            |
+| `claude-opus-4.8`         | Claude_Opus             | `claude-opus-4.8`         | Evet               | Evet                        | Premium         | 40/gün, 75/hafta        | Claude            |
+| `grok-4.5`                | Grok_4_5                | `grok-4.5`                | Hayır              | Evet                        | Standart        | Sınırsız                | Grok              |
+| `grok-reasoning`          | Grok_Reasoning          | `grok-reasoning`          | Evet               | Evet                        | Standart        | Sınırsız                | Grok              |
+| `dall-e-3`                | Magic                   | `dall-e-3`                | Hayır              | Evet                        | Standart        | Sınırsız                | DALL-E / Designer |
+| `flux-3`                  | Magic                   | `flux-3`                  | Hayır              | Evet                        | Standart        | Sınırsız                | Flux / Designer   |
+| `flux-4`                  | Magic                   | `flux-4`                  | Hayır              | Evet                        | Standart        | Sınırsız                | Flux / Designer   |
 
 > [!NOTE]
-> **Lisans Seviyeleri:** **Premium** olarak işaretlenen modeller, Microsoft tarafında Copilot Pro veya ek haklara sahip Copilot Enterprise lisansı gerektirir. Standart M365 Copilot (Starter/Included) lisansına sahip hesaplar; GPT-5 ailesi ve `gpt-6-sol` / `gpt-6.1-sol` akıl yürütme modelleri dahil olmak üzere tüm **Standart** modelleri sorunsuz kullanabilir.
+> **Lisans Seviyeleri ve Öncelikli Erişim Kotaları**:
+> - **Premium Modeller**: Copilot Pro veya ek haklara sahip Copilot Enterprise lisansı gerektirir. Microsoft bu modellerde modele özgü öncelikli erişim kotaları uygular (Sonnet 5.5 için 80/gün & 150/hafta; Opus ve GPT-6.1 Sol için 40/gün & 75/hafta; haftalık kotalar her Pazartesi sıfırlanır). Kota dolduğunda HTTP 429 (`rate_limit_exceeded`) hatası döner.
+> - **Standart Modeller**: Standart Microsoft 365 Copilot (Starter/Included) lisansına sahip tüm hesaplar tarafından modele özel kota olmadan kullanılabilir (yalnızca konuşma başına 600 mesajlık genel limite tabidir).
+> - **Canlı Takip**: Kalan kotalar Web arayüzü kenar çubuğundan, `GET /v1/quota` API ucundan veya Docker konsol loglarından anlık olarak izlenebilir.
 
 ### Model Tavsiyeleri
 | İhtiyaç                                            | Önerilen Model                             |
