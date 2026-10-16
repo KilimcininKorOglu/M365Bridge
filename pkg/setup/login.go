@@ -137,12 +137,18 @@ func finishNativeLogin(res *auth.TokenResult, clientID string, quiet bool) error
 		return errors.New("token result missing tenant ID or user OID")
 	}
 
-	if err := saveCredentialStores(res, clientID); err != nil {
+	targetClientID := models.DefaultClientID
+	if err := saveCredentialStores(res, targetClientID); err != nil {
 		return err
 	}
 
+	// Prime Chathub access token using DefaultClientID (Chathub WebSocket requires this appid)
+	tm := auth.NewTokenManager(res.TenantID, targetClientID, models.DefaultScope, defaultRefreshTokenFile, defaultCacheFile)
+	if _, err := tm.Refresh(); err != nil {
+		logging.Warnf("finishNativeLogin: primary token refresh: %v", err)
+	}
+
 	// Pre-mint designer token if possible
-	tm := auth.NewTokenManager(res.TenantID, clientID, models.DefaultScope, defaultRefreshTokenFile, defaultCacheFile)
 	if _, err := tm.GetDesignerToken(); err != nil {
 		logging.Debugf("finishNativeLogin: designer pre-mint: %v", err)
 	}
