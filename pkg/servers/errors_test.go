@@ -332,6 +332,32 @@ func TestClassifyUpstreamErrorMapsOutOfCreditsToRateLimit(t *testing.T) {
 	}
 }
 
+func TestClassifyUpstreamErrorMapsForbiddenRequestToInsufficientPermissions(t *testing.T) {
+	err := fmt.Errorf("chat: %w", &client.TurnFailedError{
+		Value: "ForbiddenRequest", TurnState: "Failed", Message: "It looks like you don't have a valid licence.",
+	})
+
+	status, code := classifyUpstreamError(err)
+	if status != http.StatusForbidden {
+		t.Errorf("status = %d, want 403", status)
+	}
+	if code != upstreamForbiddenCode {
+		t.Errorf("code = %q, want %q", code, upstreamForbiddenCode)
+	}
+
+	api := &APIServer{}
+	rec := httptest.NewRecorder()
+	api.sendUpstreamError(rec, "chat", err)
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("status = %d, want 403", rec.Code)
+	}
+	message, _, _ := decodeErrorBody(t, rec.Body.Bytes())
+	want := "Your M365 Copilot license does not include premium models (Copilot Pro/Enterprise required)"
+	if message != want {
+		t.Errorf("message = %q, want %q", message, want)
+	}
+}
+
 func TestUpstreamErrorMessageExplainsAFailedTurn(t *testing.T) {
 	msg := upstreamErrorMessage("chat", upstreamTurnFailedCode)
 	if !strings.Contains(msg, "without producing an answer") {

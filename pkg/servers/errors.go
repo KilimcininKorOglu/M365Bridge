@@ -121,14 +121,41 @@ func classifyUpstreamError(err error) (int, string) {
 	return http.StatusInternalServerError, internalProcessingCode
 }
 
+func isLicenseFailure(failure *client.TurnFailedError) bool {
+	if failure.Value == "ForbiddenRequest" {
+		return true
+	}
+	msg := strings.ToLower(failure.Message)
+	return strings.Contains(msg, "licence") || strings.Contains(msg, "license")
+}
+
+func turnFailureMessage(err error) (string, bool) {
+	if failure, ok := client.TurnFailure(err); ok && isLicenseFailure(failure) {
+		return "Your M365 Copilot license does not include premium models (Copilot Pro/Enterprise required)", true
+	}
+	return "", false
+}
+
+func resolveErrorMessage(op, code string, err error) string {
+	if msg, ok := turnFailureMessage(err); ok {
+		return msg
+	}
+	return upstreamErrorMessage(op, code)
+}
+
 // turnFailureStatus reports whether the turn reached the backend and failed,
-// and maps quota exhaustion (OutOfCredits / Throttled) to 429 rate limit.
+// and maps quota exhaustion (OutOfCredits / Throttled) to 429 rate limit,
+// and missing premium license (ForbiddenRequest) to 403 insufficient permissions.
 func turnFailureStatus(err error) (int, string, bool) {
 	if failure, ok := client.TurnFailure(err); ok {
-		if failure.Value == "OutOfCredits" || failure.Value == "Throttled" {
+		switch {
+		case failure.Value == "OutOfCredits" || failure.Value == "Throttled":
 			return http.StatusTooManyRequests, upstreamRateLimitCode, true
+		case isLicenseFailure(failure):
+			return http.StatusForbidden, upstreamForbiddenCode, true
+		default:
+			return http.StatusBadGateway, upstreamTurnFailedCode, true
 		}
-		return http.StatusBadGateway, upstreamTurnFailedCode, true
 	}
 	if errors.Is(err, client.ErrEmptyTurn) {
 		return http.StatusBadGateway, upstreamTurnFailedCode, true
@@ -208,7 +235,7 @@ func (api *APIServer) resolveModel(w http.ResponseWriter, modelKey string) (mode
 func streamErrorFields(op string, err error) (status int, code, message string) {
 	status, code = classifyUpstreamError(err)
 	logging.Errorf("%s stream failed: status=%d code=%s err=%v", op, status, code, err)
-	return status, code, upstreamErrorMessage(op, code)
+	return status, code, resolveErrorMessage(op, code, err)
 }
 
 // sendUpstreamError reports a failed backend request. The raw error goes to the
@@ -229,5 +256,5 @@ func (api *APIServer) sendUpstreamError(w http.ResponseWriter, op string, err er
 	if status == http.StatusTooManyRequests {
 		w.Header().Set("Retry-After", strconv.Itoa(rateLimitRetryAfterSeconds))
 	}
-	api.sendErrorCode(w, status, code, upstreamErrorMessage(op, code))
+	api.sendErrorCode(w, status, code, resolveErrorMessage(op, code, err))
 }

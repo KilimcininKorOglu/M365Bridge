@@ -51,6 +51,16 @@ func TestEffectiveScenarioAndLicenseStandardModels(t *testing.T) {
 	}
 }
 
+func TestEffectiveScenarioAndLicenseEnvOverrides(t *testing.T) {
+	t.Setenv("M365_SCENARIO", "CustomScenario")
+	t.Setenv("M365_LICENSE_TYPE", "CustomLicense")
+
+	scenario, license := EffectiveScenarioAndLicense("Magic", "auto")
+	if scenario != "CustomScenario" || license != "CustomLicense" {
+		t.Errorf("got (%q, %q), want (CustomScenario, CustomLicense)", scenario, license)
+	}
+}
+
 func TestToneToPublicModel(t *testing.T) {
 	tests := []struct {
 		tone       string

@@ -831,7 +831,19 @@ func parseGenericToneSpec(tone string, parts []string) (ModelConfig, bool) {
 // (such as GPT-6 Reasoning, Claude Sonnet 5, Claude Opus) are automatically elevated
 // to OfficeWebPaidCopilot with Premium license so accounts with Copilot Pro or Enterprise
 // licenses can access them without deflection errors.
-func EffectiveScenarioAndLicense(tone, model string) (scenario, licenseType string) {
+// Overridable via M365_SCENARIO and M365_LICENSE_TYPE environment variables.
+func EffectiveScenarioAndLicense(tone, model string) (string, string) {
+	scenario, licenseType := defaultScenarioAndLicense(tone, model)
+	if s := strings.TrimSpace(os.Getenv("M365_SCENARIO")); s != "" {
+		scenario = s
+	}
+	if l := strings.TrimSpace(os.Getenv("M365_LICENSE_TYPE")); l != "" {
+		licenseType = l
+	}
+	return scenario, licenseType
+}
+
+func defaultScenarioAndLicense(tone, model string) (string, string) {
 	if isPaidModelOrTone(tone, model) {
 		return "OfficeWebPaidCopilot", "Premium"
 	}
