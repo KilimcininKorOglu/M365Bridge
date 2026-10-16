@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [1.5.4] - 2026-10-16
+
+### Added
+- Connect to remote Chrome DevTools Protocol endpoints via `-cdp` flag and `M365_CDP_URL` environment variable, enabling unattended background token renewal in headless Docker and VPS environments. Added `-headless` flag to `login` command
+- Automatically fall back to unattended browser token renewal via CDP in `APIServer` background token refresher when 24-hour token expiry occurs and CDP is configured
+
+### Changed
+- Add lightweight Chromium sidecar with shared persistent browser profile volume to Docker Compose configuration
+- Document unattended single-transfer VPS setup in README and README.tr
+
 ## [1.5.3] - 2026-10-16
 
 ### Added
