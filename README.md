@@ -149,14 +149,26 @@ M365Bridge routes model identifiers to specific Copilot backend tones:
 | `gpt5.6-reasoning`        | Gpt_5_6_Reasoning       | `gpt5.6-reasoning`        | Yes      | Yes                    | GPT-5              |
 | `gpt5.6-sol`              | Gpt_6_Sol_Reasoning     | `gpt-5.6-sol`             | No       | Yes                    | GPT-6              |
 | `gpt6sol`                 | Gpt_6_Sol_Reasoning     | `gpt-6-sol`               | No       | Yes                    | GPT-6              |
+| `gpt6.1sol`               | Gpt_61_Sol_Reasoning    | `gpt-6.1-sol`             | No       | Yes                    | GPT-6              |
+| `gpt6.1-sol-chat`         | Gpt_61_Sol_Chat         | `gpt-6.1-sol-chat`        | No       | Yes                    | GPT-6              |
+| `gpt6.1-sol-reasoning`    | Gpt_61_Sol_Reasoning    | `gpt-6.1-sol-reasoning`   | No       | Yes                    | GPT-6              |
+| `gpt6`                    | Gpt_6_Reasoning         | `gpt-6`                   | Yes      | Yes                    | GPT-6              |
+| `gpt6-reasoning`          | Gpt_6_Reasoning         | `gpt-6-reasoning`         | Yes      | Yes                    | GPT-6              |
 | `gpt6-astra`              | GPT_6_Astra             | `gpt-6-astra`             | No       | Yes                    | GPT-6              |
 | `claude-sonnet-reasoning` | Claude_Sonnet_Reasoning | `claude-sonnet-reasoning` | Yes      | Yes                    | Claude             |
+| `claude-sonnet-5`         | Claude_Sonnet_5         | `claude-sonnet-5`         | Yes      | Yes                    | Claude             |
+| `claude-sonnet-5.5`       | Claude_Sonnet           | `claude-sonnet-5.5`       | Yes      | Yes                    | Claude             |
 | `claude-fable`            | Claude_Fable            | `claude-fable`            | No       | Yes                    | Claude             |
 | `claude-sonnet`           | Claude_Sonnet           | `claude-sonnet-4.6`       | No       | No (upstream offline)  | Claude             |
 | `claude-opus`             | Claude_Opus             | `claude-opus-4.6`         | Yes      | No (upstream offline)  | Claude             |
+| `claude-opus-5`           | Claude_Opus             | `claude-opus-5`           | Yes      | Yes                    | Claude             |
+| `claude-opus-5.5`         | Claude_Opus             | `claude-opus-5.5`         | Yes      | Yes                    | Claude             |
+| `claude-opus-4.8`         | Claude_Opus             | `claude-opus-4.8`         | Yes      | Yes                    | Claude             |
 | `grok-4.5`                | Grok_4_5                | `grok-4.5`                | No       | Yes                    | Grok               |
+| `grok-reasoning`          | Grok_Reasoning          | `grok-reasoning`          | Yes      | Yes                    | Grok               |
 | `dall-e-3`                | Magic                   | `dall-e-3`                | No       | Yes                    | DALL-E / Designer  |
 | `flux-3`                  | Magic                   | `flux-3`                  | No       | Yes                    | Flux / Designer    |
+| `flux-4`                  | Magic                   | `flux-4`                  | No       | Yes                    | Flux / Designer    |
 
 ### Model Recommendations
 | Task                                              | Recommended Model                                |
@@ -164,7 +176,7 @@ M365Bridge routes model identifiers to specific Copilot backend tones:
 | General questions and conversational chat         | `auto` or `gpt5.5`                               |
 | Coding assistants, tool calling, multi-step logic | `gpt5.5-reasoning` or `gpt5.6-reasoning`         |
 | Claude workflows (Claude Code, Anthropic SDK)     | `claude-sonnet-reasoning` or `claude-fable`      |
-| Latest reasoning backend                          | `gpt6sol` or `gpt5.6-sol`                        |
+| Latest reasoning backend                          | `gpt6.1sol`, `gpt6sol` or `gpt6-reasoning`       |
 
 ---
 
